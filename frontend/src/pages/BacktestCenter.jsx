@@ -43,7 +43,7 @@ export default function BacktestCenter() {
     symbols: HOT_ETFS.slice(0, 5), start: "2025-06-01", end: "2026-07-31",
     initial_cash: 100000, mode: "daily", use_agents: false, name: "",
     params: { top_n: 3, mom_window: 20, min_amount: 30000000, max_vol: 0.5,
-              target_weight: 0.2, rebalance_threshold: 0.15 },
+              target_weight: 0.2, rebalance_threshold: 0.15, max_total_position: 0.9 },
   });
   const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
@@ -89,9 +89,13 @@ export default function BacktestCenter() {
   });
 
   const eqData = (metrics?.equity_curve || []).map((v, i) => ({
-    i, 净值: v, 基准: metrics?.benchmark?.benchmark_return ? (metrics.benchmark_curve?.[i] || v) : null,
+    d: metrics?.dates?.[i] || i, 净值: v, 基准: metrics?.benchmark?.benchmark_return != null ? (metrics.benchmark_curve?.[i] || v) : null,
   }));
-  const ddData = (metrics?.drawdown_curve || []).map((v, i) => ({ i, 回撤: (v * 100).toFixed(2) }));
+  const ddData = (metrics?.drawdown_curve || []).map((v, i) => ({ d: metrics?.dates?.[i] || i, 回撤: (v * 100).toFixed(2) }));
+  const posData = (metrics?.position_curve || []).map((v, i) => ({
+    d: metrics?.dates?.[i] || i,
+    p: metrics?.params?.initial_cash ? Math.min(1, v / metrics.params.initial_cash) : 0,
+  }));
   const mData = Object.entries(metrics?.monthly_returns || {}).map(([k, v]) => ({ month: k, ret: (v * 100).toFixed(2) }));
 
   const toggleSym = (s) => {
@@ -161,14 +165,15 @@ export default function BacktestCenter() {
               {[
                 ["top_n", "持有数量", "number"],
                 ["mom_window", "动量窗口", "number"],
-                ["target_weight", "目标仓位", "number"],
+                ["target_weight", "单标的目标仓位", "number"],
+                ["max_total_position", "总仓位上限", "number"],
                 ["rebalance_threshold", "再平衡阈值", "number"],
                 ["max_vol", "波动率上限", "number"],
                 ["min_amount", "成交额下限(万)", "number"],
               ].map(([k, label, type]) => (
                 <label key={k} className="text-[11px] text-gray-500">
                   {label}
-                  <input type={type} step={k.includes("weight") || k.includes("vol") || k.includes("threshold") ? 0.01 : 1}
+                  <input type={type} step={k.includes("weight") || k.includes("vol") || k.includes("threshold") || k.includes("position") ? 0.01 : 1}
                     className="input w-full mt-0.5 text-xs"
                     value={form.params[k] === 30000000 ? form.params[k] / 10000 : form.params[k]}
                     onChange={(e) => {
@@ -199,7 +204,8 @@ export default function BacktestCenter() {
           <div className="flex items-center gap-3">
             <span className={`badge ${running.status === "FAILED" ? "bg-red-50 text-red-600" : "bg-brand-50 text-brand-600"}`}>{running.status}</span>
             <div className="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
-              <div className="h-full bg-brand-600 rounded-full animate-pulse" style={{ width: running.status === "DONE" ? "100%" : "60%" }} />
+              <div className="h-full bg-brand-600 rounded-full transition-all"
+                style={{ width: (() => { const m = /(\d+)%/.exec(running.progress || ""); return m ? m[1] + "%" : (running.status === "DONE" ? "100%" : "8%"); })() }} />
             </div>
             <span className="text-xs text-gray-500">{running.progress}</span>
           </div>
@@ -210,13 +216,39 @@ export default function BacktestCenter() {
       {/* 结果 */}
       {metrics && (
         <>
+          {/* 参数摘要 + 提示 */}
+          <div className="card">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+              <span className="font-semibold text-gray-600">参数:</span>
+              <span className="badge bg-gray-100">标的 {form.symbols.length}只</span>
+              <span className="badge bg-gray-100">{metrics.params?.start} ~ {metrics.params?.end}</span>
+              <span className="badge bg-gray-100">资金 {metrics.params?.initial_cash?.toLocaleString?.() || form.initial_cash}</span>
+              <span className="badge bg-gray-100">{metrics.params?.mode === "minute" ? "分钟" : "日线"}</span>
+              <span className="badge bg-gray-100">Top{metrics.params?.top_n} 窗口{metrics.params?.mom_window}日</span>
+              <span className="badge bg-gray-100">单标的目标 {((metrics.params?.target_weight ?? 0.2) * 100).toFixed(0)}%</span>
+              <span className="badge bg-gray-100">总仓位 ≤ {((metrics.params?.max_total_position ?? 0.9) * 100).toFixed(0)}%</span>
+              <span className="badge bg-gray-100">波动率≤{(metrics.params?.max_vol ?? 0.5) * 100}%</span>
+              {metrics.params?.use_agents && <span className="badge bg-amber-50 text-amber-700">Agent模式</span>}
+            </div>
+            {metrics.note && (
+              <div className="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                {metrics.note}
+              </div>
+            )}
+            {metrics.skipped_buys > 0 && (
+              <div className="mt-1 text-xs text-gray-400">
+                因资金不足跳过 {metrics.skipped_buys} 次买入(总仓位上限或现金不足时正常现象)
+              </div>
+            )}
+          </div>
+
           <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2">
             <MetricCard label="总收益" value={(metrics.total_return * 100).toFixed(2) + "%"} color={(metrics.total_return || 0) >= 0 ? "text-up" : "text-down"} />
             <MetricCard label="年化" value={(metrics.annual_return * 100).toFixed(2) + "%"} />
             <MetricCard label="最大回撤" value={(metrics.max_drawdown * 100).toFixed(2) + "%"} color="text-down" />
             <MetricCard label="夏普" value={metrics.sharpe?.toFixed(2)} />
             <MetricCard label="卡玛" value={metrics.calmar?.toFixed(2)} />
-            <MetricCard label="胜率" value={(metrics.win_rate * 100).toFixed(0) + "%"} />
+            <MetricCard label="胜率" value={metrics.win_rate == null ? "样本不足" : (metrics.win_rate * 100).toFixed(0) + "%"} />
             <MetricCard label="交易次数" value={metrics.trade_count} />
             <MetricCard label="超额收益" value={(metrics.benchmark?.excess_return * 100)?.toFixed(2) + "%"} color="text-brand-600" />
           </div>
@@ -227,7 +259,7 @@ export default function BacktestCenter() {
               <ResponsiveContainer width="100%" height={240}>
                 <LineChart data={eqData}>
                   <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                  <XAxis dataKey="i" fontSize={10} hide />
+                  <XAxis dataKey="d" fontSize={9} tickFormatter={(v) => String(v).slice(5)} minTickGap={40} />
                   <YAxis fontSize={10} domain={["auto", "auto"]} />
                   <Tooltip />
                   <Legend />
@@ -241,7 +273,7 @@ export default function BacktestCenter() {
               <ResponsiveContainer width="100%" height={240}>
                 <AreaChart data={ddData}>
                   <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                  <XAxis dataKey="i" fontSize={10} hide />
+                  <XAxis dataKey="d" fontSize={9} tickFormatter={(v) => String(v).slice(5)} minTickGap={40} />
                   <YAxis fontSize={10} />
                   <Tooltip />
                   <Area type="monotone" dataKey="回撤" stroke="#e03131" fill="#e03131" fillOpacity={0.3} />
@@ -250,16 +282,30 @@ export default function BacktestCenter() {
             </div>
           </div>
 
-          <div className="card">
-            <div className="card-title">月度收益(%)</div>
-            <ResponsiveContainer width="100%" height={160}>
-              <BarChart data={mData}>
-                <XAxis dataKey="month" fontSize={10} />
-                <YAxis fontSize={10} />
-                <Tooltip />
-                <Bar dataKey="ret" fill="#1c3a5e" />
-              </BarChart>
-            </ResponsiveContainer>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="card">
+              <div className="card-title">持仓市值曲线(占总资产比例)</div>
+              <ResponsiveContainer width="100%" height={160}>
+                <AreaChart data={posData}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                  <XAxis dataKey="d" fontSize={9} tickFormatter={(v) => String(v).slice(5)} minTickGap={50} />
+                  <YAxis fontSize={10} tickFormatter={(v) => (v * 100).toFixed(0) + "%"} domain={[0, 1]} />
+                  <Tooltip formatter={(v) => [(v * 100).toFixed(1) + "%", "持仓比例"]} />
+                  <Area type="monotone" dataKey="p" stroke="#1971c2" fill="#1971c2" fillOpacity={0.25} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="card">
+              <div className="card-title">月度收益(%)</div>
+              <ResponsiveContainer width="100%" height={160}>
+                <BarChart data={mData}>
+                  <XAxis dataKey="month" fontSize={10} />
+                  <YAxis fontSize={10} />
+                  <Tooltip />
+                  <Bar dataKey="ret" fill="#1c3a5e" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
           </div>
 
           <div className="card">
@@ -269,8 +315,8 @@ export default function BacktestCenter() {
                   <Download size={13} className="inline mr-1" />导出JSON
                 </button>
                 <button className="btn-ghost text-xs" onClick={() => downloadCsv(`backtest_${metrics.run_id}_trades.csv`, [
-                  ["日期", "方向", "标的", "数量", "价格", "手续费", "盈亏"],
-                  ...(metrics.trade_details || []).map((t) => [String(t.date).slice(0, 10), t.side, t.symbol, t.qty, t.price, t.fee, t.pnl ?? ""]),
+                  ["日期", "方向", "标的", "名称", "数量", "价格", "手续费", "滑点", "盈亏"],
+                  ...(metrics.trade_details || []).map((t) => [String(t.date).slice(0, 10), t.side, t.symbol, t.name ?? "", t.qty, t.price, t.fee, t.slippage_cost ?? "", t.pnl ?? ""]),
                 ])}>
                   <Download size={13} className="inline mr-1" />导出交易CSV
                 </button>
@@ -278,17 +324,19 @@ export default function BacktestCenter() {
             </div>
             <div className="max-h-72 overflow-y-auto">
               <table className="w-full">
-                <thead><tr><th className="th">日期</th><th className="th">方向</th><th className="th">标的</th>
-                  <th className="th">数量</th><th className="th">价格</th><th className="th">手续费</th><th className="th">盈亏</th></tr></thead>
+                <thead><tr><th className="th">日期</th><th className="th">方向</th><th className="th">标的</th><th className="th">名称</th>
+                  <th className="th">数量</th><th className="th">价格</th><th className="th">手续费</th><th className="th">滑点</th><th className="th">盈亏</th></tr></thead>
                 <tbody>
                   {(metrics.trade_details || []).map((t, i) => (
                     <tr key={i}>
                       <td className="td text-gray-500">{String(t.date).slice(0, 10)}</td>
                       <td className="td"><span className={`badge ${t.side === "BUY" ? "bg-red-50 text-up" : "bg-green-50 text-down"}`}>{t.side}</span></td>
                       <td className="td font-medium">{t.symbol}</td>
+                      <td className="td text-gray-500">{t.name || "-"}</td>
                       <td className="td">{t.qty}</td>
                       <td className="td">{fmt(t.price)}</td>
                       <td className="td">{fmt(t.fee, 2)}</td>
+                      <td className="td text-gray-400">{t.slippage_cost ? fmt(t.slippage_cost, 2) : "-"}</td>
                       <td className={`td font-medium ${(t.pnl || 0) >= 0 ? "text-up" : "text-down"}`}>{t.pnl ? fmt(t.pnl, 2) : "-"}</td>
                     </tr>
                   ))}

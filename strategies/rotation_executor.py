@@ -44,7 +44,10 @@ def build_rotation_signal_fn(initial_cash: float = 100000.0,
     min_amount = float(p.get("min_amount", 3e7))
     max_vol = float(p.get("max_vol", 0.50))
     target_weight = float(p.get("target_weight", 0.2))
-    rebalance_threshold = float(p.get("rebalance_threshold", 0.15))  # 仓位偏离>15%才调仓
+    rebalance_threshold = float(p.get("rebalance_threshold", 0.15))
+    max_total_position = float(p.get("max_total_position", 0.90))  # 总仓位上限(防多只超配)
+    # 有效单标的上限: 受总仓位约束 (target_weight 可被压缩)
+    eff_weight = min(target_weight, max_total_position / max(top_n, 1))
 
     def signal_fn(asof: Dict[str, List[dict]], prices: Dict[str, float],
                   d, broker=None) -> Dict[str, Dict[str, Any]]:
@@ -80,18 +83,26 @@ def build_rotation_signal_fn(initial_cash: float = 100000.0,
                     "reason": f"跌出动量Top{top_n}, 轮动卖出",
                 }
 
-        # 4. TopN 持仓不足 → 买入至目标仓位(偏离超过阈值才调, 减少噪音交易)
+        # 4. TopN 持仓不足 → 买入至目标仓位(受现金与总仓位约束)
         for sym in ranked[:top_n]:
             price = prices.get(sym, 0)
             if price <= 0:
                 continue
             cur_qty = positions.get(sym, {}).get("qty", 0) or 0
-            target_qty = int(initial_cash * target_weight / price // 100 * 100)
+            # 可用资金(总资产×有效权重 与 剩余现金 取小)
+            if broker is not None:
+                total_asset = broker.cash + broker.position_value(prices)
+                avail_cash = broker.cash
+            else:
+                total_asset = initial_cash
+                avail_cash = initial_cash
+            target_value = min(total_asset * eff_weight, avail_cash * 0.98)
+            target_qty = int(target_value / price // 100 * 100)
             diff = target_qty - cur_qty
             if diff >= 100 and (cur_qty == 0 or diff >= cur_qty * rebalance_threshold):
                 signals[sym] = {
                     "action": "BUY", "qty": diff,
-                    "reason": (f"动量排名前{top_n}, 补仓至目标权重{target_weight:.0%}"
+                    "reason": (f"动量排名前{top_n}, 补仓至目标权重{eff_weight:.0%}"
                                f"(20日动量{float(features[sym].get(f'momentum_{mom_window}d', 0) or 0):+.2%})"),
                 }
         return signals

@@ -62,6 +62,7 @@ strategies:
     max_vol: 0.50            # 年化波动率上限(过滤极端波动)
     target_weight: 0.20      # 单标的目标仓位(占总资产比例)
     rebalance_threshold: 0.15  # 仓位偏离超过15%才调仓(减少噪音交易)
+    max_total_position: 0.90   # 总仓位上限(多只合计不得超过, 防止超配)
 
 # ---- RAG ----
 rag:

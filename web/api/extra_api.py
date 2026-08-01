@@ -220,10 +220,32 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
     from backtest.engine import BacktestEngine
     from backtest.data_replayer import DataReplayer
     from strategies.rotation_executor import build_rotation_signal_fn
+    from database import repository as _repo
 
+    params = body.get("params") or {}
     signal_fn = build_rotation_signal_fn(
         initial_cash=float(body.get("initial_cash", 100000)),
-        params=body.get("params") or None)
+        params=params)
+
+    # 标的名称映射(交易明细显示中文名)
+    name_map: Dict[str, str] = {}
+    symbols = body.get("symbols") or []
+    try:
+        for w in _repo.get_watchlist():
+            name_map[w["symbol"]] = w["name"]
+        from database.models import Symbol as _Sym
+        with get_session() as s:
+            for sy in s.query(_Sym).all():
+                name_map.setdefault(sy.symbol, sy.name)
+    except Exception:
+        pass
+
+    def progress_cb(done: int, total: int):
+        pct = int(done / total * 100)
+        with _backtest_lock:
+            t = _backtest_tasks.get(run_id)
+            if t:
+                t["progress"] = f"回测进行中 {pct}% ({done}/{total} 个交易日)"
 
     try:
         with _backtest_lock:
@@ -237,7 +259,10 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
             use_agents=bool(body.get("use_agents", False)),
             name=body.get("name", ""),
         )
-        replayer = DataReplayer(body.get("symbols") or
+        engine.progress_cb = progress_cb
+        engine.params = params
+        engine.name_map = name_map
+        replayer = DataReplayer(symbols or
                                 ["510300", "159915", "588000", "512100", "159949"])
         if body.get("mode") == "minute":
             metrics = engine.run_minute(replayer, signal_fn)
