@@ -57,6 +57,7 @@ class PaperAccount:
     # ------------------------------------------------------------------
     def get_snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            self._ensure_t1_unlock()
             self._refresh_market_value()
             a = self._account
             return {
@@ -76,6 +77,7 @@ class PaperAccount:
 
     def get_positions(self) -> List[Dict[str, Any]]:
         with self._lock:
+            self._ensure_t1_unlock()
             out = []
             for p in self._positions.values():
                 out.append({
@@ -95,6 +97,7 @@ class PaperAccount:
 
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self._lock:
+            self._ensure_t1_unlock()
             p = self._positions.get(symbol)
             if p is None:
                 return None
@@ -114,6 +117,7 @@ class PaperAccount:
 
     def get_available_qty(self, symbol: str) -> int:
         with self._lock:
+            self._ensure_t1_unlock()
             p = self._positions.get(symbol)
             return p.available_qty if p else 0
 
@@ -146,17 +150,34 @@ class PaperAccount:
             self._refresh_market_value()
             self._persist()
 
+    def _ensure_t1_unlock(self, today: Optional[date] = None):
+        """
+        T+1 解锁: 昨日及以前买入的数量转入可用(available_qty)。
+        判断依据是 buy_date(最近买入日): buy_date < today 则整个 today_buy 均为
+        历史买入 → 解锁。幂等且无需持久化状态, 重启后依然正确。
+        """
+        today = today or date.today()
+        for p in self._positions.values():
+            if (p.today_buy_qty or 0) > 0 and p.buy_date and p.buy_date < today:
+                unlock = p.today_buy_qty
+                p.today_buy_qty = 0
+                p.available_qty += unlock
+                repo.save_position(p)
+
     def apply_trade(self, symbol: str, name: str, side: str, price: float,
                     qty: int, fee: float, trade_time: datetime):
         """
-        成交后更新持仓与资金 (T+1 规则在此生效):
-        - BUY:  减现金、加持仓, 今日买入量+ (不可卖)
+        成交后更新持仓与资金:
+        - BUY:  减现金、加持仓; T+1 品种今日买入不可卖, T+0 品种(跨境/债券/黄金)当日即可卖
         - SELL: 加现金、减持仓与可用量
         - 成本: 摊薄成本
         """
+        from core.symbol_utils import is_t0_etf
         with self._lock:
             a = self._account
+            t0 = is_t0_etf(symbol)
             if side == "BUY":
+                self._ensure_t1_unlock(trade_time.date())
                 a.cash -= price * qty + fee
                 a.frozen_cash = max(0.0, a.frozen_cash - (price * qty + fee) * (qty > 0))
                 p = self._positions.get(symbol)
@@ -171,12 +192,16 @@ class PaperAccount:
                 # 摊薄成本 = (旧持仓市值 + 本次买入金额) / 新总数量
                 old_cost_value = p.total_qty * p.cost_price
                 p.total_qty += qty
-                p.today_buy_qty += qty
+                if t0:
+                    p.available_qty += qty            # T+0: 当日即可卖
+                else:
+                    p.today_buy_qty += qty            # T+1: 今日买入不可卖
                 p.cost_price = (old_cost_value + price * qty) / p.total_qty if p.total_qty else price
                 p.latest_price = price
                 p.buy_date = trade_time.date()
                 repo.save_position(p)
             else:  # SELL
+                self._ensure_t1_unlock(trade_time.date())
                 a.cash += price * qty - fee
                 p = self._positions.get(symbol)
                 if p is None:

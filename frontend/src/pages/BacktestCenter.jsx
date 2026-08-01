@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+﻿import { useState, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -43,7 +43,8 @@ export default function BacktestCenter() {
     symbols: HOT_ETFS.slice(0, 5), start: "2025-06-01", end: "2026-07-31",
     initial_cash: 100000, mode: "daily", use_agents: false, name: "",
     params: { top_n: 3, mom_window: 20, min_amount: 30000000, max_vol: 0.5,
-              target_weight: 0.2, rebalance_threshold: 0.15, max_total_position: 0.9 },
+              target_weight: 0.2, rebalance_threshold: 0.15, max_total_position: 0.9,
+              stop_loss_pct: 0.08, market_filter: true, min_hold_days: 3 },
   });
   const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
@@ -170,18 +171,26 @@ export default function BacktestCenter() {
                 ["rebalance_threshold", "再平衡阈值", "number"],
                 ["max_vol", "波动率上限", "number"],
                 ["min_amount", "成交额下限(万)", "number"],
+                ["stop_loss_pct", "止损线(%)", "number"],
+                ["min_hold_days", "最小持仓天数", "number"],
               ].map(([k, label, type]) => (
                 <label key={k} className="text-[11px] text-gray-500">
                   {label}
                   <input type={type} step={k.includes("weight") || k.includes("vol") || k.includes("threshold") || k.includes("position") ? 0.01 : 1}
                     className="input w-full mt-0.5 text-xs"
-                    value={form.params[k] === 30000000 ? form.params[k] / 10000 : form.params[k]}
+                    value={k === "stop_loss_pct" ? ((form.params[k] ?? 0.1) * 100) : (form.params[k] === 30000000 ? form.params[k] / 10000 : form.params[k])}
                     onChange={(e) => {
                       const v = Number(e.target.value);
-                      setParam(k, k === "min_amount" ? (isNaN(v) ? 0 : v * 10000) : (isNaN(v) ? 0 : v));
+                      if (k === "stop_loss_pct") setParam(k, isNaN(v) ? 0 : v / 100);
+                      else setParam(k, k === "min_amount" ? (isNaN(v) ? 0 : v * 10000) : (isNaN(v) ? 0 : v));
                     }} />
                 </label>
               ))}
+              <label className="text-[11px] text-gray-500 flex items-center gap-1.5 pt-4">
+                <input type="checkbox" checked={form.params.market_filter}
+                  onChange={(e) => setParam("market_filter", e.target.checked)} />
+                市场风险过滤(熊市空仓)
+              </label>
             </div>
           </div>
           <label className="flex items-center gap-2 text-sm text-gray-600">
@@ -365,3 +374,4 @@ export default function BacktestCenter() {
     </div>
   );
 }
+

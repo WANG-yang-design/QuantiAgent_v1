@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 审计日志 / 短期记忆 / 长期记忆
 ==============================
@@ -7,6 +7,7 @@
 - 长期记忆: 历史教训/标的风险事件/Agent准确率(数据库)
 """
 import logging
+from datetime import date, datetime
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -30,16 +31,27 @@ class AuditLogger:
 
     def log(self, event_type: str, actor: str, payload: Optional[Dict[str, Any]] = None,
             trace_id: Optional[str] = None):
-        """记录审计事件。payload 必须是 JSON 可序列化。"""
+        """记录审计事件。payload 自动做 JSON 安全转换。"""
         try:
             repo.save_audit_log(
                 trace_id=trace_id or get_trace_id() or "",
                 event_type=event_type,
                 actor=actor,
-                payload=payload or {},
+                payload=self._json_safe(payload or {}),
             )
         except Exception as exc:
             logger.error("审计落库失败 %s: %s", event_type, exc)
+
+    @staticmethod
+    def _json_safe(obj: Any) -> Any:
+        """递归把 datetime/date 等转为字符串(JSON 可序列化)。"""
+        if isinstance(obj, dict):
+            return {k: AuditLogger._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [AuditLogger._json_safe(v) for v in obj]
+        if isinstance(obj, (datetime, date)):
+            return str(obj)
+        return obj
 
     def query(self, trace_id: Optional[str] = None, event_type: Optional[str] = None,
               limit: int = 500) -> List[Dict[str, Any]]:
@@ -102,3 +114,4 @@ def get_short_memory() -> ShortTermMemory:
 
 def get_long_memory() -> LongTermMemory:
     return _long
+

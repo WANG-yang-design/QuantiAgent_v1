@@ -405,8 +405,18 @@ def get_position(account_id: str, symbol: str) -> Optional[Position]:
 
 
 def save_position(p: Position):
+    """
+    按 position_id 更新或插入持仓(不能用 session.merge:
+    Position 主键是自增 id, merge 会误判为新增导致唯一冲突)。
+    """
     with get_session() as s:
-        s.merge(p)
+        exist = s.query(Position).filter_by(position_id=p.position_id).first()
+        if exist:
+            for col in p.__table__.columns.keys():
+                if col != "id":
+                    setattr(exist, col, getattr(p, col))
+        else:
+            s.add(p)
         s.commit()
 
 

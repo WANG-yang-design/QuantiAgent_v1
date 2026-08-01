@@ -65,8 +65,40 @@ class DataReplayer:
                 "open": b.open, "high": b.high, "low": b.low, "close": b.close,
                 "volume": b.volume, "amount": b.amount,
             })
+        norm = self._smooth_ex_dividend(norm)
         self._daily_cache[key] = norm
         return norm
+
+    @staticmethod
+    def _smooth_ex_dividend(bars: List[dict], jump_threshold: float = 0.78) -> List[dict]:
+        """
+        除息平滑: 修正前复权(qfq)数据漏处理的 ETF 分红除息跳变。
+        阈值 ±22%: A股ETF涨跌幅限制为10%(主板)/20%(科创创业), 正常单日极限
+        不会超过±20%; 除息跳变通常≥25%, 不会被误判也不会漏判。
+        """
+        if not bars:
+            return bars
+        out: List[dict] = []
+        factor = 1.0
+        for i, b in enumerate(bars):
+            if out:
+                prev_close = out[-1]["close"]
+                if prev_close > 0:
+                    ratio = b["open"] / prev_close
+                    if ratio < jump_threshold or ratio > (2 - jump_threshold):
+                        # 除息跳变: 按开盘跳空比例调整(把分红算回持仓)
+                        factor = prev_close / b["open"]
+                        logger.info("检测到除息跳变 %s %s: 昨收%.4f→今开%.4f (%.1f%%), 已平滑",
+                                    b["symbol"], b["trade_date"], prev_close, b["open"],
+                                    (ratio - 1) * 100)
+            if factor != 1.0:
+                b = {**b,
+                     "open": round(b["open"] * factor, 4),
+                     "high": round(b["high"] * factor, 4),
+                     "low": round(b["low"] * factor, 4),
+                     "close": round(b["close"] * factor, 4)}
+            out.append(b)
+        return out
 
     # ------------------------------------------------------------------
     def load_all_minute(self, symbol: str, day: date, freq: str = "5m") -> List[dict]:
