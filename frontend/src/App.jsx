@@ -1,10 +1,11 @@
 import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, Activity, CandlestickChart, Bot, FlaskConical,
-  PiggyBank, Settings,
+  PiggyBank, Settings, ListChecks,
 } from "lucide-react";
 import Dashboard from "./pages/Dashboard";
 import Watchlist from "./pages/Watchlist";
+import WatchMonitor from "./pages/WatchMonitor";
 import SymbolDetail from "./pages/SymbolDetail";
 import AgentCenter from "./pages/AgentCenter";
 import BacktestCenter from "./pages/BacktestCenter";
@@ -14,6 +15,7 @@ import SettingsPage from "./pages/Settings";
 const NAV = [
   { to: "/", label: "仪表盘", icon: LayoutDashboard },
   { to: "/watchlist", label: "实时盯盘", icon: Activity },
+  { to: "/monitor", label: "监控标的", icon: ListChecks },
   { to: "/symbol/510300", label: "标的详情", icon: CandlestickChart },
   { to: "/agents", label: "Agent决策", icon: Bot },
   { to: "/backtest", label: "回测中心", icon: FlaskConical },
@@ -60,6 +62,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/watchlist" element={<Watchlist />} />
+          <Route path="/monitor" element={<WatchMonitor />} />
           <Route path="/symbol/:code" element={<SymbolDetail />} />
           <Route path="/agents" element={<AgentCenter />} />
           <Route path="/backtest" element={<BacktestCenter />} />

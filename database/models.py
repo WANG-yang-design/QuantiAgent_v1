@@ -674,3 +674,23 @@ class NotificationRecord(Base):
     status: Mapped[str] = mapped_column(String(8), default="SENT")  # SENT/FAILED/SKIPPED
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
+
+class WatchItem(Base):
+    """
+    监控标的表(盘中/每日监控池)
+    分类: holding=持仓 / hot=热门自动加入 / watched=主动勾选监控 /
+          stock=股票 / etf=ETF / default=默认池
+    一个标的可属于多个分类(categories 逗号分隔)。
+    """
+    __tablename__ = "watchlist"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(12), unique=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    asset_type: Mapped[str] = mapped_column(String(8), default="etf")   # etf/stock
+    categories: Mapped[str] = mapped_column(String(64), default="watched")  # holding,hot,watched,stock,etf,default
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)         # 是否参与监控扫描
+    priority: Mapped[int] = mapped_column(Integer, default=0)            # 优先级(高者先扫)
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+

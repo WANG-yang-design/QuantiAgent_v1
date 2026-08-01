@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area,
 } from "recharts";
-import { Pause, Play, XCircle, Wallet, TrendingUp, TrendingDown, PiggyBank } from "lucide-react";
+import { Pause, Play, XCircle, Wallet, TrendingUp, TrendingDown, PiggyBank, Radar } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
 
@@ -27,11 +27,48 @@ export default function Dashboard() {
   ];
   const eqData = (equity || []).map((p) => ({ t: p.time.slice(5, 16), v: p.total_asset }));
 
+  // 大盘指数 + 牛熊诊断
+  const { data: idx } = useQuery({
+    queryKey: ["indexes"], queryFn: () => api.get("/api/index/overview"), refetchInterval: 30000,
+  });
+  const { data: diag } = useQuery({
+    queryKey: ["diagnosis"], queryFn: () => api.get("/api/market/diagnosis"), refetchInterval: 300000,
+  });
+  const diagColor = diag?.state === "risk_on" ? "text-up" : diag?.state === "risk_off" ? "text-down" : "text-amber-600";
+
   return (
     <div className="p-5 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold text-brand-600">仪表盘</h1>
         <SystemBar />
+      </div>
+
+      {/* 大盘指数 + 牛熊诊断 */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+        {(idx?.indexes || []).map((ix) => (
+          <div key={ix.code} className="card flex items-center justify-between">
+            <div>
+              <div className="text-xs text-gray-500">{ix.name}</div>
+              <div className={`text-xl font-bold ${ix.color === "up" ? "text-up" : ix.color === "down" ? "text-down" : ""}`}>
+                {ix.price}
+              </div>
+            </div>
+            <div className={`text-sm font-semibold ${ix.color === "up" ? "text-up" : ix.color === "down" ? "text-down" : ""}`}>
+              {ix.change_pct > 0 ? "+" : ""}{ix.change_pct}%
+            </div>
+          </div>
+        ))}
+        <div className={`card border-l-4 ${diag?.state === "risk_on" ? "border-red-500" : diag?.state === "risk_off" ? "border-green-500" : "border-amber-500"}`}>
+          <div className="flex items-center gap-2 text-xs text-gray-500">
+            <Radar size={14} className="text-brand-600" />
+            市场诊断(Agent)
+            <span className={`badge ${diag?.state === "risk_on" ? "bg-red-50 text-up" : diag?.state === "risk_off" ? "bg-green-50 text-down" : "bg-amber-50 text-amber-700"}`}>
+              {diag?.label || "-"}
+            </span>
+          </div>
+          <div className={`text-sm font-semibold mt-1 ${diagColor}`}>{diag?.advice || "计算中..."}</div>
+          <div className="text-[10px] text-gray-400 mt-1">依据上证/沪深300/中证500的20日动量与均线 · {diag?.time}</div>
+        </div>
       </div>
 
       {/* 指标卡片 */}

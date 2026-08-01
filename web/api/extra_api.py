@@ -429,6 +429,182 @@ def get_scan_status(task_id: str):
 
 
 # ================================================================
+# 9. 监控标的 API(持仓/热门/主动/股票/ETF 分类)
+# ================================================================
+@router.get("/watchlist", dependencies=[Depends(require_auth)])
+def get_watchlist():
+    """监控列表(按分类聚合)。"""
+    items = repo.get_watchlist()
+    # 同步持仓分类(持仓自动加入监控)
+    from workflows.intraday_monitor_workflow import get_broker
+    try:
+        for p in get_broker().get_positions():
+            repo.upsert_watch_item(p["symbol"], p.get("name", ""), "etf",
+                                   categories=["holding"], enabled=True, priority=100)
+    except Exception:
+        pass
+    items = repo.get_watchlist()
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/watchlist", dependencies=[Depends(require_auth)])
+def add_watch_item(body: dict):
+    """添加监控标的: {symbol, name?, asset_type?, categories?}"""
+    symbol = str(body.get("symbol", "")).upper()
+    if not symbol or len(symbol) < 6:
+        raise HTTPException(status_code=400, detail="标代码无效")
+    asset_type = body.get("asset_type", "etf" if symbol[0] in "15" else "stock")
+    # 尝试补全名称(从ETF现货列表)
+    name = body.get("name", "")
+    if not name:
+        try:
+            spot = get_market_service().get_etf_spot()
+            hit = next((x for x in spot if x["symbol"] == symbol), None)
+            name = hit.get("name", "") if hit else ""
+        except Exception:
+            pass
+    cats = body.get("categories") or ["watched"]
+    repo.upsert_watch_item(symbol, name, asset_type, cats, enabled=True)
+    return {"ok": True, "symbol": symbol, "name": name}
+
+
+@router.delete("/watchlist/{symbol}", dependencies=[Depends(require_auth)])
+def remove_watch_item_api(symbol: str):
+    repo.remove_watch_item(symbol.upper())
+    return {"ok": True}
+
+
+@router.post("/watchlist/{symbol}/enable", dependencies=[Depends(require_auth)])
+def set_watch_enable(symbol: str, body: dict):
+    repo.set_watch_enabled(symbol.upper(), bool(body.get("enabled", True)))
+    return {"ok": True}
+
+
+@router.post("/watchlist/{symbol}/categories", dependencies=[Depends(require_auth)])
+def set_watch_cats(symbol: str, body: dict):
+    repo.set_watch_categories(symbol.upper(), body.get("categories") or ["watched"])
+    return {"ok": True}
+
+
+# ================================================================
+# 10. 大盘指数概览 + 牛熊诊断
+# ================================================================
+_INDEX_MAP = {
+    "sh000001": "上证指数", "sh000300": "沪深300",
+    "sh000905": "中证500", "sz399006": "创业板指",
+}
+
+
+@router.get("/index/overview", dependencies=[Depends(require_auth)])
+def get_index_overview():
+    """大盘指数实时概览(新浪行情)。"""
+    import httpx
+    codes = list(_INDEX_MAP.keys())
+    try:
+        resp = httpx.get(f"https://hq.sinajs.cn/list={','.join(codes)}",
+                         headers={"Referer": "https://finance.sina.com.cn/"}, timeout=10)
+        text = resp.content.decode("gbk", errors="ignore")
+    except Exception as exc:
+        logger.warning("指数行情获取失败: %s", exc)
+        return {"indexes": [], "time": datetime.now().strftime("%H:%M:%S")}
+    indexes = []
+    for line in text.strip().splitlines():
+        if '="' not in line:
+            continue
+        key = line.split("=")[0].split("_")[-1]
+        parts = line.split('="')[1].rstrip('";').split(",")
+        if len(parts) < 32:
+            continue
+        name = _INDEX_MAP.get(key, parts[0])
+        try:
+            price = float(parts[3])
+            prev = float(parts[2])
+            chg = (price / prev - 1) * 100 if prev else 0.0
+        except (ValueError, IndexError):
+            continue
+        indexes.append({"code": key, "name": name, "price": round(price, 2),
+                        "change_pct": round(chg, 2),
+                        "color": "up" if chg > 0.05 else ("down" if chg < -0.05 else "flat")})
+    return {"indexes": indexes, "time": datetime.now().strftime("%H:%M:%S")}
+
+
+@router.get("/market/diagnosis", dependencies=[Depends(require_auth)])
+def get_market_diagnosis(refresh: int = 0):
+    """
+    牛熊诊断(规则为主, 30分钟缓存):
+    基于四大指数 20日动量/均线排列/回撤 → 判断 risk_on/neutral/risk_off + 建议。
+    refresh=1 时强制重新计算。
+    """
+    global _diagnosis_cache
+    now_ts = time.time()
+    if refresh != 1 and _diagnosis_cache and now_ts - _diagnosis_cache[0] < 1800:
+        return _diagnosis_cache[1]
+
+    from datetime import timedelta as _td
+    svc = get_market_service()
+    end = date.today()
+    start = end - _td(days=160)
+    detail = []
+    scores = []
+    for code in ["000300", "000905", "000001"]:
+        bars = svc.get_index_bars(code, start, end)
+        if len(bars) < 21:
+            continue
+        closes = [b["close"] for b in bars]
+        mom20 = closes[-1] / closes[-21] - 1
+        ma20 = sum(closes[-20:]) / 20
+        ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else ma20
+        above_ma = closes[-1] > ma20
+        peak = max(closes[-60:]) if len(closes) >= 60 else max(closes)
+        drawdown = closes[-1] / peak - 1
+        s = 0
+        if mom20 > 0.02: s += 1
+        elif mom20 < -0.02: s -= 1
+        if above_ma: s += 1
+        else: s -= 1
+        if drawdown < -0.10: s -= 1
+        scores.append(s)
+        detail.append({"code": code, "mom20": round(mom20, 4),
+                       "above_ma20": above_ma, "drawdown60": round(drawdown, 4),
+                       "score": s})
+    total = sum(scores)
+    if total >= 2:
+        state, label, advice = "risk_on", "偏牛/进攻", "指数趋势向上, 可保持较高仓位, 优先强势板块(动量排名靠前)。"
+    elif total <= -2:
+        state, label, advice = "risk_off", "偏熊/防守", "指数趋势向下, 建议降低总仓位、提高现金比例, 只参与超跌反弹并严设止损。"
+    else:
+        state, label, advice = "neutral", "震荡/观望", "多空信号交织, 建议中性仓位, 等待方向明确, 谨慎追涨杀跌。"
+    result = {"state": state, "label": label, "advice": advice,
+              "score": total, "detail": detail,
+              "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    _diagnosis_cache = (now_ts, result)
+    return result
+
+
+_diagnosis_cache: Optional[tuple] = None
+
+
+# ================================================================
+# 11. 股票池(可选启用)
+# ================================================================
+@router.get("/stocks/spot", dependencies=[Depends(require_auth)])
+def get_stock_spot(limit: int = 100):
+    """A股实时列表(供添加股票到监控)。"""
+    import akshare as ak
+    try:
+        df = ak.stock_zh_a_spot_em()
+        sub = df.head(limit)
+        return {"stocks": [
+            {"symbol": str(r["代码"]), "name": str(r["名称"]),
+             "latest_price": float(r["最新价"] or 0),
+             "change_pct": float(r["涨跌幅"] or 0)}
+            for _, r in sub.iterrows()]}
+    except Exception as exc:
+        logger.warning("股票列表获取失败: %s", exc)
+        return {"stocks": [], "error": str(exc)}
+
+
+# ================================================================
 # 8. 风控限额配置(展示用)
 # ================================================================
 @router.get("/risk/limits", dependencies=[Depends(require_auth)])

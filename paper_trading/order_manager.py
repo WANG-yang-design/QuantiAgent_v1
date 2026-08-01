@@ -301,16 +301,23 @@ class OrderManager:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _calc_fee(side: str, price: float, qty: int) -> float:
-        """手续费: 佣金(万2.5, 最低5元) + 印花税(卖出, 万5) + 过户费(万0.1)。"""
+    def _calc_fee(side: str, price: float, qty: int, asset_type: str = "etf") -> float:
+        """
+        手续费(按资产类型区分):
+        - ETF(场内基金): 佣金按实际费率, 无最低5元门槛, 免印花税
+        - 股票: 佣金最低5元 + 卖出印花税万5
+        """
         rules = get_settings().section("trading_rules")
         fees = rules.get("fees", {})
         amount = price * qty
-        commission = max(amount * float(fees.get("commission_rate", 0.00025)),
-                         float(fees.get("commission_min", 5.0)))
+        rate = float(fees.get("commission_rate", 0.00025))
+        if asset_type == "etf":
+            commission = max(amount * rate,
+                             float(fees.get("commission_min_etf", 0.0)))
+            tax = 0.0
+        else:
+            commission = max(amount * rate,
+                             float(fees.get("commission_min", 5.0)))
+            tax = amount * float(fees.get("stamp_tax_rate", 0.0005)) if side == "SELL" else 0.0
         transfer = amount * float(fees.get("transfer_fee_rate", 0.00001))
-        tax = 0.0
-        if side == "SELL" and fees.get("stamp_tax_etf", False) is False:
-            # ETF 免印花税; 股票卖出收万5 —— V1 统一按 ETF 处理, 股票留开关
-            tax = amount * float(fees.get("stamp_tax_rate", 0.0005)) * 0.0
         return round(commission + transfer + tax, 4)

@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Search, Zap, Star, ArrowLeft } from "lucide-react";
 import { api } from "../api/client";
 import KlineChart from "../components/KlineChart";
@@ -10,6 +10,7 @@ import { fmt, Spin, Empty, chgColor } from "../components/Common";
 export default function SymbolDetail() {
   const { code } = useParams();
   const nav = useNavigate();
+  const qc = useQueryClient();
   const [searchCode, setSearchCode] = useState("");
   const symbol = (searchCode || code || "").toUpperCase();
 
@@ -28,6 +29,17 @@ export default function SymbolDetail() {
   const [analyzing, setAnalyzing] = useState(false);
   const [scanResult, setScanResult] = useState(null);
   const [scanTask, setScanTask] = useState(null);
+  const [inWatch, setInWatch] = useState(false);
+  const { data: watch } = useQuery({ queryKey: ["watchlist"], queryFn: () => api.get("/api/watchlist"), refetchInterval: 60000 });
+  useEffect(() => {
+    if (watch?.items) setInWatch(watch.items.some((i) => i.symbol === symbol));
+  }, [watch, symbol]);
+  const addWatch = useMutation({
+    mutationFn: () => (inWatch
+      ? api.delete(`/api/watchlist/${symbol}`)
+      : api.post("/api/watchlist", { symbol, categories: ["watched"] })),
+    onSuccess: () => { setInWatch(!inWatch); qc.invalidateQueries({ queryKey: ["watchlist"] }); },
+  });
   const runScan = useMutation({
     mutationFn: async () => {
       setAnalyzing(true);
@@ -86,6 +98,14 @@ export default function SymbolDetail() {
         </form>
         <button className="btn-primary" disabled={runScan.isPending || analyzing} onClick={() => runScan.mutate()}>
           <Zap size={14} className="inline mr-1" />{analyzing ? "分析中..." : "立即分析"}
+        </button>
+        <button
+          className={inWatch ? "btn-green" : "btn-ghost"}
+          onClick={() => addWatch.mutate()}
+          title={inWatch ? "已加入监控, 点击移除" : "加入监控列表"}
+        >
+          <Star size={14} className={`inline mr-1 ${inWatch ? "fill-current" : ""}`} />
+          {inWatch ? "监控中" : "加入自选"}
         </button>
       </div>
 
@@ -201,3 +221,4 @@ export default function SymbolDetail() {
     </div>
   );
 }
+

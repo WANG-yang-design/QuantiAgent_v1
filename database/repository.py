@@ -598,3 +598,72 @@ def get_tool_permission(agent_name: str) -> Dict[str, str]:
     with get_session() as s:
         rows = s.query(ToolPermission).filter_by(agent_name=agent_name).all()
         return {r.tool_name: r.permission for r in rows}
+
+
+# ================================================================
+# 监控标的 (watchlist)
+# ================================================================
+
+def upsert_watch_item(symbol: str, name: str, asset_type: str = "etf",
+                      categories: Optional[List[str]] = None,
+                      enabled: bool = True, priority: int = 0):
+    """新增/更新监控标的(幂等)。categories 合并而非覆盖。"""
+    from database.models import WatchItem
+    cats = categories or ["watched"]
+    with get_session() as s:
+        item = s.query(WatchItem).filter_by(symbol=symbol).first()
+        if item is None:
+            s.add(WatchItem(symbol=symbol, name=name, asset_type=asset_type,
+                            categories=",".join(dict.fromkeys(cats)),
+                            enabled=enabled, priority=priority))
+        else:
+            cur = set(item.categories.split(",")) if item.categories else set()
+            cur.update(cats)
+            item.categories = ",".join(dict.fromkeys(cur))
+            item.name = name or item.name
+            item.asset_type = asset_type
+            item.priority = max(item.priority, priority)
+            item.enabled = enabled
+            item.updated_at = datetime.now()
+
+
+def set_watch_enabled(symbol: str, enabled: bool):
+    from database.models import WatchItem
+    with get_session() as s:
+        item = s.query(WatchItem).filter_by(symbol=symbol).first()
+        if item:
+            item.enabled = enabled
+            item.updated_at = datetime.now()
+
+
+def set_watch_categories(symbol: str, categories: List[str]):
+    from database.models import WatchItem
+    with get_session() as s:
+        item = s.query(WatchItem).filter_by(symbol=symbol).first()
+        if item:
+            item.categories = ",".join(dict.fromkeys(categories))
+            item.updated_at = datetime.now()
+
+
+def remove_watch_item(symbol: str):
+    from database.models import WatchItem
+    with get_session() as s:
+        s.query(WatchItem).filter_by(symbol=symbol).delete()
+        s.commit()
+
+
+def get_watchlist(enabled_only: bool = False) -> List[Dict[str, Any]]:
+    """监控列表(按优先级+加入时间排序)。"""
+    from database.models import WatchItem
+    with get_session() as s:
+        q = s.query(WatchItem)
+        if enabled_only:
+            q = q.filter(WatchItem.enabled == True)  # noqa: E712
+        rows = q.order_by(WatchItem.priority.desc(), WatchItem.added_at).all()
+        return [
+            {"symbol": r.symbol, "name": r.name, "asset_type": r.asset_type,
+             "categories": r.categories.split(",") if r.categories else [],
+             "enabled": r.enabled, "priority": r.priority,
+             "added_at": str(r.added_at)[:16]}
+            for r in rows
+        ]

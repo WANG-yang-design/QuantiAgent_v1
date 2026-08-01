@@ -95,7 +95,7 @@ class QuantScheduler:
         logger.info("交易日历更新: %d 个交易日", len(dates))
 
     def job_update_symbols(self):
-        """ETF/股票基础信息(每日08:10)。"""
+        """ETF/股票基础信息(每日08:10) + 热门ETF自动加入监控池。"""
         from database import repository as repo
         svc = get_market_service()
         spot = svc.get_etf_spot()
@@ -107,7 +107,14 @@ class QuantScheduler:
                 "asset_type": "etf", "exchange": exchange, "status": "active",
             }])
             symbols.append(s["symbol"])
-        logger.info("ETF池更新: %d 只", len(symbols))
+        # 热门ETF自动加入监控池(成交额Top20, 分类=hot)
+        min_amount = float(self.settings.get("universe.min_etf_amount", 5e7))
+        hot = sorted([s for s in spot if s.get("amount", 0) >= min_amount],
+                     key=lambda x: x.get("amount", 0), reverse=True)[:20]
+        for s in hot:
+            repo.upsert_watch_item(s["symbol"], s["name"], "etf",
+                                   categories=["hot"], enabled=True, priority=10)
+        logger.info("ETF池更新: %d 只, 热门监控加入 %d 只", len(symbols), len(hot))
 
     def job_premarket_news(self):
         """盘前新闻公告扫描(08:30)。"""
@@ -164,16 +171,28 @@ class QuantScheduler:
         ns.fetch_and_store_sentiment([s["symbol"] for s in uni])
 
     def job_agent_routine_analysis(self):
-        """Agent 常规分析(默认30分钟, 池内标的)。"""
-        from workflows.intraday_monitor_workflow import run_intraday_scan
+        """Agent 常规分析(默认30分钟): 扫描监控池(enabled标的, 按优先级/顺序限流)。"""
+        from workflows.intraday_monitor_workflow import run_pool_scan
         from core.config import get_settings as gs
+        from database import repository as repo
         interval = int(gs().get("intraday.analysis_interval_min", 30))
-        uni = self._current_universe(int(gs().get("universe.max_symbols_per_scan", 20)))
-        for s in uni[:3]:   # 常规分析限流: 每轮3只
-            try:
-                asyncio.run(run_intraday_scan(s["symbol"], s.get("name", ""), "etf"))
-            except Exception as exc:
-                logger.error("常规分析失败 %s: %s", s["symbol"], exc)
+        watch = repo.get_watchlist(enabled_only=True)
+        # 持仓优先(priority已加权), 每轮最多扫描 max_symbols 只(限流)
+        max_syms = int(gs().get("universe.max_symbols_per_scan", 20))
+        targets = [w for w in watch if w["enabled"]][:max_syms]
+        if not targets:
+            logger.info("监控池为空, 跳过常规分析")
+            return
+        symbols = [w["symbol"] for w in targets]
+        name_map = {w["symbol"]: w["name"] for w in targets}
+        import asyncio
+        try:
+            results = asyncio.run(run_pool_scan(symbols, name_map, max_concurrent=3))
+            done = sum(1 for r in results if r.get("chief"))
+            logger.info("常规分析完成: 扫描%d只, 产生研究结论%d个(间隔%d分钟)",
+                        len(symbols), done, interval)
+        except Exception as exc:
+            logger.error("常规分析失败: %s", exc)
 
     def job_eod_data_update(self):
         """收盘数据更新(15:10): 日K落库。"""

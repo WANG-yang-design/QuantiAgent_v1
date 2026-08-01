@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -9,7 +9,6 @@ import { api, poll } from "../api/client";
 import { SystemBar, fmt, Empty } from "../components/Common";
 
 const HOT_ETFS = ["510300", "159915", "588000", "512100", "159949", "513100", "512690", "515880", "512170", "588050"];
-
 function MetricCard({ label, value, color = "" }) {
   return (
     <div className="card text-center">
@@ -25,9 +24,31 @@ export default function BacktestCenter() {
     symbols: HOT_ETFS.slice(0, 5), start: "2025-06-01", end: "2026-07-31",
     initial_cash: 100000, mode: "daily", use_agents: false, name: "",
   });
+  const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [error, setError] = useState(null);
+
+  // 标的池: 来自监控列表(代码+中文名) + 常用ETF + 自定义添加
+  const { data: watch } = useQuery({ queryKey: ["watchlist"], queryFn: () => api.get("/api/watchlist"), refetchInterval: 60000 });
+  const pool = useMemo(() => {
+    const seen = new Set();
+    const list = [];
+    for (const w of watch?.items || []) {
+      if (w.enabled && !seen.has(w.symbol)) { seen.add(w.symbol); list.push({ symbol: w.symbol, name: w.name }); }
+    }
+    for (const s of HOT_ETFS) {
+      if (!seen.has(s)) { seen.add(s); list.push({ symbol: s, name: "" }); }
+    }
+    return list;
+  }, [watch]);
+
+  const addCustom = () => {
+    const code = customCode.trim().toUpperCase();
+    if (!/^\d{6}$/.test(code)) return;
+    if (!form.symbols.includes(code)) setForm({ ...form, symbols: [...form.symbols, code] });
+    setCustomCode("");
+  };
 
   const { data: history } = useQuery({ queryKey: ["btlist"], queryFn: () => api.get("/api/backtest/list?limit=10"), refetchInterval: running ? 5000 : false });
 
@@ -73,14 +94,20 @@ export default function BacktestCenter() {
       {/* 表单 */}
       <div className="card grid grid-cols-1 md:grid-cols-3 gap-4">
         <div>
-          <div className="text-xs text-gray-500 mb-1.5">标的池(ETF)</div>
-          <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-            {HOT_ETFS.map((s) => (
-              <button key={s} onClick={() => toggleSym(s)}
-                className={`badge ${form.symbols.includes(s) ? "bg-brand-600 text-white" : "bg-gray-100 text-gray-600"}`}>
-                {s}
+          <div className="text-xs text-gray-500 mb-1.5">标的池(来自监控列表+常用, 代码/名称)</div>
+          <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto mb-2">
+            {pool.map(({ symbol, name }) => (
+              <button key={symbol} onClick={() => toggleSym(symbol)}
+                className={`badge ${form.symbols.includes(symbol) ? "bg-brand-600 text-white" : "bg-gray-100 text-gray-600"}`}
+                title={name || symbol}>
+                {symbol} {name && <span className="opacity-70">·{name}</span>}
               </button>
             ))}
+          </div>
+          <div className="flex gap-2">
+            <input className="input w-28" placeholder="自定义代码" value={customCode}
+              onChange={(e) => setCustomCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addCustom()} />
+            <button type="button" className="btn-ghost" onClick={addCustom}>添加</button>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-3">

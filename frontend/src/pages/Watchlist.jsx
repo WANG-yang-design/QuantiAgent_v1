@@ -1,36 +1,35 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Plus, Trash2, ArrowUpDown, RefreshCw } from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
+import { SystemBar, fmt, fmtWan, Empty } from "../components/Common";
 
-const LS_KEY = "quantiagent_watchlist";
-const DEFAULTS = ["510300", "159915", "588000", "512100", "159949", "513100", "512690", "515880"];
-
-function loadList() {
-  try { return JSON.parse(localStorage.getItem(LS_KEY)) || DEFAULTS; } catch { return DEFAULTS; }
-}
-function saveList(l) { localStorage.setItem(LS_KEY, JSON.stringify(l)); }
-
-/** 实时盯盘: 自选池 10s 自动刷新, 红涨绿跌, 大波动高亮 */
+/** 实时盯盘: 自选池来自"监控标的"(DB持久化), 10s自动刷新 */
 export default function Watchlist() {
   const nav = useNavigate();
   const qc = useQueryClient();
-  const [list, setList] = useState(loadList);
   const [addCode, setAddCode] = useState("");
   const [mode, setMode] = useState("watchlist");   // watchlist / top100
   const [sortKey, setSortKey] = useState("change_pct");
-  const [prev, setPrev] = useState({});            // 上一轮价格(检测大波动)
+  const [prev, setPrev] = useState({});
   const [flash, setFlash] = useState({});
 
+  const { data: watch } = useQuery({
+    queryKey: ["watchlist"],
+    queryFn: () => api.get("/api/watchlist"),
+    refetchInterval: 60000,
+  });
+  const watchSymbols = (watch?.items || []).filter((i) => i.enabled).map((i) => i.symbol);
+
   const { data, isFetching } = useQuery({
-    queryKey: ["quotes", mode, list],
-    queryFn: () => api.get("/api/quotes", { symbols: mode === "watchlist" ? list.join(",") : "", limit: 60 }),
+    queryKey: ["quotes", mode, watchSymbols],
+    queryFn: () => api.get("/api/quotes", { symbols: mode === "watchlist" ? watchSymbols.join(",") : "", limit: 60 }),
+    enabled: mode === "top100" || watchSymbols.length > 0,
     refetchInterval: 10000,
   });
 
-  // 大波动检测(>2%): 高亮 2 秒
+  // 大波动检测(>0.2%): 高亮 2 秒
   useEffect(() => {
     const q = data?.quotes || [];
     const now = {};
@@ -53,19 +52,15 @@ export default function Watchlist() {
     mutationFn: async () => {
       const code = addCode.trim().toUpperCase();
       if (!/^\d{6}$/.test(code)) throw new Error("请输入6位代码");
-      if (!list.includes(code)) {
-        const nl = [...list, code];
-        saveList(nl);
-        setList(nl);
-      }
+      await api.post("/api/watchlist", { symbol: code, categories: ["watched"] });
       setAddCode("");
     },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
   });
-  const remove = (code) => {
-    const nl = list.filter((c) => c !== code);
-    saveList(nl);
-    setList(nl);
-  };
+  const remove = useMutation({
+    mutationFn: (code) => api.delete(`/api/watchlist/${code}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+  });
 
   const rows = useMemo(() => {
     const arr = [...(data?.quotes || [])];
@@ -134,7 +129,7 @@ export default function Watchlist() {
                   <td className="td text-gray-500">{fmt(q.iopv)}</td>
                   <td className="td">
                     {mode === "watchlist" && (
-                      <button className="text-gray-300 hover:text-red-500" onClick={(e) => { e.stopPropagation(); remove(q.symbol); }}>
+                      <button className="text-gray-300 hover:text-red-500" onClick={(e) => { e.stopPropagation(); remove.mutate(q.symbol); }}>
                         <Trash2 size={14} />
                       </button>
                     )}
@@ -149,3 +144,4 @@ export default function Watchlist() {
     </div>
   );
 }
+

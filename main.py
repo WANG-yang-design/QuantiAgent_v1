@@ -201,6 +201,63 @@ def cmd_test_email(args):
     print(f"邮件发送: {'成功' if ok else '失败(检查 .env 配置)'}")
 
 
+def cmd_init_portfolio(args):
+    """导入初始模拟盘持仓(重置账户后写入真实持仓)。"""
+    import json as _json
+    from database import repository as repo
+    from database.models import Account, Position, Order, Trade, AccountSnapshot
+    from paper_trading.paper_account import PaperAccount
+
+    path = args.file
+    with open(path, "r", encoding="utf-8") as f:
+        data = _json.load(f)
+    acc_id = data.get("account_id", "PA-001")
+
+    # 1. 重置: 清空该账户的订单/成交/快照/持仓
+    with repo.get_session() as s:
+        s.query(Trade).filter(Trade.order_id.in_(
+            s.query(Order.order_id).filter(Order.account_id == acc_id))).delete(synchronize_session=False)
+        s.query(Order).filter_by(account_id=acc_id).delete()
+        s.query(Position).filter_by(account_id=acc_id).delete()
+        s.query(AccountSnapshot).filter_by(account_id=acc_id).delete()
+
+    # 2. 账户资金
+    acc = repo.get_account(acc_id)
+    if acc is None:
+        acc = Account(account_id=acc_id, account_type="paper", init_cash=0)
+    acc.init_cash = float(data["initial_cash"])
+    acc.cash = float(data["cash"])
+    acc.frozen_cash = 0.0
+    acc.total_pnl = 0.0
+    acc.day_pnl = 0.0
+    acc.total_fee = 0.0
+    repo.save_account(acc)
+
+    # 3. 写入持仓(T+1: 全部可卖)
+    total_mv = 0.0
+    for p in data.get("positions", []):
+        pos = Position(
+            position_id=f"POS-{acc_id}-{p['symbol']}",
+            account_id=acc_id, symbol=p["symbol"], name=p.get("name", ""),
+            total_qty=int(p["total_qty"]), available_qty=int(p["available_qty"]),
+            frozen_qty=0, today_buy_qty=0,
+            cost_price=float(p["cost_price"]), latest_price=float(p["latest_price"]),
+            market_value=float(p["total_qty"]) * float(p["latest_price"]),
+            pnl=float(p.get("pnl", 0)), pnl_pct=float(p.get("pnl_pct", 0)),
+        )
+        repo.save_position(pos)
+        total_mv += pos.market_value
+
+    # 4. 刷新账户市值/总资产
+    acc = repo.get_account(acc_id)
+    acc.market_value = total_mv
+    acc.total_asset = acc.cash + acc.market_value
+    repo.save_account(acc)
+    print(f"[OK] 模拟盘持仓初始化完成: 账户 {acc_id}")
+    print(f"     总资产 ¥{acc.total_asset:,.2f} = 现金 ¥{acc.cash:,.2f} + 市值 ¥{total_mv:,.2f}")
+    print(f"     持仓 {len(data.get('positions', []))} 只")
+
+
 def cmd_rag(args):
     """RAG 检索测试: python main.py rag "ETF 溢价风险" """
     from data_service.rag_service import get_rag_service
@@ -264,6 +321,10 @@ def main():
     p.set_defaults(fn=cmd_confirm)
 
     sub.add_parser("test-email").set_defaults(fn=cmd_test_email)
+
+    p = sub.add_parser("init-portfolio", help="导入初始模拟盘持仓(data/portfolio_init.json)")
+    p.add_argument("--file", default="data/portfolio_init.json")
+    p.set_defaults(fn=cmd_init_portfolio)
 
     p = sub.add_parser("rag")
     p.add_argument("query")

@@ -5,8 +5,9 @@
 # 手续费
 fees:
   commission_rate: 0.00025       # 佣金 万2.5
-  commission_min: 5.0            # 最低佣金 5元
-  stamp_tax_rate: 0.0005         # 印花税(仅卖出) 万5
+  commission_min: 5.0            # 最低佣金 5元(仅股票)
+  commission_min_etf: 0.0        # ETF 无最低佣金门槛(场内基金按实际佣金)
+  stamp_tax_rate: 0.0005         # 印花税(仅卖出股票) 万5
   transfer_fee_rate: 0.00001     # 过户费 万0.1
   # ETF 不收印花税
   stamp_tax_etf: false

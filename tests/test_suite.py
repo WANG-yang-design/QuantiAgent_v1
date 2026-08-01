@@ -101,11 +101,14 @@ class TestPaperTrading(unittest.TestCase):
 
     def test_fee_calc(self):
         from paper_trading.order_manager import OrderManager
-        fee = OrderManager._calc_fee("BUY", 100.0, 100)
-        # 佣金万2.5 = 2.5元 < 最低5元 → 5元 + 过户费 100*100*0.00001=0.1
-        self.assertAlmostEqual(fee, 5.1, places=2)
-        fee2 = OrderManager._calc_fee("BUY", 100.0, 10000)
-        # 佣金 = 100*10000*0.00025 = 250 + 过户费 10
+        # ETF: 佣金万2.5=2.5元, 无最低5元门槛, 过户费0.1
+        fee = OrderManager._calc_fee("BUY", 100.0, 100, asset_type="etf")
+        self.assertAlmostEqual(fee, 2.6, places=2)
+        # 股票: 佣金最低5元
+        fee_stock = OrderManager._calc_fee("BUY", 100.0, 100, asset_type="stock")
+        self.assertAlmostEqual(fee_stock, 5.1, places=2)
+        # 大额: 佣金=250 + 过户费10
+        fee2 = OrderManager._calc_fee("BUY", 100.0, 10000, asset_type="etf")
         self.assertAlmostEqual(fee2, 260.0, places=2)
 
 
