@@ -1,10 +1,30 @@
-import { useState, useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Zap, ChevronDown, ChevronRight, Target } from "lucide-react";
+import { Zap, ChevronDown, ChevronRight, Target, Download } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, Empty, Spin } from "../components/Common";
 import DecisionTimeline from "../components/DecisionTimeline";
 import { useScanStore } from "../store/scanStore";
+
+/** 下载 JSON 文件(导出用) */
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function downloadCsv(filename, rows) {
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = rows.map((r) => r.map(esc).join(",")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 /** Agent 决策中心: 最近工作流列表 + 决策链路可视化 + 准确率归因 */
 export default function AgentCenter() {
@@ -112,8 +132,11 @@ export default function AgentCenter() {
                 return (
                   <button key={t.trace_id} className={`w-full text-left px-3 py-2 rounded-lg border ${sel ? "border-brand-600 bg-brand-50" : "border-gray-100 hover:bg-gray-50"}`}
                     onClick={() => setTraceId(t.trace_id)}>
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-sm">{t.symbol || "全市场"}</span>
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-sm">
+                      {t.symbol || "全市场"}
+                      {t.name && <span className="text-gray-400 font-normal"> · {t.name}</span>}
+                    </span>
                       {t.latest_status === "RUNNING" ? (
                         <span className="badge bg-amber-50 text-amber-700 animate-pulse">运行中</span>
                       ) : t.failed ? (
@@ -126,15 +149,23 @@ export default function AgentCenter() {
                       {t.start} · {t.runs.length}个节点
                       {t.chief && <> · <b className={t.chief.decision === "BUY_CANDIDATE" ? "text-up" : "text-gray-700"}>{t.chief.decision}</b></>}
                     </div>
-                    {sel ? <ChevronDown size={14} className="absolute" /> : <ChevronRight size={14} className="absolute" />}
+                    {sel ? <ChevronDown size={14} className="ml-auto shrink-0 text-brand-600" /> : <ChevronRight size={14} className="ml-auto shrink-0 text-gray-300" />}
                   </button>
                 );
               }) : <Empty text="暂无工作流记录(先执行 scan)" />}
             </div>
           </div>
 
-          <div className="card lg:col-span-2">
-            <div className="card-title">决策链路 {traceId ? `· ${traceId.slice(0, 20)}...` : ""}</div>
+        <div className="card lg:col-span-2">
+          <div className="card-title flex items-center justify-between">
+            <span>决策链路 {traceId ? `· ${traceId.slice(0, 20)}...` : ""}</span>
+            {trace && (
+              <button className="btn-ghost text-xs" onClick={() => downloadJson(
+                `agent_trace_${trace.trace_id.slice(0, 16)}.json`, trace)}>
+                <Download size={13} className="inline mr-1" />导出链路JSON
+              </button>
+            )}
+          </div>
             {traceId ? (
               trace ? (
                 <div className="max-h-[600px] overflow-y-auto pr-1">
@@ -179,3 +210,4 @@ export default function AgentCenter() {
     </div>
   );
 }
+

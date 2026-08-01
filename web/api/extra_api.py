@@ -321,14 +321,21 @@ def get_backtest_status(run_id: str):
 @router.get("/workflow/traces", dependencies=[Depends(require_auth)])
 def list_workflow_traces(limit: int = 20):
     """最近工作流: 按 trace_id 聚合 Agent 运行记录(状态: DONE/FAILED/RUNNING)。"""
-    from database.models import AgentRun, AgentOutput
+    from database.models import AgentRun, AgentOutput, WatchItem, Symbol as SymModel
     with get_session() as s:
+        # 代码→名称映射(优先监控列表, 其次标的表)
+        name_map: Dict[str, str] = {}
+        for w in s.query(WatchItem).all():
+            name_map[w.symbol] = w.name
+        for sy in s.query(SymModel).all():
+            name_map.setdefault(sy.symbol, sy.name)
         rows = s.query(AgentRun).filter(AgentRun.trace_id != "") \
             .order_by(AgentRun.start_time.desc()).all()
         by_trace: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             t = by_trace.setdefault(r.trace_id, {
-                "trace_id": r.trace_id, "symbol": r.symbol, "start": str(r.start_time)[:19],
+                "trace_id": r.trace_id, "symbol": r.symbol, "name": name_map.get(r.symbol, ""),
+                "start": str(r.start_time)[:19],
                 "runs": [], "failed": False, "chief": None, "latest_status": "DONE",
             })
             t["runs"].append({"agent": r.agent_name, "status": r.status,

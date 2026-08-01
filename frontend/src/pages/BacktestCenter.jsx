@@ -4,9 +4,28 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
   AreaChart, Area, BarChart, Bar, Legend,
 } from "recharts";
-import { Play, History } from "lucide-react";
+import { Play, History, Download } from "lucide-react";
 import { api, poll } from "../api/client";
 import { SystemBar, fmt, Empty } from "../components/Common";
+
+function downloadJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function downloadCsv(filename, rows) {
+  const esc = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const csv = rows.map((r) => r.map(esc).join(",")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 const HOT_ETFS = ["510300", "159915", "588000", "512100", "159949", "513100", "512690", "515880", "512170", "588050"];
 function MetricCard({ label, value, color = "" }) {
@@ -244,7 +263,19 @@ export default function BacktestCenter() {
           </div>
 
           <div className="card">
-            <div className="card-title">交易明细 ({(metrics.trade_details || []).length}) {metrics.report_path && <a className="text-xs text-brand-600 underline ml-2" href={`/${metrics.report_path.split("/").pop()}`} target="_blank">查看报告</a>}</div>
+            <div className="card-title">交易明细 ({(metrics.trade_details || []).length}) {metrics.report_path && <a className="text-xs text-brand-600 underline ml-2" href={`/${metrics.report_path.split("/").pop()}`} target="_blank">查看报告</a>}
+              <span className="ml-auto flex gap-2">
+                <button className="btn-ghost text-xs" onClick={() => downloadJson(`backtest_${metrics.run_id}.json`, metrics)}>
+                  <Download size={13} className="inline mr-1" />导出JSON
+                </button>
+                <button className="btn-ghost text-xs" onClick={() => downloadCsv(`backtest_${metrics.run_id}_trades.csv`, [
+                  ["日期", "方向", "标的", "数量", "价格", "手续费", "盈亏"],
+                  ...(metrics.trade_details || []).map((t) => [String(t.date).slice(0, 10), t.side, t.symbol, t.qty, t.price, t.fee, t.pnl ?? ""]),
+                ])}>
+                  <Download size={13} className="inline mr-1" />导出交易CSV
+                </button>
+              </span>
+            </div>
             <div className="max-h-72 overflow-y-auto">
               <table className="w-full">
                 <thead><tr><th className="th">日期</th><th className="th">方向</th><th className="th">标的</th>

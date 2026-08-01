@@ -16,32 +16,8 @@ export default function SymbolDetail() {
   const symbol = (code || "").toUpperCase();
   const { taskId, symbol: scanSymbol, status: scanStatus, setTask, update } = useScanStore();
 
-  // 无代码: 搜索引导页
-  if (!symbol) {
-    return (
-      <div className="p-5 max-w-2xl mx-auto space-y-6">
-        <h1 className="text-lg font-bold text-brand-600">标的搜索</h1>
-        <form className="card flex gap-2 items-center"
-          onSubmit={(e) => { e.preventDefault(); if (/^\d{6}$/.test(searchCode)) nav(`/symbol/${searchCode}`); }}>
-          <input className="input flex-1 text-base py-2.5" placeholder="输入6位代码, 如 510300 / 159915 / 600519"
-            value={searchCode} onChange={(e) => setSearchCode(e.target.value)} autoFocus />
-          <button type="submit" className="btn-primary"><Search size={15} className="inline mr-1" />搜索</button>
-        </form>
-        <div className="card">
-          <div className="card-title"><TrendingUp size={14} />热门标的(点击查看详情)</div>
-          <div className="flex flex-wrap gap-2">
-            {["510300", "159915", "588000", "159611", "159692", "159516", "159141", "159697", "513400", "600519", "000001"].map((s) => (
-              <button key={s} className="badge bg-brand-50 text-brand-600 hover:bg-brand-100"
-                onClick={() => nav(`/symbol/${s}`)}>{s}</button>
-            ))}
-          </div>
-        </div>
-        <div className="text-xs text-gray-400">
-          提示: 侧边栏"标的详情"现在打开的是搜索页; 查看过的标的记录在左侧最近工作流与监控列表中。
-        </div>
-      </div>
-    );
-  }
+  // 注意: 搜索页的 return 必须放在所有 hooks 之后(文件末尾),
+  // 否则路由切换时 hooks 数量变化会导致 React 崩溃白屏。
 
   const { data: kline } = useQuery({
     queryKey: ["kline", symbol],
@@ -112,6 +88,11 @@ export default function SymbolDetail() {
     ["均线排列", t.bull_align ? "多头" : t.bear_align ? "空头" : "缠绕"],
     ["趋势强度", (t.trend_strength * 100)?.toFixed(0) + "%"],
   ];
+
+  // 无代码 → 搜索引导页(所有 hooks 之后的条件渲染, 保证 hooks 顺序一致)
+  if (!symbol) {
+    return <SymbolSearchPage nav={nav} searchCode={searchCode} setSearchCode={setSearchCode} />;
+  }
 
   return (
     <div className="p-5 space-y-4">
@@ -245,6 +226,33 @@ export default function SymbolDetail() {
             )) : <Empty text="暂无公告" />}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** 无代码时的搜索引导页(作为独立组件, 避免 hooks 顺序问题) */
+function SymbolSearchPage({ nav, searchCode, setSearchCode }) {
+  return (
+    <div className="p-5 max-w-2xl mx-auto space-y-6">
+      <h1 className="text-lg font-bold text-brand-600">标的搜索</h1>
+      <form className="card flex gap-2 items-center"
+        onSubmit={(e) => { e.preventDefault(); if (/^\d{6}$/.test(searchCode)) nav(`/symbol/${searchCode}`); }}>
+        <input className="input flex-1 text-base py-2.5" placeholder="输入6位代码, 如 510300 / 159915 / 600519"
+          value={searchCode} onChange={(e) => setSearchCode(e.target.value)} autoFocus />
+        <button type="submit" className="btn-primary"><Search size={15} className="inline mr-1" />搜索</button>
+      </form>
+      <div className="card">
+        <div className="card-title"><TrendingUp size={14} />热门标的(点击查看详情)</div>
+        <div className="flex flex-wrap gap-2">
+          {["510300", "159915", "588000", "159611", "159692", "159516", "159141", "159697", "513400", "600519", "000001"].map((s) => (
+            <button key={s} className="badge bg-brand-50 text-brand-600 hover:bg-brand-100"
+              onClick={() => nav(`/symbol/${s}`)}>{s}</button>
+          ))}
+        </div>
+      </div>
+      <div className="text-xs text-gray-400">
+        提示: 侧边栏"标的详情"现在打开的是搜索页; 查看过的标的记录在左侧最近工作流与监控列表中。
       </div>
     </div>
   );

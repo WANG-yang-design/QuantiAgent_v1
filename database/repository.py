@@ -607,7 +607,10 @@ def get_tool_permission(agent_name: str) -> Dict[str, str]:
 def upsert_watch_item(symbol: str, name: str, asset_type: str = "etf",
                       categories: Optional[List[str]] = None,
                       enabled: bool = True, priority: int = 0):
-    """新增/更新监控标的(幂等)。categories 合并而非覆盖。"""
+    """
+    新增/更新监控标的(幂等)。categories 合并而非覆盖。
+    重要: 已存在的标的不会修改 enabled —— 用户停用的标的不被自动任务重新启用。
+    """
     from database.models import WatchItem
     cats = categories or ["watched"]
     with get_session() as s:
@@ -623,7 +626,7 @@ def upsert_watch_item(symbol: str, name: str, asset_type: str = "etf",
             item.name = name or item.name
             item.asset_type = asset_type
             item.priority = max(item.priority, priority)
-            item.enabled = enabled
+            # enabled 保持用户设置(不覆盖停用状态)
             item.updated_at = datetime.now()
 
 
