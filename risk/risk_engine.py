@@ -215,15 +215,20 @@ class RiskEngine:
         return out
 
     def _check_symbol(self, plan, features, etf_features) -> Dict[str, Any]:
+        """
+        标的级风控。关键: 波动率/溢价/流动性规则只对 BUY 生效,
+        卖出(止损/减仓/轮动)必须放行 —— 否则高波动标的无法止损离场。
+        """
         sym_cfg = self.cfg.get("position_level", {})
         out = {"result": "PASS", "warnings": []}
         symbol = plan.get("symbol", "")
+        action = plan.get("action", "HOLD")
         if symbol in sym_cfg.get("blacklist", []):
             out["result"] = "REJECT"
             out["reason"] = f"{symbol} 在黑名单中"
             return out
-        # ETF 溢价禁止
-        if etf_features:
+        # ETF 溢价禁止(仅买入; 卖出不受溢价限制)
+        if etf_features and action == "BUY":
             premium = float(etf_features.get("premium_rate", 0) or 0)
             if sym_cfg.get("forbid_high_premium_etf") and premium > float(sym_cfg.get("max_premium_rate", 0.03)):
                 out["result"] = "REJECT"
@@ -234,12 +239,12 @@ class RiskEngine:
                 out["warnings"].append(f"流动性评分{liquidity:.0f}偏低")
                 out["reduce_to"] = 0.5
                 out["reason"] = "流动性不足降仓"
-        # 波动率限制
-        if features:
+        # 波动率限制(仅买入; 卖出止损不受波动率拦截)
+        if features and action == "BUY":
             vol = float(features.get("volatility_20d", 0) or 0)
             if vol > float(sym_cfg.get("max_volatility", 0.035)):
                 out["result"] = "REJECT"
-                out["reason"] = f"20日波动率{vol:.1%}超过上限"
+                out["reason"] = f"20日波动率{vol:.1%}超过上限, 禁止买入"
                 return out
             amount = float(features.get("amount_ma20", 0) or 0)
             if amount and amount < float(sym_cfg.get("min_avg_amount_20d", 3e7)):
@@ -263,21 +268,27 @@ class RiskEngine:
             out["result"] = "REJECT"
             out["reason"] = "单笔数量超限"
             return out
-        # 价格偏离保护
+        # 价格偏离保护(方向性):
+        #   BUY : 限价高于现价 2% 拒绝(防追高/手误)
+        #   SELL: 限价低于现价 5% 拒绝(防手误低价贱卖); 正常止损价放行
         limit_price = float(plan.get("limit_price", 0) or 0)
         if features and limit_price > 0:
             close = float(features.get("close", 0) or 0)
             if close > 0:
-                dev = abs(limit_price - close) / close
-                if dev > float(ord_cfg.get("max_price_deviation", 0.02)):
+                dev = (limit_price - close) / close
+                if plan.get("action") == "BUY" and dev > float(ord_cfg.get("max_price_deviation", 0.02)):
                     out["result"] = "REJECT"
-                    out["reason"] = f"委托价偏离最新价{dev:.2%}超过2%"
+                    out["reason"] = f"买入限价高于最新价{dev:.2%}超过2%"
                     return out
-        # 卖出可用数量
+                if plan.get("action") == "SELL" and dev < -float(ord_cfg.get("max_price_deviation", 0.02)):
+                    out["result"] = "REJECT"
+                    out["reason"] = f"卖出限价低于最新价{abs(dev):.2%}超过2%"
+                    return out
+        # 卖出可用数量(T+1: 不能卖超过可用)
         if plan.get("action") == "SELL":
-            avail = int(account_view.get("positions", {}) or 0)
-            from paper_trading.paper_account import PaperAccount
-            real_avail = PaperAccount().get_available_qty(plan.get("symbol", ""))
+            positions = account_view.get("positions") or []
+            pos = next((p for p in positions if p.get("symbol") == plan.get("symbol", "")), None)
+            real_avail = int(pos.get("available_qty", 0)) if pos else 0
             if qty > real_avail:
                 out["result"] = "REJECT"
                 out["reason"] = f"卖出数量{qty}超过可用{real_avail}(T+1)"

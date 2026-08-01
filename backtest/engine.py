@@ -102,8 +102,10 @@ class BacktestEngine:
         rules = get_settings().section("trading_rules")
         self.slippage = slippage if slippage is not None else float(
             rules.get("slippage", {}).get("daily_bar", 0.001))
-        self.fee_rate = float(rules.get("fees", {}).get("commission_rate", 0.00025))
-        self.fee_min = float(rules.get("fees", {}).get("commission_min", 5.0))
+        fees = rules.get("fees", {})
+        self.fee_rate = float(fees.get("commission_rate", 0.00025))
+        self.fee_min = float(fees.get("commission_min_etf", 0.0))   # ETF 免最低5元门槛
+        self.transfer_rate = float(fees.get("transfer_fee_rate", 0.00001))
         self.broker = BacktestBroker(initial_cash)
         self.run_id = gen_backtest_id()
         self.equity_curve: List[float] = [initial_cash]
@@ -112,7 +114,9 @@ class BacktestEngine:
 
     # ------------------------------------------------------------------
     def _calc_fee(self, amount: float) -> float:
-        return max(amount * self.fee_rate, self.fee_min)
+        """回测手续费(与模拟盘一致): ETF 佣金按实际费率(免最低5元) + 过户费。"""
+        commission = max(amount * self.fee_rate, self.fee_min)
+        return round(commission + amount * self.transfer_rate, 4)
 
     # ------------------------------------------------------------------
     def run_daily(self, data_loader, signal_fn, benchmark_symbol: str = "000300"):

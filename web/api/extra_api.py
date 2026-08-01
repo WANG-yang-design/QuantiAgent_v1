@@ -221,7 +221,9 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
     from backtest.data_replayer import DataReplayer
     from strategies.rotation_executor import build_rotation_signal_fn
 
-    signal_fn = build_rotation_signal_fn(initial_cash=float(body.get("initial_cash", 100000)))
+    signal_fn = build_rotation_signal_fn(
+        initial_cash=float(body.get("initial_cash", 100000)),
+        params=body.get("params") or None)
 
     try:
         with _backtest_lock:
@@ -602,6 +604,97 @@ def get_stock_spot(limit: int = 100):
     except Exception as exc:
         logger.warning("股票列表获取失败: %s", exc)
         return {"stocks": [], "error": str(exc)}
+
+
+# ================================================================
+# 12. Agent 准确率归因统计
+# ================================================================
+@router.get("/agents/accuracy", dependencies=[Depends(require_auth)])
+def get_agent_accuracy(days: int = 90, horizon_days: int = 5):
+    """
+    Agent 准确率归因: 每个 Agent 的历史结论 vs 标的后续 horizon_days 个交易日收益。
+    - chief_researcher: BUY_CANDIDATE→涨 命中; SELL_CANDIDATE→跌 命中; HOLD 不计
+    - 分析师: bullish→涨 命中; bearish→跌 命中; neutral 不计
+    """
+    from database.models import AgentRun, AgentOutput, DailyBar
+    from datetime import timedelta as _td
+    from collections import defaultdict
+    start = datetime.now() - timedelta(days=days)
+
+    with get_session() as s:
+        runs = s.query(AgentRun).filter(
+            AgentRun.start_time >= start,
+            AgentRun.status == "OK",
+            AgentRun.symbol != "").all()
+        # 标的结论日之后的日K(一次拉取)
+        symbols = {r.symbol for r in runs}
+        bar_map = defaultdict(list)
+        if symbols:
+            bars = s.query(DailyBar).filter(
+                DailyBar.symbol.in_(symbols),
+                DailyBar.trade_date >= (date.today() - timedelta(days=days + 60))).all()
+            for b in bars:
+                bar_map[b.symbol].append(b)
+
+        stats: Dict[str, Dict[str, Any]] = {}
+        for r in runs:
+            out = s.query(AgentOutput).filter_by(run_id=r.run_id).first()
+            if not out or not out.output_json:
+                continue
+            st = stats.setdefault(r.agent_name, {"agent": r.agent_name, "count": 0,
+                                                 "hit": 0, "neutral": 0, "avg_confidence": 0.0})
+            # 结论方向
+            o = out.output_json
+            if r.agent_name == "chief_researcher":
+                d = o.get("research_decision")
+                direction = "BUY" if d == "BUY_CANDIDATE" else ("SELL" if d == "SELL_CANDIDATE" else None)
+            else:
+                v = o.get("view")
+                direction = "BUY" if v == "bullish" else ("SELL" if v == "bearish" else None)
+            if direction is None:
+                st["neutral"] += 1
+                continue
+            # 结论日之后第 horizon 个交易日收益
+            bars = bar_map.get(r.symbol, [])
+            if not bars:
+                continue
+            b0 = None
+            for b in bars:
+                if b.trade_date >= r.start_time.date():
+                    b0 = b
+                    break
+            if b0 is None:
+                continue
+            later = [b for b in bars if b.trade_date > b0.trade_date]
+            if len(later) < horizon_days:
+                continue
+            ret = later[horizon_days - 1].close / b0.close - 1
+            st["count"] += 1
+            st["avg_confidence"] += float(o.get("confidence", 0) or 0)
+            if (direction == "BUY" and ret > 0) or (direction == "SELL" and ret < 0):
+                st["hit"] += 1
+        result = []
+        for agent, st in stats.items():
+            st["accuracy"] = round(st["hit"] / st["count"], 4) if st["count"] else 0.0
+            st["avg_confidence"] = round(st["avg_confidence"] / st["count"], 3) if st["count"] else 0.0
+            result.append(st)
+        result.sort(key=lambda x: x["count"], reverse=True)
+        return {"agents": result, "horizon_days": horizon_days,
+                "window_days": days,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
+
+
+# ================================================================
+# 13. 账户手动快照(净值曲线)
+# ================================================================
+@router.post("/account/snapshot", dependencies=[Depends(require_auth)])
+def manual_snapshot():
+    from workflows.intraday_monitor_workflow import get_broker
+    broker = get_broker()
+    broker.snapshot()
+    acc = broker.get_account()
+    return {"ok": True, "total_asset": acc.get("total_asset"),
+            "time": datetime.now().strftime("%H:%M:%S")}
 
 
 # ================================================================

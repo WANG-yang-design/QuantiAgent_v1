@@ -1,18 +1,47 @@
 ﻿import { useState, useEffect } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Search, Zap, Star, ArrowLeft } from "lucide-react";
+import { Search, Zap, Star, ArrowLeft, TrendingUp } from "lucide-react";
 import { api } from "../api/client";
 import KlineChart from "../components/KlineChart";
 import { fmt, Spin, Empty, chgColor } from "../components/Common";
+import { useScanStore } from "../store/scanStore";
 
-/** 标的详情: K线 / 行情 / 盘口 / 指标 / 新闻公告 / 立即分析 */
+/** 标的详情: 无代码时显示搜索引导页 */
 export default function SymbolDetail() {
   const { code } = useParams();
   const nav = useNavigate();
   const qc = useQueryClient();
   const [searchCode, setSearchCode] = useState("");
-  const symbol = (searchCode || code || "").toUpperCase();
+  const symbol = (code || "").toUpperCase();
+  const { taskId, symbol: scanSymbol, status: scanStatus, setTask, update } = useScanStore();
+
+  // 无代码: 搜索引导页
+  if (!symbol) {
+    return (
+      <div className="p-5 max-w-2xl mx-auto space-y-6">
+        <h1 className="text-lg font-bold text-brand-600">标的搜索</h1>
+        <form className="card flex gap-2 items-center"
+          onSubmit={(e) => { e.preventDefault(); if (/^\d{6}$/.test(searchCode)) nav(`/symbol/${searchCode}`); }}>
+          <input className="input flex-1 text-base py-2.5" placeholder="输入6位代码, 如 510300 / 159915 / 600519"
+            value={searchCode} onChange={(e) => setSearchCode(e.target.value)} autoFocus />
+          <button type="submit" className="btn-primary"><Search size={15} className="inline mr-1" />搜索</button>
+        </form>
+        <div className="card">
+          <div className="card-title"><TrendingUp size={14} />热门标的(点击查看详情)</div>
+          <div className="flex flex-wrap gap-2">
+            {["510300", "159915", "588000", "159611", "159692", "159516", "159141", "159697", "513400", "600519", "000001"].map((s) => (
+              <button key={s} className="badge bg-brand-50 text-brand-600 hover:bg-brand-100"
+                onClick={() => nav(`/symbol/${s}`)}>{s}</button>
+            ))}
+          </div>
+        </div>
+        <div className="text-xs text-gray-400">
+          提示: 侧边栏"标的详情"现在打开的是搜索页; 查看过的标的记录在左侧最近工作流与监控列表中。
+        </div>
+      </div>
+    );
+  }
 
   const { data: kline } = useQuery({
     queryKey: ["kline", symbol],
@@ -28,7 +57,6 @@ export default function SymbolDetail() {
 
   const [analyzing, setAnalyzing] = useState(false);
   const [scanResult, setScanResult] = useState(null);
-  const [scanTask, setScanTask] = useState(null);
   const [inWatch, setInWatch] = useState(false);
   const { data: watch } = useQuery({ queryKey: ["watchlist"], queryFn: () => api.get("/api/watchlist"), refetchInterval: 60000 });
   useEffect(() => {
@@ -45,28 +73,28 @@ export default function SymbolDetail() {
       setAnalyzing(true);
       setScanResult(null);
       const { task_id } = await api.post(`/api/scan/${symbol}`);
-      setScanTask(task_id);
+      setTask(task_id, symbol);
       return task_id;
     },
   });
-  // 异步分析任务轮询
-  const { data: scanStatus } = useQuery({
-    queryKey: ["scantask", scanTask],
-    queryFn: () => api.get(`/api/scan/status/${scanTask}`),
-    enabled: !!scanTask,
+  // 异步分析任务轮询(全局store, 切页不丢)
+  const { data: scanStatusData } = useQuery({
+    queryKey: ["scantask", taskId],
+    queryFn: () => api.get(`/api/scan/status/${taskId}`),
+    enabled: !!taskId && scanSymbol === symbol,
     refetchInterval: 3000,
   });
   useEffect(() => {
-    if (scanStatus?.status === "DONE") {
-      setScanResult(scanStatus.result);
-      setScanTask(null);
+    if (!scanStatusData) return;
+    if (scanStatusData.status === "DONE") {
+      setScanResult(scanStatusData.result);
       setAnalyzing(false);
-    }
-    if (scanStatus?.status === "FAILED") {
-      setScanTask(null);
+      update({ status: "DONE" });
+    } else if (scanStatusData.status === "FAILED") {
       setAnalyzing(false);
+      update({ status: "FAILED" });
     }
-  }, [scanStatus]);
+  }, [scanStatusData]);
 
   const t = detail?.technical || {};
   const q = detail?.quote || {};
@@ -96,8 +124,8 @@ export default function SymbolDetail() {
             onChange={(e) => setSearchCode(e.target.value)} />
           <button type="submit" className="btn-primary"><Search size={14} className="inline mr-1" />搜索</button>
         </form>
-        <button className="btn-primary" disabled={runScan.isPending || analyzing} onClick={() => runScan.mutate()}>
-          <Zap size={14} className="inline mr-1" />{analyzing ? "分析中..." : "立即分析"}
+        <button className="btn-primary" disabled={runScan.isPending || analyzing || (scanStatus === "RUNNING" && scanSymbol === symbol)} onClick={() => runScan.mutate()}>
+          <Zap size={14} className="inline mr-1" />{analyzing || (scanStatus === "RUNNING" && scanSymbol === symbol) ? "分析中..." : "立即分析"}
         </button>
         <button
           className={inWatch ? "btn-green" : "btn-ghost"}
@@ -221,4 +249,5 @@ export default function SymbolDetail() {
     </div>
   );
 }
+
 

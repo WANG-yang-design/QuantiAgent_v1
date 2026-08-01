@@ -18,6 +18,20 @@ export default function Dashboard() {
   const pause = useMutation({ mutationFn: () => api.post("/api/emergency/pause?reason=dashboard"), onSuccess: () => qc.invalidateQueries() });
   const resume = useMutation({ mutationFn: () => api.post("/api/emergency/resume"), onSuccess: () => qc.invalidateQueries() });
   const cancelAll = useMutation({ mutationFn: () => api.post("/api/emergency/cancel_all"), onSuccess: () => qc.invalidateQueries() });
+  const doSnapshot = useMutation({
+    mutationFn: () => api.post("/api/account/snapshot"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["equity"] }),
+  });
+
+  // 净值曲线: 快照不足时用 [初始资金, 当前资产] 兜底, 保证始终有曲线
+  const rawEq = equity || [];
+  const hasSnapshot = rawEq.length >= 2;
+  const eqData = hasSnapshot
+    ? rawEq.map((p) => ({ t: p.time.slice(5, 16), v: p.total_asset }))
+    : [
+        { t: "初始", v: Math.round((acc?.total_asset || 0) - (acc?.total_pnl || 0)) },
+        { t: "现在", v: Math.round(acc?.total_asset || 0) },
+      ];
 
   const cards = [
     { label: "总资产", value: fmt(acc?.total_asset, 2), icon: Wallet, color: "text-brand-600" },
@@ -25,7 +39,6 @@ export default function Dashboard() {
     { label: "持仓市值", value: fmt(acc?.market_value, 2), icon: TrendingUp, color: "text-green-600" },
     { label: "总盈亏", value: fmt(acc?.total_pnl, 2), icon: TrendingDown, color: (acc?.total_pnl || 0) >= 0 ? "text-up" : "text-down" },
   ];
-  const eqData = (equity || []).map((p) => ({ t: p.time.slice(5, 16), v: p.total_asset }));
 
   // 大盘指数 + 牛熊诊断
   const { data: idx } = useQuery({
@@ -71,21 +84,22 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* 指标卡片 */}
+      {/* 指标卡片(点击跳转模拟盘/实盘页) */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {cards.map(({ label, value, icon: Icon, color }) => (
-          <div key={label} className="card">
+          <button key={label} className="card text-left hover:shadow-md transition-shadow cursor-pointer"
+            onClick={() => nav("/paper-live")}>
             <div className="flex items-center justify-between">
               <span className="text-xs text-gray-500">{label}</span>
               <Icon size={16} className={color} />
             </div>
-            <div className={`text-xl font-bold mt-1 ${label === "总盈亏" ? "" : ""}`}>¥{value}</div>
+            <div className="text-xl font-bold mt-1">¥{value}</div>
             {label === "总盈亏" && (
               <div className={`text-xs ${(acc?.total_pnl || 0) >= 0 ? "text-up" : "text-down"}`}>
                 {(acc?.total_return || 0) >= 0 ? "+" : ""}{(acc?.total_return * 100)?.toFixed(2)}%
               </div>
             )}
-          </div>
+          </button>
         ))}
       </div>
 
@@ -110,7 +124,15 @@ export default function Dashboard() {
       {/* 净值曲线 + 持仓 */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="card lg:col-span-2">
-          <div className="card-title">账户净值曲线</div>
+          <div className="card-title flex items-center justify-between">
+            <span>账户净值曲线</span>
+            <span className="flex items-center gap-2">
+              {!hasSnapshot && <span className="text-[11px] text-gray-400 font-normal">快照不足, 显示当前资产</span>}
+              <button className="btn-ghost text-xs" disabled={doSnapshot.isPending} onClick={() => doSnapshot.mutate()}>
+                记录快照
+              </button>
+            </span>
+          </div>
           {eqData.length ? (
             <ResponsiveContainer width="100%" height={220}>
               <AreaChart data={eqData}>
@@ -127,7 +149,7 @@ export default function Dashboard() {
                 <Area type="monotone" dataKey="v" name="总资产" stroke="#1c3a5e" fill="url(#g)" />
               </AreaChart>
             </ResponsiveContainer>
-          ) : <Empty text="尚无账户快照(收盘后生成)" />}
+          ) : <Empty text="暂无资产数据" />}
         </div>
 
         <div className="card">

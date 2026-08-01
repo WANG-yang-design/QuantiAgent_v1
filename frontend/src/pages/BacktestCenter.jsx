@@ -23,11 +23,14 @@ export default function BacktestCenter() {
   const [form, setForm] = useState({
     symbols: HOT_ETFS.slice(0, 5), start: "2025-06-01", end: "2026-07-31",
     initial_cash: 100000, mode: "daily", use_agents: false, name: "",
+    params: { top_n: 3, mom_window: 20, min_amount: 30000000, max_vol: 0.5,
+              target_weight: 0.2, rebalance_threshold: 0.15 },
   });
   const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [error, setError] = useState(null);
+  const setParam = (k, v) => setForm({ ...form, params: { ...form.params, [k]: v } });
 
   // 标的池: 来自监控列表(代码+中文名) + 常用ETF + 自定义添加
   const { data: watch } = useQuery({ queryKey: ["watchlist"], queryFn: () => api.get("/api/watchlist"), refetchInterval: 60000 });
@@ -131,7 +134,32 @@ export default function BacktestCenter() {
             </select>
           </label>
         </div>
-        <div className="flex flex-col justify-between">
+        <div className="flex flex-col justify-between gap-2">
+          {/* 策略参数 */}
+          <div>
+            <div className="text-xs text-gray-500 mb-1.5">轮动策略参数(修改后立即生效)</div>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                ["top_n", "持有数量", "number"],
+                ["mom_window", "动量窗口", "number"],
+                ["target_weight", "目标仓位", "number"],
+                ["rebalance_threshold", "再平衡阈值", "number"],
+                ["max_vol", "波动率上限", "number"],
+                ["min_amount", "成交额下限(万)", "number"],
+              ].map(([k, label, type]) => (
+                <label key={k} className="text-[11px] text-gray-500">
+                  {label}
+                  <input type={type} step={k.includes("weight") || k.includes("vol") || k.includes("threshold") ? 0.01 : 1}
+                    className="input w-full mt-0.5 text-xs"
+                    value={form.params[k] === 30000000 ? form.params[k] / 10000 : form.params[k]}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setParam(k, k === "min_amount" ? (isNaN(v) ? 0 : v * 10000) : (isNaN(v) ? 0 : v));
+                    }} />
+                </label>
+              ))}
+            </div>
+          </div>
           <label className="flex items-center gap-2 text-sm text-gray-600">
             <input type="checkbox" checked={form.use_agents}
               onChange={(e) => setForm({ ...form, use_agents: e.target.checked })} />
