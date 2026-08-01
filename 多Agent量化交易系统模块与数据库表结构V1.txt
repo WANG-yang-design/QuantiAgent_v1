@@ -1,0 +1,87 @@
+## Sheet: 多Agent量化交易系统模块与数据库表结构V1
+
+| 类别 | 名称 | 说明 | V1优先级 | 关键字段/接口 |  |
+|---|---|---|---|---|---|
+| 模块 | 多源数据接入 | 接入Tushare、AkShare、东方财富、巨潮、雪球等 | P0 | get_daily_bars/get_minute_bars/get_quote/get_order_book |  |
+| 模块 | 数据采集调度 | 使用APScheduler定时采集行情、盘口、新闻、资金流 | P0 | job_id/source/frequency/status/last_run_time |  |
+| 模块 | 数据清洗校验 | 检查缺失、延迟、冲突、异常值 | P0 | quality_status/warnings/source_diff |  |
+| 模块 | 统一数据服务API | 为Agent、策略、回测提供统一数据入口 | P0 | MarketDataService/NewsService/AccountService |  |
+| 模块 | 技术指标计算 | MA、MACD、RSI、ATR、VWAP、波动率等 | P0 | symbol/timeframe/features |  |
+| 模块 | ETF专项特征 | ETF规模、成交额、IOPV、折溢价、跟踪指数 | P0 | premium_rate/iopv/avg_amount |  |
+| 模块 | 资金流特征 | 主力资金、板块资金、ETF资金流 | P1 | net_inflow/main_inflow/flow_rank |  |
+| 模块 | 情绪特征 | 股吧、雪球、新闻评论情绪评分 | P1 | sentiment_score/heat/negative_ratio |  |
+| 模块 | 策略参考信号 | 动量、趋势、网格、突破等基础策略 | P0 | strategy_id/signal/score |  |
+| 模块 | LangGraph工作流 | 编排多Agent分析、交易、复盘流程 | P0 | state/nodes/edges/conditions |  |
+| 模块 | PydanticAI输出约束 | 约束Agent结构化输出 | P0 | AgentOutput/TradePlan/RiskCheckResult |  |
+| 模块 | LlamaIndex RAG | 新闻、公告、历史报告检索 | P1 | document_id/chunk/embedding/query |  |
+| 模块 | 数据管理员Agent | 检查数据是否允许进入投研流程 | P0 | data_status/blocked_reason |  |
+| 模块 | 技术分析师Agent | 分析趋势、指标、支撑压力 | P0 | view/score/confidence/signals |  |
+| 模块 | ETF专项分析师Agent | 分析ETF流动性、溢价、跟踪指数 | P0 | liquidity_score/premium_risk |  |
+| 模块 | 基本面分析师Agent | 分析股票财务和估值 | P1 | valuation_score/growth_score |  |
+| 模块 | 新闻公告分析师Agent | 识别新闻公告风险和事件影响 | P0 | event_type/sentiment/impact |  |
+| 模块 | 情绪分析师Agent | 分析舆情热度和市场情绪 | P1 | sentiment_view/extreme_flag |  |
+| 模块 | 资金流分析师Agent | 分析资金流方向和强弱 | P1 | flow_view/flow_score |  |
+| 模块 | 看多研究员Agent | 构造买入/持有理由 | P0 | bull_points/upside_reason |  |
+| 模块 | 看空研究员Agent | 提出风险、反对意见 | P0 | bear_points/downside_risk |  |
+| 模块 | 首席研究员Agent | 综合多空观点形成投研结论 | P0 | research_decision/confidence |  |
+| 模块 | 交易员Agent | 生成交易计划和订单意图 | P0 | action/target_weight/order_amount |  |
+| 模块 | 风险管理Agent | 审核交易计划，批准/拒绝/降仓 | P0 | risk_result/approved_amount |  |
+| 模块 | 合规审计Agent | 检查重复下单、交易时间、限额 | P0 | compliance_status/reason |  |
+| 模块 | 执行监督Agent | 监控订单状态、部分成交、撤单 | P0 | order_status/fill_status |  |
+| 模块 | 复盘总结Agent | 总结交易表现和Agent准确率 | P1 | review_summary/improvement |  |
+| 模块 | 日线回测引擎 | 按日推进，避免未来函数 | P0 | run_id/current_date/portfolio_value |  |
+| 模块 | 分钟回测引擎 | 按分钟增量喂数据，关键节点调用LLM | P0 | timestamp/event_type/bar_data |  |
+| 模块 | 模拟账户系统 | 模拟资金、持仓、市值、盈亏 | P0 | cash/frozen_cash/market_value/total_asset |  |
+| 模块 | 模拟撮合引擎 | 支持限价、市价、滑点、部分成交 | P0 | order_id/fill_price/fill_qty |  |
+| 模块 | 订单管理系统 | 订单状态机和防重复下单 | P0 | order_id/status/intent_id |  |
+| 模块 | 持仓管理系统 | 支持T+1可用数量、成本、市值 | P0 | total_qty/available_qty/cost_price |  |
+| 模块 | 风控规则引擎 | 账户、标的、策略、订单、模型五层风控 | P0 | risk_limits/check_result |  |
+| 模块 | 实盘BrokerAdapter | 预留QMT/PTrade/券商API适配接口 | P1 | connect/place_order/cancel_order |  |
+| 模块 | 邮件通知系统 | 交易计划、成交、异常、日报邮件 | P0 | subject/body/attachments |  |
+| 模块 | 报告导出系统 | 日报、周报、回测报告、交易明细 | P1 | report_type/file_path |  |
+| 模块 | 日志记忆审计 | 记录全链路操作和Agent输出 | P0 | trace_id/event_type/payload |  |
+| 模块 | Prompt管理 | 提示词版本化、回滚、测试 | P1 | prompt_id/version/status |  |
+| 模块 | Skill/Tool权限 | 控制每个Agent可用工具 | P1 | agent_name/tool_name/permission |  |
+| 数据源 | 股票日K | 主源Tushare Pro，备源AkShare、东方财富 | P0 | symbol/date/open/high/low/close/volume/amount |  |
+| 数据源 | ETF日K | 主源AkShare，备源Tushare Pro、东方财富 | P0 | symbol/date/open/high/low/close/volume/amount |  |
+| 数据源 | 股票分钟K | 主源AkShare，备源东方财富、券商行情API | P0 | symbol/timestamp/freq/ohlcv |  |
+| 数据源 | ETF分钟K | 主源AkShare，备源东方财富、券商行情API | P0 | symbol/timestamp/freq/ohlcv |  |
+| 数据源 | 实时行情 | 主源东方财富，备源新浪财经、券商行情API | P0 | latest_price/change_pct/timestamp |  |
+| 数据源 | 盘口数据 | 主源东方财富，备源新浪/腾讯、券商API | P0 | bid1/ask1/bid_vol/ask_vol/spread |  |
+| 数据源 | 历史盘口 | 本地定时采集落库，备源券商API/第三方数据 | P1 | snapshot_time/order_book_json |  |
+| 数据源 | 资金流 | 主源东方财富，备源AkShare、同花顺公开数据 | P1 | main_inflow/net_inflow/flow_rank |  |
+| 数据源 | 新闻 | 主源东方财富，备源新浪财经、同花顺 | P0 | title/content/publish_time/source |  |
+| 数据源 | 公告 | 主源巨潮资讯，备源交易所官网、东方财富 | P0 | announcement_id/title/url/publish_time |  |
+| 数据源 | 舆情 | 主源东方财富股吧，备源雪球、自建爬虫 | P1 | post_id/content/sentiment_score |  |
+| 数据源 | 交易日历 | 主源Tushare Pro，备源AkShare、交易所官网 | P0 | trade_date/is_open |  |
+| 数据表 | symbols | 股票和ETF基础标的信息 | P0 | symbol,name,asset_type,exchange,status,listed_date |  |
+| 数据表 | market_daily_bars | 日K行情表 | P0 | symbol,trade_date,open,high,low,close,volume,amount,source,quality_status |  |
+| 数据表 | market_minute_bars | 分钟K行情表 | P0 | symbol,bar_time,freq,open,high,low,close,volume,amount,source,quality_status |  |
+| 数据表 | realtime_quotes | 实时行情快照表 | P0 | symbol,quote_time,latest_price,change_pct,volume,amount,source |  |
+| 数据表 | order_book_snapshots | 盘口快照表 | P0 | symbol,snapshot_time,bid1,ask1,bid_vol1,ask_vol1,order_book_json,source |  |
+| 数据表 | money_flow_records | 资金流记录表 | P1 | symbol,record_time,main_inflow,net_inflow,source |  |
+| 数据表 | news_records | 新闻表 | P0 | news_id,symbol,title,content,publish_time,source,sentiment_score |  |
+| 数据表 | announcement_records | 公告表 | P0 | announcement_id,symbol,title,url,publish_time,event_type,risk_level |  |
+| 数据表 | sentiment_records | 舆情情绪表 | P1 | record_id,symbol,platform,content,score,heat,publish_time |  |
+| 数据表 | fundamental_records | 基本面数据表 | P1 | symbol,report_date,pe,pb,roe,revenue_growth,profit_growth |  |
+| 数据表 | etf_info | ETF基础信息表 | P0 | symbol,name,tracking_index,scale,fee_rate,fund_company |  |
+| 数据表 | etf_nav_records | ETF净值和折溢价表 | P0 | symbol,record_time,nav,iopv,premium_rate |  |
+| 数据表 | features | 特征指标表 | P0 | symbol,feature_time,feature_name,feature_value,timeframe |  |
+| 数据表 | strategy_signals | 策略参考信号表 | P0 | signal_id,strategy_id,symbol,signal_time,signal,score,reason |  |
+| 数据表 | agent_runs | Agent运行记录表 | P0 | run_id,agent_name,symbol,start_time,end_time,status,model_name |  |
+| 数据表 | agent_outputs | Agent输出表 | P0 | output_id,run_id,agent_name,view,score,confidence,output_json |  |
+| 数据表 | research_decisions | 投研结论表 | P0 | decision_id,symbol,decision,confidence,bull_summary,bear_summary |  |
+| 数据表 | trade_plans | 交易计划表 | P0 | plan_id,decision_id,symbol,action,target_weight,order_amount,limit_price,status |  |
+| 数据表 | risk_checks | 风控审核表 | P0 | risk_check_id,plan_id,result,risk_level,approved_amount,blocked_reason |  |
+| 数据表 | accounts | 账户表 | P0 | account_id,account_type,cash,frozen_cash,market_value,total_asset,update_time |  |
+| 数据表 | positions | 持仓表 | P0 | position_id,account_id,symbol,total_qty,available_qty,cost_price,market_value,pnl |  |
+| 数据表 | orders | 订单表 | P0 | order_id,plan_id,account_id,symbol,side,order_type,price,qty,status,submit_time |  |
+| 数据表 | trades | 成交表 | P0 | trade_id,order_id,symbol,side,price,qty,fee,trade_time |  |
+| 数据表 | account_snapshots | 账户快照表 | P0 | snapshot_id,account_id,snapshot_time,cash,market_value,total_asset,pnl |  |
+| 数据表 | backtest_runs | 回测任务表 | P0 | run_id,name,start_date,end_date,mode,status,config_json |  |
+| 数据表 | backtest_results | 回测结果表 | P0 | result_id,run_id,total_return,max_drawdown,sharpe,metrics_json |  |
+| 数据表 | prompt_versions | Prompt版本表 | P1 | prompt_id,agent_name,version,content,status,created_at |  |
+| 数据表 | tool_permissions | Agent工具权限表 | P1 | id,agent_name,tool_name,permission,status |  |
+| 数据表 | audit_logs | 审计日志表 | P0 | log_id,trace_id,event_type,actor,payload_json,created_at |  |
+| 数据表 | system_logs | 系统日志表 | P0 | log_id,level,module,message,created_at |  |
+| 数据表 | reports | 报告表 | P1 | report_id,report_type,title,file_path,created_at |  |

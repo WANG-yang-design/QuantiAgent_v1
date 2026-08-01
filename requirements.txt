@@ -1,0 +1,39 @@
+# =========================================================
+# 多Agent量化交易系统 V1 - Python 依赖清单
+# 目标环境: Python 3.13 (Windows x64)
+# =========================================================
+
+# ---- 数据库 ----
+sqlalchemy>=2.0.36
+psycopg[binary]>=3.2.3        # PostgreSQL 驱动 v3 (支持 3.13)
+pgvector>=0.3.6               # pgvector 向量扩展的 Python 适配
+
+# ---- 数据校验/结构 ----
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# ---- Web 管理台 ----
+fastapi>=0.115.0
+uvicorn>=0.32.0
+
+# ---- 调度器 ----
+apscheduler>=3.10.4,<4.0.0    # 文档指定 APScheduler (3.x 稳定 API)
+
+# ---- 数据源 ----
+akshare>=1.16.0               # 免费行情/新闻/资金流主源
+pandas>=2.2.3
+numpy>=2.1.0
+
+# ---- LLM (OpenAI 兼容接口) ----
+openai>=1.52.0
+
+# ---- 报告/邮件 ----
+jinja2>=3.1.4
+matplotlib>=3.9.2
+
+# ---- 配置/工具 ----
+python-dotenv>=1.0.1
+PyYAML>=6.0.2
+rich>=13.9.0
+httpx>=0.27.2
+jieba>=0.42.1                 # RAG 中文分词

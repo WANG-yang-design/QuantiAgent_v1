@@ -1,0 +1,57 @@
+# =========================================================
+# 数据源配置: 主源 + 备源 + 多源比对阈值
+# 主源失败自动切换备源; 多源冲突触发 CONFLICT 质量标签
+# =========================================================
+
+sources:
+  daily_bar:
+    primary: akshare
+    backups: [sina, eastmoney, tushare]
+  minute_bar:
+    primary: akshare
+    backups: [eastmoney]
+  realtime_quote:
+    primary: akshare
+    backups: [eastmoney, sina]
+  order_book:
+    primary: eastmoney
+    backups: [akshare]
+  money_flow:
+    primary: eastmoney
+    backups: [akshare]
+  news:
+    primary: eastmoney
+    backups: [akshare]
+  announcement:
+    primary: cninfo
+    backups: [eastmoney]
+  sentiment:
+    primary: akshare
+    backups: []
+  trade_calendar:
+    primary: akshare
+    backups: [tushare]
+  etf_info:
+    primary: akshare
+    backups: []
+  fund_flow:
+    primary: eastmoney
+    backups: [akshare]
+
+# 多源比对: 两源收盘价相对偏差超过此阈值 → CONFLICT
+cross_source:
+  close_price_diff_pct: 0.01
+  quote_diff_pct: 0.02
+
+# 数据新鲜度阈值(秒): 超过即 DELAYED
+freshness:
+  realtime_quote: 60
+  daily_bar: 43200          # 12小时(收盘后更新)
+  minute_bar: 600
+
+# 采集限流(秒): 相邻两次采集的最小间隔
+rate_limit:
+  realtime_quote: 5
+  order_book: 15
+  news: 300
+  money_flow: 60

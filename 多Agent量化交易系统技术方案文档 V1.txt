@@ -1,0 +1,1074 @@
+多Agent量化交易系统技术方案文档 V1
+
+版本：V1.0
+日期：2026-07-29
+系统定位：多 Agent 智能量化交易系统 V1
+交易范围：股票 + ETF，优先 ETF
+交易阶段：V1 先做模拟盘，预留实盘接口
+数据库：PostgreSQL
+调度器：APScheduler
+Agent 框架：LangGraph + PydanticAI + LlamaIndex
+回测支持：日线回测 + 分钟级/分时回测
+盘中监控：支持，Agent 分析频率可配置为 5 分钟至 1 小时
+通知方式：界面 + 邮件
+人工确认：可选，支持分级确认
+
+---
+
+1. 项目定位
+
+本项目定位为“多 Agent 智能量化交易系统 V1”。系统模拟专业交易机构的投研与交易流程，由数据系统、分析师团队、研究员团队、交易员 Agent、风险管理 Agent、模拟交易系统、回测系统、日志审计系统和报告通知系统共同组成。
+
+V1 阶段以模拟盘为主，但架构、目录、接口、数据库、订单状态机和风控流程全部按后续实盘接入标准设计，确保模拟盘稳定后可以快速接入 QMT、PTrade 或券商官方 API。
+
+核心原则：
+
+1. 数据事实与 Agent 分析分离。
+2. 策略信号可作为 Agent 决策参考，但最终交易计划由 Agent 层综合生成。
+3. 风控优先级高于交易员 Agent。
+4. 任何数据异常、账户异常、订单状态未知、风控服务不可用时，默认不交易。
+5. AI 负责分析、解释、综合判断；硬规则负责风控边界；执行系统负责安全下单与状态核验。
+
+---
+
+2. V1 范围确认
+
+2.1 必做范围
+
+| 模块 | V1 是否纳入 | 说明 |
+|---|---|---|
+| 股票行情 | 是 | 支持 A 股股票 |
+| ETF 行情 | 是 | 优先支持 ETF |
+| 日 K 数据 | 是 | 策略、回测、Agent 分析基础 |
+| 分钟 K 数据 | 是 | 分时回测、盘中监控 |
+| 实时行情 | 是 | 模拟盘估值、盘中分析 |
+| 盘口数据 | 是 | 五档/十档盘口、买卖价差、流动性分析 |
+| 资金流数据 | 是 | 辅助 Agent 判断 |
+| 新闻公告 | 是 | 新闻公告 Agent 必需 |
+| 舆情/情绪 | 是 | 情绪 Agent 启用 |
+| 历史数据 | 是 | 支持日线和分时回测 |
+| 多 Agent 决策 | 是 | 系统核心 |
+| 模拟盘交易 | 是 | V1 主执行环境 |
+| 实盘接口预留 | 是 | V1 不自动实盘，但保留 BrokerAdapter |
+| 日线回测 | 是 | 必做 |
+| 分钟回测 | 是 | 必做 |
+| 盘中监控 | 是 | 必做 |
+| 邮件通知 | 是 | 交易计划、成交、异常、日报 |
+| 日志与记忆 | 是 | 全链路记录 |
+| Prompt/Skill 管理 | 是 | 支持提示词和工具权限管理 |
+
+2.2 暂不作为 V1 重点
+
+1. 秒级高频交易。
+2. 逐笔成交深度建模。
+3. 真实自动下单。
+4. 复杂深度学习预测模型。
+5. 大规模全市场因子平台。
+
+---
+
+3. 总体架构
+
+系统分为九层：
+
+```text
+9. 前端管理台 / 邮件通知 / 报告导出
+8. 日志 / 记忆 / 审计 / 复盘系统
+7. 回测 / 模拟盘 / 实盘交易执行层
+6. 风控系统 / 订单系统 / 持仓账户系统
+5. 多Agent投研与交易决策层
+4. 策略信号与特征工程层
+3. 数据清洗 / 数据质量校验 / 统一数据服务
+2. 数据采集调度层
+1. 多源数据接入层
+```
+
+核心数据流：
+
+```text
+数据源 → 采集调度 → 清洗校验 → 统一数据服务 → 特征工程/策略信号 → 多Agent分析 → 交易计划 → 风控审核 → 模拟盘执行 → 订单/持仓/账户更新 → 报告/邮件/审计
+```
+
+---
+
+4. 数据源设计
+
+4.1 数据类型
+
+系统需要支持：
+
+1. 股票基础信息。
+2. ETF 基础信息。
+3. 日 K 数据。
+4. 分钟 K 数据。
+5. 实时行情。
+6. 五档/十档盘口。
+7. 历史盘口快照。
+8. 资金流数据。
+9. 新闻数据。
+10. 公告数据。
+11. 舆情数据。
+12. 情绪评分。
+13. 财务数据。
+14. 指数数据。
+15. 板块数据。
+16. ETF 净值、IOPV、折溢价。
+17. 交易日历。
+18. 模拟账户数据。
+19. 后续实盘账户数据。
+
+4.2 主源与备源
+
+| 数据类型 | 主源 | 备源1 | 备源2 | 说明 |
+|---|---|---|---|---|
+| 股票日K | Tushare Pro | AkShare | 东方财富 | 回测基础 |
+| ETF日K | AkShare | Tushare Pro | 东方财富 | ETF优先 |
+| 股票分钟K | AkShare | 东方财富 | 券商行情API | 分时回测 |
+| ETF分钟K | AkShare | 东方财富 | 券商行情API | 分时回测 |
+| 实时行情 | 东方财富 | 新浪财经 | 券商行情API | 盘中监控 |
+| 盘口数据 | 东方财富 | 新浪/腾讯 | 券商行情API | V1必做 |
+| 历史盘口 | 本地定时采集 | 券商行情API | 第三方数据 | 免费源通常不足 |
+| 指数行情 | Tushare Pro | AkShare | 东方财富 | 市场环境 |
+| 板块行情 | 东方财富 | AkShare | 同花顺公开数据 | 板块轮动 |
+| 交易日历 | Tushare Pro | AkShare | 交易所官网 | 调度基础 |
+| 个股新闻 | 东方财富 | 新浪财经 | 同花顺 | 新闻Agent |
+| ETF新闻 | 东方财富 | 基金公司官网 | 新浪财经 | ETF事件 |
+| 公司公告 | 巨潮资讯 | 交易所官网 | 东方财富 | 权威优先 |
+| 财报公告 | 巨潮资讯 | 交易所官网 | Tushare | 财务分析 |
+| 股吧舆情 | 东方财富股吧 | 雪球 | 自建爬虫 | 注意合规 |
+| 情绪评分 | 自建LLM/NLP | 第三方情绪API | 规则词典 | 辅助判断 |
+| 财务数据 | Tushare Pro | 东方财富 | 巨潮资讯 | 股票基本面 |
+| ETF净值/IOPV | 东方财富 | 基金公司官网 | 交易所 | ETF风控 |
+
+4.3 数据质量控制
+
+每条关键数据需要打质量标签：
+
+```text
+VALID：有效
+MISSING：缺失
+DELAYED：延迟
+SUSPICIOUS：疑似异常
+CONFLICT：多源冲突
+ESTIMATED：估算数据
+```
+
+交易和回测默认只使用 VALID 数据。盘中交易若数据存在 DELAYED、CONFLICT、SUSPICIOUS，则中止交易计划生成或进入人工确认。
+
+---
+
+5. 调度设计
+
+V1 使用 APScheduler。
+
+5.1 采集频率建议
+
+| 任务 | 频率 | 说明 |
+|---|---|---|
+| 交易日历更新 | 每日 08:00 | 判断是否交易日 |
+| 股票/ETF基础信息 | 每日 08:10 | 更新标的池 |
+| 盘前新闻公告 | 每日 08:30 | 盘前事件扫描 |
+| 实时行情 | 交易时段 5-15秒 | 越快越好，但注意限流 |
+| 盘口快照 | 交易时段 5-15秒 | V1必做，落库可降频 |
+| 分钟K生成 | 每1分钟/5分钟 | 用于盘中监控和回测 |
+| 资金流数据 | 交易时段 1-5分钟 | 辅助判断 |
+| 舆情新闻扫描 | 交易时段 5-15分钟 | 非交易时段可降频 |
+| Agent常规分析 | 5分钟-1小时可配置 | 默认30分钟 |
+| Agent紧急分析 | 事件触发 | 涨跌2%、量比>2等 |
+| 收盘数据更新 | 15:10后 | 日K、成交额等 |
+| 日终报告 | 16:00-18:00 | 生成复盘 |
+
+5.2 Agent 触发规则
+
+常规触发：
+
+```yaml
+agent_analysis_interval: 30min
+optional_values:
+• 5min
+• 10min
+• 15min
+• 30min
+• 60min
+```
+
+紧急触发：
+
+```yaml
+urgent_triggers:
+price_change_pct_abs: 0.02
+volume_ratio_gt: 2.0
+intraday_drawdown_gt: 0.015
+order_book_spread_gt: 0.005
+major_news_detected: true
+announcement_risk_detected: true
+stop_loss_near: true
+```
+
+---
+
+6. Agent 框架选型
+
+V1 使用：
+
+```text
+LangGraph + PydanticAI + LlamaIndex
+```
+
+职责划分：
+
+1. LangGraph：负责多 Agent 工作流编排、节点状态流转、条件分支和流程可控性。
+2. PydanticAI：负责结构化输出、类型校验、Agent 输出 schema 约束。
+3. LlamaIndex：负责新闻、公告、研报、历史报告、策略文档等 RAG 检索。
+
+不建议让 Agent 自由群聊式决策。交易系统要采用固定 DAG 工作流。
+
+---
+
+7. 多Agent角色设计
+
+V1 建议启用以下 Agent：
+
+1. 数据管理员 Agent。
+2. 技术分析师 Agent。
+3. ETF 专项分析师 Agent。
+4. 基本面分析师 Agent。
+5. 新闻公告分析师 Agent。
+6. 情绪分析师 Agent。
+7. 资金流分析师 Agent。
+8. 看多研究员 Agent。
+9. 看空研究员 Agent。
+10. 首席研究员 Agent。
+11. 交易员 Agent。
+12. 风险管理 Agent。
+13. 合规审计 Agent。
+14. 执行监督 Agent。
+15. 复盘总结 Agent。
+
+7.1 数据管理员 Agent
+
+职责：
+
+1. 检查数据完整性。
+2. 检查数据新鲜度。
+3. 检查多源冲突。
+4. 判断是否允许进入投研流程。
+
+输出字段：
+
+```json
+{
+"data_status": "PASS",
+"warnings": [],
+"blocked_reason": null
+}
+```
+
+7.2 技术分析师 Agent
+
+职责：分析趋势、均线、MACD、RSI、成交量、波动率、支撑压力、突破/跌破等。
+
+7.3 ETF 专项分析师 Agent
+
+职责：分析 ETF 流动性、规模、成交额、折溢价、IOPV、跟踪指数、同类 ETF 替代关系。
+
+7.4 基本面分析师 Agent
+
+职责：主要用于股票，分析估值、成长、盈利、现金流、财务风险。
+
+7.5 新闻公告分析师 Agent
+
+职责：抽取事件、分类利好/利空/中性，识别公告风险。
+
+7.6 情绪分析师 Agent
+
+职责：分析股吧、雪球、新闻评论热度，给出市场情绪评分。情绪只作为辅助，不作为单独买卖依据。
+
+7.7 资金流分析师 Agent
+
+职责：分析主力资金、北向资金、板块资金流、ETF资金流等，辅助判断短期市场强弱。
+
+7.8 看多研究员 Agent
+
+职责：基于所有分析师输出，构造买入/持有理由。
+
+7.9 看空研究员 Agent
+
+职责：专门提出反对意见，识别风险、质疑假设、查找数据缺陷。
+
+7.10 首席研究员 Agent
+
+职责：综合多空观点，形成研究结论，但不直接下单。
+
+7.11 交易员 Agent
+
+职责：把研究结论转化为交易计划，结合账户、持仓、可用资金、可用股数、T+1、手续费、盘口和价格生成订单意图。
+
+7.12 风险管理 Agent
+
+职责：审核交易计划，决定批准、拒绝、降仓或人工确认。
+
+7.13 合规审计 Agent
+
+职责：检查非交易时段、重复下单、交易次数、单笔限额、数据异常、模型输出异常等。
+
+7.14 执行监督 Agent
+
+职责：监控订单状态、部分成交、撤单、失败、未知状态。
+
+7.15 复盘总结 Agent
+
+职责：日终复盘，评估 Agent 判断、交易执行、盈亏来源和改进建议。
+
+---
+
+8. 标准工作流
+
+8.1 盘中监控工作流
+
+```text
+实时行情/盘口/资金流/新闻/舆情更新
+→ 数据质量检查
+→ 特征计算
+→ 技术/ETF/新闻/情绪/资金流 Agent 并行分析
+→ 看多/看空研究员辩论
+→ 首席研究员汇总
+→ 交易员生成交易计划
+→ 风控审核
+→ 合规审核
+→ 模拟盘执行或等待人工确认
+→ 订单状态监控
+→ 日志和通知
+```
+
+8.2 日终复盘工作流
+
+```text
+收盘行情更新
+→ 更新账户和持仓市值
+→ 统计当日盈亏
+→ 汇总订单和成交
+→ 对比计划与执行
+→ Agent复盘
+→ 生成日报
+→ 邮件发送
+```
+
+---
+
+9. 策略与 Agent 分工
+
+用户决策：策略可给 Agent 参考和风控，主要决策在 Agent 层。
+
+推荐实现：
+
+1. 策略层计算基础信号，例如动量排名、均线趋势、突破信号、回撤、波动率、ETF折溢价等。
+2. Agent 层综合技术、基本面、新闻、情绪、资金流、账户、盘口和风控要求形成交易计划。
+3. 风控层对交易计划进行硬规则审核。
+
+示例：
+
+```text
+动量策略提示某ETF排名第一
+→ 技术Agent确认趋势有效
+→ ETF Agent确认流动性和溢价合理
+→ 新闻Agent未发现重大风险
+→ 情绪Agent发现市场热度偏高但未极端
+→ 看空研究员提示追高风险
+→ 交易员降低目标仓位
+→ 风控批准模拟买入
+```
+
+---
+
+10. 回测系统设计
+
+V1 同时支持日线回测和分钟回测。
+
+10.1 日线回测
+
+流程：
+
+```text
+T日收盘后，只允许使用T日及之前数据
+→ 计算特征
+→ Agent在关键节点分析
+→ 生成T+1交易计划
+→ T+1开盘价或VWAP模拟成交
+→ 计入滑点和手续费
+→ 更新账户
+```
+
+滑点假设：日线 0.1%。
+
+10.2 分钟回测
+
+流程：
+
+```text
+09:30 初始化状态
+09:35 喂入09:30-09:35增量数据
+→ 特征更新
+→ 若达到分析频率或紧急触发，则调用Agent
+→ 模拟撮合订单
+09:40 继续推进
+...
+15:00 收盘结算
+```
+
+关键原则：
+
+1. 不能一次性把未来 K 线全部喂给 AI。
+2. 每个时间点只能看到当前时刻及以前的数据。
+3. 新闻、公告、舆情也必须按发布时间进入系统。
+4. 回测可在关键节点调用 LLM，不建议每5分钟全部调用，避免成本过高。
+
+滑点假设：分钟 0.05%。
+
+10.3 回测指标
+
+必须输出：
+
+1. 总收益。
+2. 年化收益。
+3. 最大回撤。
+4. 夏普比率。
+5. 卡玛比率。
+6. 胜率。
+7. 盈亏比。
+8. 换手率。
+9. 交易次数。
+10. 平均持仓天数。
+11. 最大连续亏损次数。
+12. 手续费总额。
+13. 滑点成本。
+14. 月度收益。
+15. 持仓曲线。
+16. 净值曲线。
+17. 回撤曲线。
+18. 每笔交易明细。
+19. Agent 建议与实际结果对比。
+
+---
+
+11. 模拟盘交易系统
+
+模拟盘必须尽可能接近真实交易。
+
+11.1 模拟账户字段
+
+1. 账户总资产。
+2. 可用资金。
+3. 冻结资金。
+4. 证券市值。
+5. 总盈亏。
+6. 当日盈亏。
+7. 累计手续费。
+8. 持仓列表。
+9. 委托列表。
+10. 成交列表。
+
+11.2 持仓规则
+
+1. 支持股票和 ETF。
+2. 支持 A 股 T+1。
+3. 今日买入数量不可卖。
+4. 昨日及以前买入数量可卖。
+5. 实时行情更新后动态计算市值和浮盈浮亏。
+
+11.3 模拟撮合
+
+支持三档：
+
+1. 简单撮合：下一根 K 线开盘价成交。
+2. 中级撮合：限价单根据下一根 K 线高低价判断是否成交。
+3. 高级撮合：结合盘口、成交量、滑点、成交概率进行撮合。
+
+V1 推荐实现简单版和中级版，高级版预留。
+
+---
+
+12. 实盘接口预留
+
+V1 不自动实盘，但必须预留标准 BrokerAdapter。
+
+12.1 预留接口
+
+```python
+class BrokerAdapter:
+def connect(self): ...
+def disconnect(self): ...
+def get_account(self): ...
+def get_positions(self): ...
+def get_orders(self): ...
+def get_trades(self): ...
+def place_order(self, order_request): ...
+def cancel_order(self, order_id): ...
+def query_order(self, order_id): ...
+```
+
+12.2 后续适配方向
+
+1. QMT / MiniQMT。
+2. PTrade。
+3. 券商官方 API。
+4. 其他正规交易 API。
+
+不推荐使用模拟点击交易客户端作为长期方案。
+
+---
+
+13. 风控系统
+
+风控分为五层：
+
+13.1 账户级风控
+
+1. 最大总仓位。
+2. 最大单日亏损。
+3. 最大周亏损。
+4. 最大总回撤。
+5. 最小现金比例。
+6. 每日最大交易次数。
+7. 每日最大交易金额。
+
+13.2 标的级风控
+
+1. 单标的最大仓位。
+2. 单标的最大亏损。
+3. 单标的最小成交额。
+4. 单标的最大波动率。
+5. 禁止买入高溢价 ETF。
+6. 禁止买入流动性不足标的。
+7. 黑名单标的禁止交易。
+
+13.3 策略级风控
+
+1. 每个策略最大资金。
+2. 每个策略最大回撤。
+3. 策略连续亏损暂停。
+4. 策略调仓频率限制。
+
+13.4 订单级风控
+
+1. 单笔最大金额。
+2. 单笔最大数量。
+3. 价格偏离限制。
+4. 禁止重复订单。
+5. 禁止卖出超过可用股数。
+6. 限价保护。
+
+13.5 模型级风控
+
+1. 模型输出必须是结构化 JSON。
+2. 模型置信度低则不得自动交易。
+3. 模型结论冲突则进入人工确认。
+4. 模型无法解释则不得自动交易。
+5. 模型输出非法字段则拒绝。
+
+---
+
+14. 人工确认规则
+
+V1 模拟盘中人工确认可选，但架构保留。
+
+建议默认规则：
+
+```yaml
+confirmation_policy:
+auto_execute:
+max_order_amount: 1000
+risk_level: low
+email_or_ui_confirm:
+max_order_amount: 5000
+risk_level: medium
+block:
+risk_level: high
+```
+
+说明：
+
+1. ≤1000 元且低风险，可自动模拟执行。
+2. ≤5000 元且中风险，需要邮件或界面确认。
+3. 高风险禁止执行。
+4. 实盘开启后所有阈值应重新评估，并默认更保守。
+
+---
+
+15. 邮件通知和报告
+
+15.1 邮件类型
+
+1. 盘前报告。
+2. 盘中风险提醒。
+3. 交易计划邮件。
+4. 模拟成交确认邮件。
+5. 异常告警邮件。
+6. 收盘复盘报告。
+7. 周报。
+8. 月报。
+9. 回测报告。
+
+15.2 交易邮件字段
+
+1. 交易动作。
+2. 标的代码和名称。
+3. 计划数量。
+4. 计划价格。
+5. 预计金额。
+6. 当前持仓。
+7. 可用资金。
+8. 交易理由。
+9. 风险提示。
+10. 风控结论。
+11. 是否需要人工确认。
+
+---
+
+16. 日志、记忆与审计
+
+16.1 日志分类
+
+1. 系统日志。
+2. 数据采集日志。
+3. 数据质量日志。
+4. Agent 调用日志。
+5. Prompt 版本日志。
+6. 策略信号日志。
+7. 风控审核日志。
+8. 订单执行日志。
+9. 成交日志。
+10. 错误日志。
+11. 人工操作日志。
+12. 报告生成日志。
+
+16.2 审计要求
+
+每笔交易必须能追溯：
+
+1. 为什么买/卖。
+2. 哪些 Agent 给了什么观点。
+3. 使用了哪些数据。
+4. 风控是否通过。
+5. 是否需要人工确认。
+6. 订单是否成功提交。
+7. 是否成交。
+8. 成交后账户如何变化。
+9. 后续表现如何。
+
+---
+
+17. Prompt / Skill 系统
+
+17.1 Prompt 管理
+
+字段包括：
+
+1. prompt_id。
+2. agent_name。
+3. version。
+4. content。
+5. created_by。
+6. created_at。
+7. status。
+8. description。
+9. test_result。
+
+17.2 Skill 权限控制
+
+不同 Agent 只能调用授权工具。例如：
+
+1. 新闻 Agent 可调用新闻、公告、RAG 工具。
+2. 技术 Agent 可调用行情、指标工具。
+3. 交易员 Agent 可调用账户、持仓、交易计划生成工具。
+4. 风控 Agent 可调用风控检查工具。
+5. 新闻 Agent、技术 Agent 不允许调用下单工具。
+
+---
+
+18. 项目目录结构
+
+```text
+multi_agent_quant_system/
+├── config/
+│   ├── config.yaml
+│   ├── risk_limits.yaml
+│   ├── data_sources.yaml
+│   ├── model_routes.yaml
+│   ├── agent_schedule.yaml
+│   ├── trading_rules.yaml
+│   └── prompts/
+├── data_sources/
+│   ├── base.py
+│   ├── tushare_client.py
+│   ├── akshare_client.py
+│   ├── eastmoney_client.py
+│   ├── sina_client.py
+│   ├── cninfo_client.py
+│   └── broker_market_client.py
+├── data_service/
+│   ├── market_data_service.py
+│   ├── fundamental_service.py
+│   ├── news_service.py
+│   ├── sentiment_service.py
+│   ├── account_data_service.py
+│   ├── data_quality.py
+│   └── cache_service.py
+├── features/
+│   ├── technical_indicators.py
+│   ├── etf_features.py
+│   ├── fundamental_features.py
+│   ├── sentiment_features.py
+│   └── money_flow_features.py
+├── agents/
+│   ├── base_agent.py
+│   ├── data_admin_agent.py
+│   ├── technical_analyst_agent.py
+│   ├── etf_analyst_agent.py
+│   ├── fundamental_analyst_agent.py
+│   ├── news_analyst_agent.py
+│   ├── sentiment_analyst_agent.py
+│   ├── money_flow_analyst_agent.py
+│   ├── bull_researcher_agent.py
+│   ├── bear_researcher_agent.py
+│   ├── chief_researcher_agent.py
+│   ├── trader_agent.py
+│   ├── risk_manager_agent.py
+│   ├── compliance_agent.py
+│   ├── execution_supervisor_agent.py
+│   └── review_agent.py
+├── workflows/
+│   ├── intraday_monitor_workflow.py
+│   ├── research_workflow.py
+│   ├── trading_workflow.py
+│   ├── backtest_workflow.py
+│   └── daily_review_workflow.py
+├── strategies/
+│   ├── base_strategy.py
+│   ├── etf_momentum_rotation.py
+│   ├── ma_trend_strategy.py
+│   ├── grid_strategy.py
+│   └── signal_aggregator.py
+├── risk/
+│   ├── risk_engine.py
+│   ├── account_risk.py
+│   ├── position_risk.py
+│   ├── order_risk.py
+│   ├── model_risk.py
+│   └── circuit_breaker.py
+├── backtest/
+│   ├── engine.py
+│   ├── event.py
+│   ├── data_replayer.py
+│   ├── broker_simulator.py
+│   ├── matching_engine.py
+│   └── metrics.py
+├── paper_trading/
+│   ├── paper_account.py
+│   ├── paper_broker.py
+│   ├── order_manager.py
+│   ├── position_manager.py
+│   └── portfolio_manager.py
+├── live_trading/
+│   ├── broker_adapter.py
+│   ├── qmt_adapter.py
+│   ├── ptrade_adapter.py
+│   └── live_order_manager.py
+├── notification/
+│   ├── email_sender.py
+│   ├── notification_service.py
+│   └── templates/
+├── reports/
+│   ├── report_generator.py
+│   ├── chart_generator.py
+│   └── templates/
+├── memory/
+│   ├── short_term_memory.py
+│   ├── long_term_memory.py
+│   └── audit_log.py
+├── database/
+│   ├── models.py
+│   ├── repository.py
+│   ├── migrations/
+│   └── db_session.py
+├── web/
+│   ├── api/
+│   └── dashboard/
+├── scheduler/
+│   ├── apscheduler_app.py
+│   └── jobs.py
+├── tests/
+└── main.py
+```
+
+---
+
+19. Python 类设计骨架
+
+19.1 数据源基类
+
+```python
+from abc import ABC, abstractmethod
+
+class BaseDataSource(ABC):
+@abstractmethod
+def get_daily_bars(self, symbol: str, start: str, end: str):
+pass
+
+@abstractmethod
+def get_minute_bars(self, symbol: str, start: str, end: str, freq: str = "5m"):
+pass
+
+@abstractmethod
+def get_realtime_quote(self, symbol: str):
+pass
+
+@abstractmethod
+def get_order_book(self, symbol: str):
+pass
+```
+
+19.2 Agent 基类
+
+```python
+from pydantic import BaseModel
+from abc import ABC, abstractmethod
+
+class AgentInput(BaseModel):
+symbol: str
+context: dict
+
+class AgentOutput(BaseModel):
+agent_name: str
+view: str
+score: float
+confidence: float
+key_points: list[str]
+risks: list[str]
+
+class BaseAgent(ABC):
+name: str
+
+@abstractmethod
+async def run(self, input_data: AgentInput) -> AgentOutput:
+pass
+```
+
+19.3 交易计划模型
+
+```python
+from pydantic import BaseModel
+from typing import Literal, Optional
+
+class TradePlan(BaseModel):
+decision_id: str
+symbol: str
+name: str
+action: Literal["BUY", "SELL", "HOLD", "CANCEL"]
+target_weight: float
+order_amount: float
+estimated_quantity: int
+order_type: Literal["LIMIT", "MARKET"]
+limit_price: Optional[float]
+confidence: float
+reasons: list[str]
+risks: list[str]
+human_confirm_required: bool
+```
+
+19.4 风控结果模型
+
+```python
+class RiskCheckResult(BaseModel):
+risk_check_id: str
+decision_id: str
+result: Literal["APPROVE", "REJECT", "REDUCE", "CONFIRM_REQUIRED"]
+approved_amount: float
+approved_quantity: int
+risk_level: Literal["LOW", "MEDIUM", "HIGH"]
+warnings: list[str]
+blocked_reason: Optional[str]
+```
+
+19.5 BrokerAdapter
+
+```python
+class BrokerAdapter(ABC):
+@abstractmethod
+def connect(self):
+pass
+
+@abstractmethod
+def get_account(self):
+pass
+
+@abstractmethod
+def get_positions(self):
+pass
+
+@abstractmethod
+def place_order(self, order_request):
+pass
+
+@abstractmethod
+def cancel_order(self, order_id: str):
+pass
+
+@abstractmethod
+def query_order(self, order_id: str):
+pass
+```
+
+---
+
+20. 开发路线
+
+阶段一：基础工程
+
+1. 初始化项目目录。
+2. 配置 PostgreSQL。
+3. 搭建 APScheduler。
+4. 搭建统一配置系统。
+5. 实现日志系统。
+
+阶段二：数据系统
+
+1. 接入 AkShare、Tushare、东方财富。
+2. 实现日 K、分钟 K、实时行情、盘口数据。
+3. 接入新闻、公告、舆情、资金流。
+4. 实现数据质量校验。
+
+阶段三：特征与策略
+
+1. 实现技术指标。
+2. 实现 ETF 专项指标。
+3. 实现资金流和情绪特征。
+4. 实现策略参考信号。
+
+阶段四：多 Agent
+
+1. 搭建 LangGraph 工作流。
+2. 用 PydanticAI 约束输出。
+3. 用 LlamaIndex 接新闻公告 RAG。
+4. 实现各 Agent。
+
+阶段五：回测和模拟盘
+
+1. 实现日线回测。
+2. 实现分钟回测。
+3. 实现模拟账户。
+4. 实现订单撮合。
+5. 实现 T+1 和手续费。
+
+阶段六：风控、报告和通知
+
+1. 实现五层风控。
+2. 实现邮件通知。
+3. 实现交易报告。
+4. 实现审计追踪。
+
+阶段七：实盘预留
+
+1. 实现 BrokerAdapter。
+2. 预留 QMT/PTrade 适配。
+3. 先做只读账户同步。
+4. 稳定后再考虑小额度自动交易。
+
+---
+
+21. V1 结论
+
+V1 的目标不是立即实盘盈利，而是构建一套规范、可扩展、可验证的多 Agent 量化交易底座。
+
+推荐最终交付形态：
+
+1. 数据可持续采集。
+2. Agent 可结构化分析。
+3. 策略可给出参考信号。
+4. 风控可拦截危险交易。
+5. 模拟盘可真实记录账户、持仓、订单、成交。
+6. 回测可复现历史过程。
+7. 邮件和报告可完整留痕。
+8. 后续可快速接入实盘 API。
+
+系统建设原则：
+
+```text
+先稳定数据，再稳定回测；
+先稳定模拟盘，再考虑实盘；
+先可解释可审计，再追求自动化；
+先保证不失控，再追求收益。
+```
+
+---
+
+22. V1 阶段仍可改进之处
+
+V1 在架构理念、风控优先、模拟先行、事件驱动回测、固定 DAG 工作流和结构化输出方面设计扎实，但在以下方面仍可进一步完善。
+
+22.1 量化严谨性
+
+1. 缺少基准对比与超额收益指标。当前 19 项回测指标侧重绝对收益，未包含相对基准（如沪深 300、中证全指 ETF）的超额收益、信息比率和追踪误差。ETF 轮动策略尤其需要 alpha 归因，否则无法判断收益来自策略还是 beta。
+2. 滑点模型过于静态。日线 0.1%、分钟 0.05% 为固定值，未按成交额、盘口深度、标流动性动态计算。小盘和低流动性 ETF 实际滑点远高于此，静态值会系统性高估回测收益。
+3. 回测过拟合防范缺失。未设计样本内外分割、Walk-forward 滚动检验、参数稳定性检验。多 Agent 加 Prompt 调参极易对历史过拟合，需在回测引擎中强制支持样本分割与滚动验证。
+4. Agent 置信度未校准。多个 Agent 输出 confidence 字段并参与风控决策（低置信度不自动交易），但未描述如何用历史准确率校准。未校准的 confidence 阈值缺乏统计意义，应建立置信度—实际命中率校准曲线。
+
+22.2 数据与执行偏差
+
+1. 历史盘口与实盘撮合不一致未量化。V1 标记盘口数据为 P0 必做，但承认免费源历史盘口不足。模拟盘采用 K 线撮合，实盘为实时盘口撮合，两套逻辑偏差未评估，可能导致模拟盘表现无法在实盘复现。应增加模拟-实盘撮合偏差度量指标。
+2. T+1 与持仓模拟偏粗。未覆盖 ETF 分红除息、份额申赎变动、现金替代、ETF 申赎套利等复杂场景，这些会直接影响可用数量、成本价和市值计算准确性。
+
+22.3 风控与治理
+
+1. 缺组合级风控。五层风控（账户/标的/策略/订单/模型）未包含组合层：行业与板块集中度、持仓相关性、风格因子暴露。多标的轮动时隐性集中是主要风险源，应补充组合层风控。
+2. 多空辩论可能流于形式。未定义辩论轮数、僵局处理、防止首席研究员偏置的机制。若首席一句话汇总，看多/看空观点易被弱化。应明确辩论最小轮数与僵局升级路径。
+3. Prompt 变更缺强制回归流程。有 test_result 字段但无明确"A/B 回测对比、评审、灰度上线"机制。交易系统 Prompt 改动影响巨大，应强制变更前回测验证。
+4. Agent 表现归因体系不完整。有"建议与实际结果对比"指标，但未设计每个 Agent 的准确率与贡献度归因（哪个 Agent 信号最有效、哪个常误判），难以定向优化 Prompt 与模型路由。
+5. 情绪数据合规边界未明确。股吧、雪球爬虫标注"注意合规"但无替代方案；平台反爬与数据使用条款风险未评估，需明确合规边界与兜底数据源。
+
+22.4 运维与安全
+
+1. 灾难恢复与高可用缺失。PostgreSQL 为单点，无备份、主从、故障切换方案。实盘场景数据库故障等同于熔断，需有降级与恢复方案。
+2. 密钥管理未提及。券商 API 密钥、LLM API key、邮箱与数据库凭据如何存储与轮换。交易系统密钥泄露等同于资金风险，应引入密钥管理服务。
+3. 系统层监控告警缺失。熔断仅覆盖交易层，进程存活、调度任务执行状态、数据采集成功率、磁盘与内存等运维监控未设计。需补充系统健康监控与告警通道。
+4. 时序数据存储优化未讨论。分钟 K、盘口快照膨胀快，无分区、归档、冷热分离策略，长期将影响查询性能。
+5. 前端管理台设计空白。仅 web/dashboard 目录，无功能规格。实盘半自动需要人工确认工作台、紧急按钮、实时持仓与订单监控、风控状态仪表盘、Agent 决策可视化。
+6. 模型降级路径不明确。快/深模型分层有思路，但未定义深模型不可用时降级到快模型还是人工，token 预算与单次决策成本上限未量化。
+
+---
+
+23. 接入实盘的演进方向
+
+实盘接入应严格遵循"只读同步、撮合校准、半自动、小额度自动"逐步放量，每步用模拟盘足够样本验证后再推进，不可跳级。
+
+23.1 第一步：只读账户同步与撮合校准
+
+1. 实现 BrokerAdapter 的 get_account、get_positions、get_orders、get_trades 只读方法，优先接入 QMT 或 MiniQMT。
+2. 对比模拟盘账户与真实账户偏差，用真实成交数据校准滑点与撮合模型，缩小模拟-实盘 gap。
+3. 建立行情延迟基线、下单到成交延迟基线、账户同步延迟基线，超基线限制交易频率或触发熔断。
+
+23.2 第二步：撮合模型向实盘对齐
+
+1. 模拟盘撮合从 K 线撮合升级为实时盘口撮合模拟，引入历史盘口数据校准成交概率与滑点。
+2. 实盘接入真实十档盘口，为后续执行算法与拆单打基础。
+
+23.3 第三步：半自动实盘
+
+1. Agent 生成计划、风控审核后，通过邮件或界面推送，由人工手动下单，系统记录成交回填。
+2. 前端管理台必须先落地：人工确认工作台、紧急按钮、实时持仓与订单监控、风控状态仪表盘、Agent 决策可视化。
+
+23.4 第四步：小额度自动与实盘风控加固
+
+1. 限额执行：单笔、单日、仓位、次数均设上限，全量开启熔断，保留人工一键暂停。
+2. 实盘阈值应比模拟盘更保守：降低自动执行上限、提高人工确认比例、收紧回撤与连续失败熔断阈值。
+3. 强化幂等与状态机：API 超时或返回未知状态时查询优先、绝不重复提交，order_intent_id 持久化并加分布式锁。
+4. 补齐组合级风控：行业与板块集中度、持仓相关性、风格因子暴露监控。
+
+23.5 横向能力建设（贯穿各步）
+
+1. 灾难恢复与高可用：PostgreSQL 主从加定时备份加故障切换；风控、行情、调度等关键服务多实例；密钥用 Vault 管理；明确 RTO 与 RPO。
+2. Agent 持续校准闭环：实盘数据追踪每个 Agent 准确率与贡献度，校准 confidence，Prompt 优化后回测验证再灰度上线，形成实盘反馈驱动迭代。
+3. 执行算法升级：执行监督 Agent 演进为执行算法调度器，大单采用 TWAP、VWAP、冰山等拆单策略降低冲击成本。
+4. 模型降级链路：深模型不可用时降级到快模型，再降级到规则策略，最终人工接管，明确各场景降级路径与通知机制。
+5. 合规对接：实盘需满足券商交易留痕、反操纵、异常交易监控要求，合规审计 Agent 规则应对接券商风控标准。
+6. Prompt 强制回归：任何 Prompt 变更必须经回测 A/B 对比、评审、灰度上线，避免线上行为漂移。

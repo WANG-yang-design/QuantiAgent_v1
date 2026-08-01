@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>多Agent量化交易系统 V1</title>
+<style>
+body{margin:0;font-family:'Microsoft YaHei',Arial,sans-serif;background:#f2f2f7;color:#222}
+header{background:#1c3a5e;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
+header h1{margin:0;font-size:18px}
+.status{font-size:13px;padding:6px 12px;border-radius:12px;background:#27ae60}
+.status.paused{background:#c0392b}
+main{padding:20px;max-width:1200px;margin:auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:20px}
+.card{background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h3{margin:0 0 12px;font-size:15px;color:#1c3a5e}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+.row:last-child{border:none}
+.label{color:#888}.val{font-weight:600}
+button{background:#1c3a5e;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;margin:4px}
+button.danger{background:#c0392b}
+button.green{background:#27ae60}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:left}
+th{background:#f7f7fa;color:#666}
+.tab{display:flex;gap:4px;margin-bottom:12px}
+.tab button{background:#e8e8f0;color:#333}
+.tab button.on{background:#1c3a5e;color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>多Agent量化交易系统 V1</h1>
+  <div class="status" id="status">连接中...</div>
+</header>
+<main>
+  <div class="tab">
+    <button class="on" onclick="showTab('overview')">仪表盘</button>
+    <button onclick="showTab('confirm')">人工确认</button>
+    <button onclick="showTab('agents')">Agent运行</button>
+    <button onclick="showTab('orders')">订单</button>
+  </div>
+
+  <div id="tab-overview">
+    <div class="grid">
+      <div class="card">
+        <h3>账户</h3>
+        <div id="account"><div class="row"><span class="label">加载中...</span></div></div>
+      </div>
+      <div class="card">
+        <h3>紧急控制</h3>
+        <button class="danger" onclick="api('/api/emergency/pause?reason=web一键暂停','POST')">一键暂停</button>
+        <button class="green" onclick="api('/api/emergency/resume','POST')">恢复交易</button>
+        <button class="danger" onclick="api('/api/emergency/cancel_all','POST')">撤销全部委托</button>
+      </div>
+      <div class="card">
+        <h3>持仓</h3>
+        <div id="positions"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-confirm" style="display:none">
+    <div class="card"><div id="confirms"></div></div>
+  </div>
+  <div id="tab-agents" style="display:none">
+    <div class="card"><div id="agents"></div></div>
+  </div>
+  <div id="tab-orders" style="display:none">
+    <div class="card"><div id="orders"></div></div>
+  </div>
+</main>
+<script>
+const TOKEN = "quantiagent-admin";
+async function api(path, method="GET"){
+  const r = await fetch(path, {method, headers:{Authorization:"Bearer "+TOKEN}});
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+function money(v){ return "¥"+Number(v||0).toLocaleString("zh-CN",{maximumFractionDigits:2}); }
+async function refresh(){
+  try{
+    const h = await api("/api/health");
+    const st = document.getElementById("status");
+    st.textContent = h.paused ? "熔断中: "+h.paused_reason : "运行正常";
+    st.className = "status" + (h.paused ? " paused" : "");
+
+    const acc = await api("/api/account");
+    document.getElementById("account").innerHTML =
+      `<div class="row"><span class="label">总资产</span><span class="val">${money(acc.total_asset)}</span></div>
+       <div class="row"><span class="label">可用资金</span><span class="val">${money(acc.cash)}</span></div>
+       <div class="row"><span class="label">持仓市值</span><span class="val">${money(acc.market_value)}</span></div>
+       <div class="row"><span class="label">总盈亏</span><span class="val">${money(acc.total_pnl)}</span></div>`;
+
+    const pos = acc.positions || [];
+    document.getElementById("positions").innerHTML = pos.length ? pos.map(p=>
+      `<div class="row"><span class="label">${p.symbol} ${p.name}</span>
+       <span class="val">${p.total_qty}份 ${(p.pnl_pct*100).toFixed(2)}%</span></div>`).join("")
+      : `<div class="row"><span class="label">暂无持仓</span></div>`;
+
+    const confirms = await api("/api/confirmations/pending");
+    document.getElementById("confirms").innerHTML = confirms.length ? confirms.map(c=>
+      `<div class="row"><span class="label">${c.symbol} ${c.action} ¥${c.amount} [${c.risk_level}]</span>
+       <span class="val">
+         <button class="green" onclick="decide('${c.confirm_id}',true)">批准</button>
+         <button class="danger" onclick="decide('${c.confirm_id}',false)">拒绝</button>
+       </span></div>`).join("") : `<div class="row"><span class="label">无待确认交易</span></div>`;
+
+    const runs = await api("/api/agents/recent_runs?limit=20");
+    document.getElementById("agents").innerHTML = `<table><tr><th>时间</th><th>Agent</th><th>标的</th><th>状态</th></tr>` +
+      runs.map(r=>`<tr><td>${r.time}</td><td>${r.agent}</td><td>${r.symbol}</td><td>${r.status}</td></tr>`).join("") + `</table>`;
+
+    const orders = await api("/api/orders?limit=20");
+    document.getElementById("orders").innerHTML = `<table><tr><th>单号</th><th>标的</th><th>方向</th><th>数量</th><th>状态</th></tr>` +
+      orders.map(o=>`<tr><td>${o.order_id}</td><td>${o.symbol}</td><td>${o.side}</td><td>${o.filled_qty}/${o.qty}</td><td>${o.status}</td></tr>`).join("") + `</table>`;
+  }catch(e){ console.error(e); }
+}
+function showTab(name){
+  document.querySelectorAll('.tab button').forEach(b=>b.classList.remove('on'));
+  event.target.classList.add('on');
+  ["overview","confirm","agents","orders"].forEach(t=>{
+    document.getElementById("tab-"+t).style.display = t===name ? "" : "none";
+  });
+}
+async function decide(id, ok){
+  await api(`/api/confirmations/${id}/decide`, "POST").catch(()=>{});
+  // 通过原始 fetch 提交 body
+  fetch(`/api/confirmations/${id}/decide`, {method:"POST", headers:{Authorization:"Bearer "+TOKEN,"Content-Type":"application/json"},
+    body: JSON.stringify({approved:ok, note:"web"})}).then(refresh);
+}
+setInterval(refresh, 10000);
+refresh();
+</script>
+</body>
+</html>

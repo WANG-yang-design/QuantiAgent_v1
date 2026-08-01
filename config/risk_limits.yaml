@@ -1,0 +1,72 @@
+# =========================================================
+# 风控限额配置 (五层风控 + 组合层 + 熔断)
+# 风控是硬规则, 优先级高于所有 Agent
+# =========================================================
+
+account_level:
+  max_total_position: 0.90        # 最大总仓位(占总资产比例)
+  max_daily_loss: 0.03            # 最大单日亏损(占总资产)
+  max_weekly_loss: 0.06           # 最大周亏损
+  max_total_drawdown: 0.15        # 最大总回撤(从历史峰值)
+  min_cash_ratio: 0.10            # 最小现金比例
+  max_daily_trade_count: 20       # 每日最大交易次数
+  max_daily_trade_amount: 50000   # 每日最大交易金额(元)
+
+position_level:
+  max_single_position: 0.30       # 单标的最大仓位
+  max_single_loss: 0.10           # 单标的最大亏损
+  min_single_amount: 50000000     # 单标的最小日成交额(元)
+  max_volatility: 0.035           # 单标的最大日波动率(20日)
+  forbid_high_premium_etf: true
+  max_premium_rate: 0.03          # ETF 溢价率超过3%禁止买入
+  min_etf_premium_rate: -0.05     # 折价超5%也警示
+  min_avg_amount_20d: 30000000    # 20日平均成交额下限(元)
+  blacklist: []                   # 黑名单标的(手动维护)
+  tradable: true
+
+strategy_level:
+  max_strategy_capital: 0.5       # 每个策略最大资金比例
+  max_strategy_drawdown: 0.12
+  consecutive_loss_pause: 3       # 策略连续亏损3次暂停
+  rebalance_frequency_min: 60     # 策略调仓频率限制(分钟)
+
+order_level:
+  max_order_amount: 20000         # 单笔最大金额(元)
+  max_order_quantity: 1000000
+  max_price_deviation: 0.02       # 委托价偏离最新价 2% 拒绝
+  forbid_repeat_order: true
+  forbid_sell_over_available: true
+  limit_protection: true
+  min_lot: 100                    # 最小交易单位(手/100股)
+
+model_level:
+  require_structured_json: true
+  min_confidence: 0.55            # 低于此置信度不得自动交易
+  conflict_to_confirm: true       # 模型结论冲突进入人工确认
+  min_agent_agreement: 0.6        # 多Agent 观点一致性阈值
+  reject_invalid_fields: true
+
+portfolio_level:
+  max_sector_ratio: 0.45          # 单一行业/板块集中度上限
+  max_related_ratio: 0.6          # 高度相关标的(同跟踪指数ETF)合计上限
+
+circuit_breaker:
+  daily_loss_pct: 0.05            # 单日亏损5%熔断
+  consecutive_fail_orders: 5      # 连续失败订单5次熔断
+  quote_delay_seconds: 60         # 行情延迟超过60秒熔断
+  account_sync_fail: true
+  risk_service_down: true
+  model_output_anomaly: true
+  data_source_conflict: true
+  manual_pause: false             # 人工一键暂停(Web/CLI 可设置)
+  paused_reason: ""
+
+confirmation_policy:
+  auto_execute:
+    max_order_amount: 1000
+    risk_level: low
+  email_or_ui_confirm:
+    max_order_amount: 5000
+    risk_level: medium
+  block:
+    risk_level: high

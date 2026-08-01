@@ -1,0 +1,50 @@
+# =========================================================
+# 交易规则: A股/ETF 撮合与费用参数
+# =========================================================
+
+# 手续费
+fees:
+  commission_rate: 0.00025       # 佣金 万2.5
+  commission_min: 5.0            # 最低佣金 5元
+  stamp_tax_rate: 0.0005         # 印花税(仅卖出) 万5
+  transfer_fee_rate: 0.00001     # 过户费 万0.1
+  # ETF 不收印花税
+  stamp_tax_etf: false
+
+# 滑点
+slippage:
+  daily_bar: 0.001               # 日线回测 0.1%
+  minute_bar: 0.0005             # 分钟回测 0.05%
+  realtime: 0.0005
+
+# 涨跌停
+price_limit:
+  stock_limit: 0.10              # 主板股票 ±10%
+  stock_limit_st: 0.05           # ST ±5%
+  etf_limit: 0.10                # ETF ±10%
+  # 跌停/涨停不可买入/卖出
+
+# 交易单位
+lot:
+  stock: 100                     # 股票 100股/手
+  etf: 100
+
+# 交易时段 (A股)
+trading_hours:
+  open1: ["09:30", "11:30"]
+  open2: ["13:00", "15:00"]
+  call_auction_open: "09:15"     # 集合竞价
+  # 非交易时段不允许下单
+
+# T+1
+t_plus_1:
+  enabled: true
+  # 今日买入不可卖, 昨日及以前可卖
+
+# 最大单日委托次数(订单级保护)
+max_daily_orders: 50
+
+# 撤单规则
+cancel:
+  unfilled_timeout_seconds: 300  # 限价单超过5分钟未成交允许撤单
+  max_cancel_per_day: 30

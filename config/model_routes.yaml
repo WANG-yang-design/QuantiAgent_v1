@@ -1,0 +1,51 @@
+# =========================================================
+# 模型路由: 快模型 / 深模型 / 不用模型 的任务划分
+# 快模型: 摘要、分类、初筛、润色 —— token 便宜、速度快
+# 深模型: 多空辩论、重大决策、异常分析、复盘 —— 精度优先
+# 不用模型: K线计算、指标、撮合、风控硬规则等纯代码任务
+# =========================================================
+
+fast_model_tasks:
+  - news_summary          # 新闻摘要
+  - announcement_classify # 公告分类
+  - sentiment_screening   # 情绪初筛
+  - data_explain         # 数据解释
+  - simple_technical_summary  # 简单技术面总结
+  - report_polish        # 报告润色
+  - log_summary          # 日志总结
+
+deep_model_tasks:
+  - bull_bear_debate     # 多空辩论 (看多/看空研究员)
+  - major_trade_decision # 重大交易决策 (首席研究员/交易员)
+  - anomaly_analysis     # 异常风险分析
+  - strategy_review      # 策略复盘
+  - complex_event_judge  # 复杂事件判断 (新闻风险评级)
+  - portfolio_advice     # 组合调整建议
+
+no_model_tasks:           # 纯代码, 严禁调用 LLM
+  - kline_calc
+  - indicator_calc
+  - backtest_matching
+  - risk_hard_rules
+  - account_calc
+  - order_state_machine
+  - fee_calc
+
+# Agent → 任务映射 (供编排层使用)
+agent_task_map:
+  data_admin: fast
+  technical_analyst: fast
+  etf_analyst: fast
+  fundamental_analyst: fast
+  news_analyst: deep
+  sentiment_analyst: fast
+  money_flow_analyst: fast
+  macro_analyst: fast
+  bull_researcher: deep
+  bear_researcher: deep
+  chief_researcher: deep
+  trader: deep
+  risk_manager: deep
+  compliance: fast
+  execution_supervisor: fast
+  review: deep

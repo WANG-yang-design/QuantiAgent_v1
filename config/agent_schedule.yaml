@@ -1,0 +1,65 @@
+# =========================================================
+# Agent 调度配置 (APScheduler)
+# =========================================================
+
+timezone: "Asia/Shanghai"
+
+jobs:
+  # 交易日历更新
+  update_trade_calendar:
+    cron: "0 8 * * 1-5"
+    enabled: true
+  # 股票/ETF 基础信息更新
+  update_symbols:
+    cron: "10 8 * * 1-5"
+    enabled: true
+  # 盘前新闻公告扫描
+  premarket_news:
+    cron: "30 8 * * 1-5"
+    enabled: true
+  # 实时行情采集(交易时段 5-15秒) -> 简化: 每10秒, 只采池内标的
+  collect_realtime_quote:
+    interval_seconds: 10
+    enabled: true
+    only_trading_hours: true
+  # 盘口快照(15秒, 落库降频为每60秒)
+  collect_order_book:
+    interval_seconds: 60
+    enabled: true
+    only_trading_hours: true
+  # 资金流数据(1-5分钟)
+  collect_money_flow:
+    interval_seconds: 300
+    enabled: true
+    only_trading_hours: true
+  # 舆情新闻扫描(5-15分钟)
+  scan_news:
+    interval_seconds: 600
+    enabled: true
+  # Agent 常规分析(默认30分钟, 可配置)
+  agent_routine_analysis:
+    interval_minutes: 30
+    enabled: true
+    only_trading_hours: true
+  # 收盘数据更新(15:10后)
+  eod_data_update:
+    cron: "10 15 * * 1-5"
+    enabled: true
+  # 日终报告(16:00-18:00)
+  daily_report:
+    cron: "0 17 * * 1-5"
+    enabled: true
+  # 周报(周五 18:00)
+  weekly_report:
+    cron: "0 18 * * 5"
+    enabled: true
+
+# 紧急触发条件(与 config.yaml intraday.urgent 一致, 供调度复用)
+urgent_triggers:
+  price_change_pct_abs: 0.02
+  volume_ratio_gt: 2.0
+  intraday_drawdown_gt: 0.015
+  order_book_spread_gt: 0.005
+  major_news_detected: true
+  announcement_risk_detected: true
+  stop_loss_near: true

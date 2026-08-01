@@ -1,0 +1,93 @@
+# =========================================================
+# 多Agent量化交易系统 V1 - 全局配置
+# =========================================================
+
+system:
+  name: "多Agent量化交易系统V1"
+  version: "1.0.0"
+  timezone: "Asia/Shanghai"
+  trade_mode: "paper"            # paper=模拟盘 live=实盘(预留) backtest=回测
+  log_dir: "logs"
+  report_dir: "reports"
+
+database:
+  url: ""                        # 留空则从 .env 拼接
+  echo: false
+  pool_size: 10
+  max_overflow: 20
+
+# ---- 模拟盘初始资金 ----
+paper_account:
+  initial_cash: 100000
+  account_id: "PA-001"
+
+# ---- 标的池 ----
+universe:
+  # V1 优先 ETF；股票为 P1 可选
+  etf_whitelist: []              # 空 = 从数据源拉取全部 ETF, 再按流动性过滤
+  stock_whitelist: []
+  max_symbols_per_scan: 20       # 盘中监控单轮最多分析标的数
+  min_etf_amount: 50000000       # 最小日成交额(元), 过滤低流动性 ETF
+
+# ---- LLM 调用 ----
+llm:
+  base_url: ""                   # 从 .env 覆盖
+  api_key: ""
+  fast_model: ""
+  deep_model: ""
+  embedding_model: ""
+  temperature: 0.2
+  max_retries: 3
+  timeout_seconds: 60
+  mock_mode: "auto"              # auto=无key自动降级为规则模拟; true=强制模拟; false=强制真实
+  cost_log: true
+
+# ---- 盘中监控 ----
+intraday:
+  analysis_interval_min: 30      # Agent 常规分析频率(可配5/10/15/30/60)
+  urgent:
+    price_change_pct_abs: 0.02   # 涨跌幅超过2%触发紧急分析
+    volume_ratio_gt: 2.0
+    intraday_drawdown_gt: 0.015
+    order_book_spread_gt: 0.005
+    major_news: true
+    stop_loss_near: true
+
+# ---- 策略参数 (无Agent参与时的规则策略, 见 strategies/rotation_executor.py) ----
+strategies:
+  etf_momentum_rotation:
+    top_n: 3                 # 持有动量排名前N只
+    mom_window: 20           # 动量计算窗口(交易日)
+    min_amount: 30000000     # 20日均成交额下限(元), 低于则剔除
+    max_vol: 0.50            # 年化波动率上限(过滤极端波动)
+    target_weight: 0.20      # 单标的目标仓位(占总资产比例)
+    rebalance_threshold: 0.15  # 仓位偏离超过15%才调仓(减少噪音交易)
+
+# ---- RAG ----
+rag:
+  chunk_size: 500
+  chunk_overlap: 50
+  top_k: 5
+  vector_dim: 1024               # 与 embedding 模型输出维度一致
+  embedding_batch_size: 10
+
+# ---- Web 管理台 ----
+web:
+  host: "0.0.0.0"
+  port: 8080
+  # 人工确认令牌(简单实现, 实盘前应换为正式鉴权)
+  admin_token: "quantiagent-admin"
+
+# ---- 报告 ----
+report:
+  daily_time: "17:00"
+  weekly_day: 5                  # 周五
+  monthly_day: 1
+
+# ---- 券商接口(实盘预留) ----
+broker:
+  adapter: "paper"               # paper | qmt | ptrade
+  qmt_path: ""                   # QMT 安装目录(预留)
+  qmt_account: ""
+  ptrade_ip: ""
+  ptrade_port: 0
