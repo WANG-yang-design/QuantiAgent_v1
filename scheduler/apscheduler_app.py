@@ -55,6 +55,11 @@ class QuantScheduler:
                 seconds = int(jc.get("interval_seconds", 60) or 0)
                 if jc.get("interval_minutes"):
                     seconds = int(jc["interval_minutes"]) * 60
+                if jc.get("interval_seconds") is None and job_name == "position_monitor":
+                    # 持仓巡检间隔从 risk_limits.yaml 读取(可调)
+                    from core.config import get_settings
+                    seconds = int(get_settings().get(
+                        "risk.position_monitor.check_interval_seconds", 300) or 300)
                 trigger = IntervalTrigger(seconds=seconds)
             only_trading = jc.get("only_trading_hours", False)
 
@@ -225,6 +230,19 @@ class QuantScheduler:
                 logger.info("市场诊断更新: %s (%s)", d.get("label"), d.get("state"))
         except Exception as exc:
             logger.warning("市场诊断任务失败: %s", exc)
+
+    def job_position_monitor(self):
+        """持仓风控巡检(交易时段, 间隔见 risk_limits.yaml)。"""
+        from risk.position_monitor import get_position_monitor
+        try:
+            r = get_position_monitor().check_once()
+            if r.get("executed"):
+                logger.warning("持仓巡检执行了 %d 笔止损/止盈/降仓单", len(r["executed"]))
+            elif r.get("triggered"):
+                logger.info("持仓巡检触发 %d 笔(未执行: %s)",
+                            len(r["triggered"]), r.get("skipped")[:3])
+        except Exception as exc:
+            logger.error("持仓巡检异常: %s", exc, exc_info=True)
 
     def job_weekly_report(self):
         """周报(周五18:00)。"""

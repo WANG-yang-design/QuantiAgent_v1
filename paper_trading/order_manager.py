@@ -52,13 +52,9 @@ class OrderManager:
 
     def _load_orders(self):
         for o in repo.get_open_orders(self.account.account_id):
-            self._orders[o.order_id] = {
-                "order_id": o.order_id, "order_intent_id": o.order_intent_id,
-                "symbol": o.symbol, "side": o.side, "order_type": o.order_type,
-                "price": o.price, "qty": o.qty, "filled_qty": o.filled_qty,
-                "remaining_qty": o.remaining_qty, "status": o.status,
-                "submit_time": o.submit_time, "plan_id": o.plan_id,
-            }
+            view = self._to_view(o)
+            view["frozen_amount"] = 0.0     # 重启后冻结金额按剩余数量近似(防御)
+            self._orders[o.order_id] = view
 
     # ------------------------------------------------------------------
     # 提交订单 (幂等: 同一 order_intent_id 只能提交一次)

@@ -70,3 +70,19 @@ confirmation_policy:
     risk_level: medium
   block:
     risk_level: high
+
+# =========================================================
+# 持仓风控巡检 (硬性止损, 不依赖Agent及时性)
+# 交易时段按间隔自动扫描持仓, 触发条件满足立即执行(经风控)
+# =========================================================
+position_monitor:
+  enabled: true
+  check_interval_seconds: 300        # 巡检间隔(秒), 默认5分钟
+  only_trading_hours: true           # 仅交易时段巡检
+  stop_loss_pct: 0.08                # 硬止损: 浮亏超过成本8%立即卖出
+  trailing_stop_pct: 0.08            # 移动止盈: 从持仓最高价回撤8%卖出(锁定利润)
+  market_risk_filter: true           # 大盘risk_off时降低仓位
+  market_risk_reduce_ratio: 0.5      # risk_off时卖出持仓的一半
+  auto_execute: true                 # 自动执行(经风控+合规); false=仅告警不下单
+  max_daily_stop_orders: 10          # 每日最大自动止损单次数(防失控)
+  min_sell_qty: 100                  # 最小卖出数量(低于则不执行)

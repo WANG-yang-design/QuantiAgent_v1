@@ -53,6 +53,11 @@ jobs:
   market_diagnosis:
     cron: "0 10-14 * * 1-5"
     enabled: true
+  # 持仓风控巡检(间隔读 risk_limits.yaml position_monitor.check_interval_seconds)
+  position_monitor:
+    interval_seconds: 0
+    enabled: true
+    only_trading_hours: true
   # 周报(周五 18:00)
   weekly_report:
     cron: "0 18 * * 5"

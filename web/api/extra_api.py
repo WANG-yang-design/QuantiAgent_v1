@@ -877,6 +877,25 @@ def manual_snapshot():
 
 
 # ================================================================
+# 14. 持仓风控巡检
+# ================================================================
+@router.get("/risk/position-monitor", dependencies=[Depends(require_auth)])
+def position_monitor_view():
+    """巡检配置与最近状态。"""
+    from risk.position_monitor import get_position_monitor
+    pm = get_position_monitor()
+    return {"enabled": pm.enabled(), "config": pm.config_view()}
+
+
+@router.post("/risk/position-monitor/run", dependencies=[Depends(require_auth)])
+def position_monitor_run():
+    """手动触发一轮持仓风控巡检(立即执行)。"""
+    from risk.position_monitor import get_position_monitor
+    result = get_position_monitor().check_once()
+    return result
+
+
+# ================================================================
 # 8. 风控限额配置(展示用)
 # ================================================================
 @router.get("/risk/limits", dependencies=[Depends(require_auth)])

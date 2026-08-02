@@ -132,6 +132,8 @@ class PaperAccount:
             p.market_value = p.total_qty * (p.latest_price or 0)
             p.pnl = p.market_value - p.total_qty * (p.cost_price or 0)
             p.pnl_pct = (p.latest_price / p.cost_price - 1) if p.cost_price else 0
+            if p.latest_price > (p.peak_price or 0):
+                p.peak_price = p.latest_price
             total_mv += p.market_value
             total_pnl += p.pnl
         self._account.market_value = total_mv
@@ -141,12 +143,14 @@ class PaperAccount:
         self._account.total_pnl = total_pnl
 
     def update_prices(self, prices: Dict[str, float]):
-        """行情更新时刷新价格并重算市值。"""
+        """行情更新时刷新价格并重算市值, 同时更新持仓峰值(移动止盈基准)。"""
         with self._lock:
             for symbol, price in prices.items():
                 p = self._positions.get(symbol)
                 if p and price > 0:
                     p.latest_price = price
+                    if price > (p.peak_price or 0):
+                        p.peak_price = price
             self._refresh_market_value()
             self._persist()
 
@@ -187,7 +191,8 @@ class PaperAccount:
                                  symbol=symbol, name=name, total_qty=0,
                                  available_qty=0, today_buy_qty=0, frozen_qty=0,
                                  market_value=0.0, pnl=0.0, pnl_pct=0.0,
-                                 cost_price=price, latest_price=price)
+                                 cost_price=price, latest_price=price,
+                                 peak_price=price)
                     self._positions[symbol] = p
                 # 摊薄成本 = (旧持仓市值 + 本次买入金额) / 新总数量
                 old_cost_value = p.total_qty * p.cost_price
@@ -198,6 +203,7 @@ class PaperAccount:
                     p.today_buy_qty += qty            # T+1: 今日买入不可卖
                 p.cost_price = (old_cost_value + price * qty) / p.total_qty if p.total_qty else price
                 p.latest_price = price
+                p.peak_price = max(p.peak_price or price, price)   # 持仓最高价(移动止盈基准)
                 p.buy_date = trade_time.date()
                 repo.save_position(p)
             else:  # SELL

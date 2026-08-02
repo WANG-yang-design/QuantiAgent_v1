@@ -432,6 +432,7 @@ class Position(Base):
     today_buy_qty: Mapped[int] = mapped_column(Integer, default=0)  # 今日买入(不可卖)
     cost_price: Mapped[float] = mapped_column(Float, default=0)     # 摊薄成本
     latest_price: Mapped[float] = mapped_column(Float, default=0)
+    peak_price: Mapped[float] = mapped_column(Float, default=0)     # 持仓期间最高价(移动止盈基准)
     market_value: Mapped[float] = mapped_column(Float, default=0)
     pnl: Mapped[float] = mapped_column(Float, default=0)            # 浮动盈亏
     pnl_pct: Mapped[float] = mapped_column(Float, default=0)

@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Pause, Play, XCircle, Check, X, Info } from "lucide-react";
+﻿import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Pause, Play, XCircle, Check, X, Info, ShieldAlert, Activity } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
 
@@ -19,6 +19,18 @@ export default function PaperLive() {
   const decide = useMutation({
     mutationFn: ({ id, ok }) => api.post(`/api/confirmations/${id}/decide`, { approved: ok, note: "web" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["sysmode"] }),
+  });
+
+  // 持仓风控巡检
+  const { data: pm } = useQuery({
+    queryKey: ["position-monitor"],
+    queryFn: () => api.get("/api/risk/position-monitor"),
+    refetchInterval: 30000,
+  });
+  const [pmResult, setPmResult] = useState(null);
+  const runPm = useMutation({
+    mutationFn: () => api.post("/api/risk/position-monitor/run"),
+    onSuccess: (r) => setPmResult(r),
   });
 
   if (isLoading) return <div className="p-5"><Spin /></div>;
@@ -131,6 +143,48 @@ export default function PaperLive() {
         </div>
       </div>
 
+      {/* 持仓风控巡检 */}
+      <div className="card">
+        <div className="card-title"><ShieldAlert size={14} />持仓风控巡检(硬性止损, 不依赖Agent及时性)</div>
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <button className="btn-primary" disabled={runPm.isPending} onClick={() => runPm.mutate()}>
+            <Activity size={14} className="inline mr-1" />{runPm.isPending ? "巡检中..." : "立即巡检一轮"}
+          </button>
+          <span className="text-xs text-gray-500">
+            自动巡检: {pm?.config?.check_interval_seconds ? `${pm.config.check_interval_seconds / 60}分钟/次` : "-"} ·
+            硬止损 {((pm?.config?.stop_loss_pct ?? 0.08) * 100).toFixed(0)}% · 移动止盈 {((pm?.config?.trailing_stop_pct ?? 0.08) * 100).toFixed(0)}% ·
+            {pm?.config?.market_risk_filter ? " 含市场risk_off降仓" : " 无市场降仓"} ·
+            {pm?.config?.auto_execute ? " 自动执行" : " 仅告警"}
+            <span className="ml-1 text-gray-400">(阈值修改见 config/risk_limits.yaml position_monitor)</span>
+          </span>
+        </div>
+        {pmResult && (
+          <div className="text-sm">
+            <div className="text-xs text-gray-500 mb-1">巡检结果: 检查 {pmResult.checked} 只持仓 · 触发 {pmResult.triggered.length} · 执行 {pmResult.executed.length} · 跳过 {pmResult.skipped.length}</div>
+            {pmResult.executed.map((e, i) => (
+              <div key={i} className="flex items-center gap-2 border border-red-200 bg-red-50/50 rounded-lg px-3 py-1.5 mb-1">
+                <span className="badge bg-red-50 text-red-600">{e.type}</span>
+                <span className="font-medium">{e.symbol}</span>
+                <span>卖出 {e.qty}份 @ {fmt(e.price)}</span>
+                <span className="text-xs text-gray-500 truncate flex-1">{e.reason}</span>
+                <span className="text-[10px] text-gray-400">{e.order_id}</span>
+              </div>
+            ))}
+            {pmResult.triggered.filter((t) => !pmResult.executed.some((e) => e.symbol === t.symbol)).map((t, i) => (
+              <div key={`t${i}`} className="flex items-center gap-2 border border-amber-200 bg-amber-50/50 rounded-lg px-3 py-1.5 mb-1">
+                <span className="badge bg-amber-50 text-amber-700">{t.type}触发(未执行)</span>
+                <span className="font-medium">{t.symbol}</span>
+                <span className="text-xs text-gray-500 truncate">{t.reason}</span>
+              </div>
+            ))}
+            {pmResult.skipped.map((s, i) => (
+              <div key={`s${i}`} className="text-xs text-gray-400">跳过: {s}</div>
+            ))}
+            {!pmResult.triggered.length && <div className="text-xs text-green-600">持仓健康, 无触发</div>}
+          </div>
+        )}
+      </div>
+
       {/* 人工确认队列 */}
       <div className="card">
         <div className="card-title">人工确认队列 ({(mode?.confirmations || []).length})</div>
@@ -157,3 +211,4 @@ export default function PaperLive() {
     </div>
   );
 }
+
