@@ -52,15 +52,19 @@ function TradeKlineCard({ runId, trades }) {
     <div className="card">
       <div className="card-title">买卖点K线图(红B=买入 绿S=卖出 · 蓝虚=成本 橙虚=止损)</div>
       <div className="flex flex-wrap gap-1.5 mb-2">
-        {symbols.map((s) => (
-          <button key={s} className={`badge ${cur === s ? "bg-brand-600 text-white" : "bg-gray-100 text-gray-600"}`}
-            onClick={() => setCur(s)}>
-            {s} · {(trades || []).filter((t) => t.symbol === s).length}笔
-          </button>
-        ))}
+        {symbols.map((s) => {
+          const name = (trades || []).find((t) => t.symbol === s)?.name || "";
+          const cnt = (trades || []).filter((t) => t.symbol === s).length;
+          return (
+            <button key={s} className={`badge ${cur === s ? "bg-brand-600 text-white" : "bg-gray-100 text-gray-600"}`}
+              onClick={() => setCur(s)}>
+              {s}{name ? ` · ${name}` : ""} · {cnt}笔
+            </button>
+          );
+        })}
       </div>
       {data?.candles?.length ? (
-        <BacktestKline candles={data.candles} marks={data.marks || []} envelopes={data.envelopes || []} />
+        <BacktestKline candles={data.candles} marks={data.marks || []} roundTrips={data.round_trips || []} />
       ) : (
         <Empty text="加载K线中(先执行 fetch-daily)" />
       )}
@@ -139,9 +143,13 @@ export default function BacktestCenter() {
 
   const loadHistory = async (runId) => {
     setMetrics(null); setError(null);
-    const r = await api.get(`/api/backtest/${runId}`);
-    if (r.status === "DONE" && r.metrics) setMetrics(r.metrics);
-    else setError("该回测未完成或数据丢失");
+    try {
+      const r = await api.get(`/api/backtest/${runId}`);
+      if (r.status === "DONE" && r.metrics) setMetrics(r.metrics);
+      else setError(`该回测无结果(${r.status || "数据缺失"}), 可能是历史残留记录`);
+    } catch (e) {
+      setError("该回测记录不存在或已被清理: " + (e.response?.data?.detail || e.message));
+    }
   };
 
   return (

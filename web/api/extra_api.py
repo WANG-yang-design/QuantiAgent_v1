@@ -227,16 +227,48 @@ def get_backtest_kline(run_id: str, symbol: str):
 
     # 买卖点标记
     marks = []
-    envelopes = []   # [{date, cost, stop}] 每笔买入后的成本线+止损线
     for t in trades:
         d = str(t.get("date"))[:10]
         marks.append({"date": d, "price": round(float(t.get("price", 0)), 4),
                       "side": t.get("side"), "qty": t.get("qty"),
                       "pnl": round(float(t.get("pnl", 0) or 0), 2)})
+
+    # 完整交易区间(round-trip): 每笔 BUY→SELL 的区间, 用于包络带(盈亏着色)
+    round_trips = []
+    cur_buy = None   # {date, qty, cost}
+    for t in trades:
+        d = str(t.get("date"))[:10]
+        price = float(t.get("price", 0))
+        qty = int(t.get("qty", 0))
         if t.get("side") == "BUY":
-            cost = round(float(t.get("price", 0)), 4)
-            stop = round(cost * (1 - 0.08), 4)
-            envelopes.append({"date": d, "cost": cost, "stop": stop})
+            if cur_buy is None:
+                cur_buy = {"date": d, "qty": qty, "cost": price}
+            else:
+                # 合并补仓: 摊薄成本
+                total_q = cur_buy["qty"] + qty
+                cur_buy["cost"] = (cur_buy["cost"] * cur_buy["qty"] + price * qty) / total_q
+                cur_buy["qty"] = total_q
+        else:  # SELL
+            if cur_buy is not None:
+                sell_price = price
+                pnl = float(t.get("pnl", 0) or 0)
+                round_trips.append({
+                    "buy_date": cur_buy["date"], "sell_date": d,
+                    "cost": round(cur_buy["cost"], 4),
+                    "stop": round(cur_buy["cost"] * (1 - 0.08), 4),
+                    "sell_price": round(sell_price, 4),
+                    "pnl": round(pnl, 2),
+                    "profit": pnl > 0,
+                })
+                cur_buy = None
+    if cur_buy is not None:
+        # 期末未平仓
+        round_trips.append({
+            "buy_date": cur_buy["date"], "sell_date": None,
+            "cost": round(cur_buy["cost"], 4),
+            "stop": round(cur_buy["cost"] * (1 - 0.08), 4),
+            "sell_price": None, "pnl": None, "profit": None,
+        })
     # 名字
     name_map: Dict[str, str] = {}
     try:
@@ -247,7 +279,7 @@ def get_backtest_kline(run_id: str, symbol: str):
     except Exception:
         pass
     return {"symbol": symbol, "name": name_map.get(symbol, ""),
-            "candles": candles, "marks": marks, "envelopes": envelopes,
+            "candles": candles, "marks": marks, "round_trips": round_trips,
             "trade_count": len(trades)}
 
 
@@ -399,10 +431,13 @@ def submit_backtest(body: dict):
 
 @router.get("/backtest/list", dependencies=[Depends(require_auth)])
 def list_backtests(limit: int = 20):
-    """注意: 必须定义在 /backtest/{run_id} 之前, 否则会被路径参数抢先匹配。"""
+    """注意: 必须定义在 /backtest/{run_id} 之前, 否则会被路径参数抢先匹配。
+    只列出有结果的回测(排除历史上重复提交残留的 PENDING 空记录)。"""
     from database.models import BacktestRun
     with get_session() as s:
-        runs = s.query(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(limit).all()
+        runs = s.query(BacktestRun).filter(
+            BacktestRun.status.in_(["DONE", "FAILED"])) \
+            .order_by(BacktestRun.created_at.desc()).limit(limit).all()
         return [{"run_id": r.run_id, "name": r.name, "start": str(r.start_date),
                  "end": str(r.end_date), "mode": r.mode, "status": r.status,
                  "created_at": str(r.created_at)[:16]} for r in runs]

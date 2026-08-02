@@ -57,6 +57,8 @@ def build_rotation_signal_fn(initial_cash: float = 100000.0,
     min_hold_days = int(p.get("min_hold_days", 3))                 # 最小持仓天数(防"今天买明天卖")
     hold_buffer = int(p.get("hold_buffer", 1))                     # 卖出滞回: 跌出前(top_n+hold_buffer)才卖
     max_buy_momentum = float(p.get("max_buy_momentum", 0.30))      # 追高保护: 20日涨幅超过30%禁止买入
+    initial_ratio = float(p.get("initial_ratio", 0.5))             # 首仓比例: 首次买入只建目标仓位的50%(分批建仓)
+    bottom_ratio = float(p.get("bottom_ratio", 0.2))               # 底仓比例: 排名跌出时减仓至底仓留观察, 不全清
     # 有效单标的上限: 受总仓位约束 (target_weight 可被压缩)
     eff_weight = min(target_weight, max_total_position / max(top_n, 1))
 
@@ -154,13 +156,19 @@ def build_rotation_signal_fn(initial_cash: float = 100000.0,
             held = (d - buy_date).days if isinstance(buy_date, date) else min_hold_days
             if held < min_hold_days:
                 continue
-            # 轮动卖出(滞回): 排名跌破 top_n+hold_buffer 才卖
+            # 轮动减仓(滞回): 排名跌破 top_n+hold_buffer → 减仓至底仓(留观察仓, 不全清)
             rank = rank_of.get(sym, 999)
             if rank >= sell_rank_limit:
                 mom = float(features[sym].get(f"momentum_{mom_window}d", 0) or 0) if sym in features else 0
-                reason = (f"排名第{rank + 1}, 跌出前{sell_rank_limit}, 轮动卖出"
-                          f"(动量{mom:+.1%})") if sym in features else "标的失去流动性, 卖出"
-                signals[sym] = {"action": "SELL", "qty": pos["qty"], "reason": reason}
+                # 保留底仓(bottom_ratio), 其余卖出; 仓位太小直接全清
+                keep = int(pos["qty"] * bottom_ratio // 1)
+                sell_qty = pos["qty"] - keep
+                if sell_qty < 100:
+                    sell_qty = pos["qty"]
+                    keep = 0
+                reason = (f"排名第{rank + 1}, 跌出前{sell_rank_limit}, 减仓至底仓"
+                          f"(卖出{sell_qty}份, 留{keep}份观察; 动量{mom:+.1%})")
+                signals[sym] = {"action": "SELL", "qty": sell_qty, "reason": reason}
 
         # 5. 买入: 仅在市场非risk_off时; 动量必须为正(熊市不接飞刀)
         if risk_off:
@@ -188,10 +196,17 @@ def build_rotation_signal_fn(initial_cash: float = 100000.0,
             # 最小买入金额(防碎单)
             if diff >= 100 and diff * price >= min_order_amount \
                     and (cur_qty == 0 or diff >= cur_qty * rebalance_threshold):
-                signals[sym] = {
-                    "action": "BUY", "qty": diff,
-                    "reason": (f"动量排名前{top_n}({mom:+.1%}), 补仓至目标权重{eff_weight:.0%}"),
-                }
+                if cur_qty == 0:
+                    # 首次建仓: 只建目标仓位的一部分(分批建仓, 避免一次性追满)
+                    target_qty = int(target_qty * initial_ratio // 100 * 100)
+                    diff = target_qty
+                    if diff < 100 or diff * price < min_order_amount:
+                        continue
+                    reason = (f"动量排名前{top_n}({mom:+.1%}), 分批建仓{initial_ratio:.0%}"
+                              f"(目标权重{eff_weight:.0%}的{initial_ratio:.0%})")
+                else:
+                    reason = (f"动量排名前{top_n}({mom:+.1%}), 加仓至目标权重{eff_weight:.0%}")
+                signals[sym] = {"action": "BUY", "qty": diff, "reason": reason}
         return signals
 
     return signal_fn

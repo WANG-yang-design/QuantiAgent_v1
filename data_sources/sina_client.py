@@ -1,10 +1,13 @@
 ﻿# -*- coding: utf-8 -*-
 """
-新浪财经客户端 (实时行情备源)
-============================
+新浪财经客户端 (实时行情备源 + ETF日K备源)
+==========================================
 hq.sinajs.cn 接口, 免费, 需带 Referer 头。返回 GBK 编码。
+注意: 新浪部分接口 SSL 证书 hostname 不匹配(第三方数据源常见),
+需要关闭证书校验才能访问。
 """
 import logging
+import warnings
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +15,22 @@ import httpx
 
 from data_sources.base import BaseDataSource
 from data_sources.akshare_client import _safe_float, _safe_str
+
+# 关闭 requests/httpx 对新浪的 SSL 证书校验(新浪证书 hostname 不匹配)
+warnings.filterwarnings("ignore")
+import urllib3  # noqa: E402
+urllib3.disable_warnings()
+try:
+    import requests  # noqa: E402
+    _orig_requests_get = requests.get
+
+    def _insecure_get(*args, **kwargs):
+        kwargs.setdefault("verify", False)
+        return _orig_requests_get(*args, **kwargs)
+
+    requests.get = _insecure_get          # akshare 内部走 requests.get
+except Exception:
+    pass
 
 logger = logging.getLogger("data.sina")
 
