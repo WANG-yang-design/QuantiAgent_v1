@@ -25,6 +25,14 @@ function downloadCsv(filename, rows) {
   a.click();
   URL.revokeObjectURL(a.href);
 }
+/** 秒数 → 友好耗时(1分23秒) */
+function fmtDuration(sec) {
+  if (sec == null) return "-";
+  if (sec < 60) return `${sec.toFixed(0)}秒`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}分${s}秒`;
+}
 
 /** Agent 决策中心: 最近工作流列表 + 决策链路可视化 + 准确率归因 */
 export default function AgentCenter() {
@@ -43,6 +51,7 @@ export default function AgentCenter() {
     queryKey: ["trace", traceId],
     queryFn: () => api.get(`/api/workflow/trace/${traceId}`),
     enabled: !!traceId,
+    refetchInterval: 5000,   // 分析进行中自动刷新(切页回来也有最新状态)
   });
   const { data: accuracy } = useQuery({
     queryKey: ["accuracy"],
@@ -158,7 +167,14 @@ export default function AgentCenter() {
 
         <div className="card lg:col-span-2">
           <div className="card-title flex items-center justify-between">
-            <span>决策链路 {traceId ? `· ${traceId.slice(0, 20)}...` : ""}</span>
+            <span>
+              决策链路 {traceId ? `· ${traceId.slice(0, 20)}...` : ""}
+              {trace?.duration != null && (
+                <span className="text-xs text-gray-400 font-normal ml-2">
+                  链路总耗时 {fmtDuration(trace.duration)}
+                </span>
+              )}
+            </span>
             {trace && (
               <button className="btn-ghost text-xs" onClick={() => downloadJson(
                 `agent_trace_${trace.trace_id.slice(0, 16)}.json`, trace)}>

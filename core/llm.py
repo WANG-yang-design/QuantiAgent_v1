@@ -61,6 +61,10 @@ class LLMClient:
     def is_mock(self) -> bool:
         return self.mock
 
+    def force_mock(self, flag: bool = True):
+        """临时强制模拟模式(测试用, 避免真实调用污染数据/消耗token)。"""
+        self.mock = flag
+
     def get_model(self, task: str = "fast") -> str:
         """
         按任务路由模型: deep 任务用深模型, 其余用快模型。

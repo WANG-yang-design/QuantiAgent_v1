@@ -209,17 +209,37 @@ class TestDataQuality(unittest.TestCase):
 
 
 # ================================================================
-# 6. 工作流冒烟 (模拟模式, 使用缓存数据)
+# 6. 工作流冒烟 (模拟模式, 避免真实LLM调用污染数据/消耗token)
 # ================================================================
 class TestWorkflow(unittest.TestCase):
     def test_research_workflow(self):
-        async def run():
-            from workflows.research_workflow import run_research
-            state = await run_research("510300")
-            return state
-        state = asyncio.run(run())
-        self.assertIsNotNone(state.get("analyst_outputs"))
-        self.assertIsNotNone(state.get("chief"))
+        # 强制 LLM 模拟模式 + 测试后清理, 避免污染"最近工作流"与消耗token
+        from core.llm import get_llm
+        llm = get_llm()
+        was_mock = llm.is_mock()
+        llm.force_mock(True)
+        state = None
+        try:
+            async def run():
+                from workflows.research_workflow import run_research
+                st = await run_research("510300")
+                return st
+            state = asyncio.run(run())
+            self.assertIsNotNone(state.get("analyst_outputs"))
+            self.assertIsNotNone(state.get("chief"))
+        finally:
+            llm.force_mock(was_mock)
+            # 清理本次测试产生的运行记录(不污染"最近工作流"列表)
+            if state is not None:
+                from database.models import AgentRun, AgentOutput
+                from database.db_session import get_session
+                with get_session() as s:
+                    runs = s.query(AgentRun).filter(
+                        AgentRun.trace_id == state.trace_id).all()
+                    for r in runs:
+                        s.query(AgentOutput).filter_by(run_id=r.run_id).delete()
+                        s.delete(r)
+                    s.commit()
 
     def test_circuit_breaker(self):
         from risk.circuit_breaker import CircuitBreaker

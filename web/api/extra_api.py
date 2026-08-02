@@ -385,28 +385,46 @@ def list_workflow_traces(limit: int = 20):
 
 @router.get("/workflow/trace/{trace_id}", dependencies=[Depends(require_auth)])
 def get_workflow_trace(trace_id: str):
-    """单个 trace 的完整决策链路: 每节点 Agent 输出 + 审计事件。"""
+    """单个 trace 的完整决策链路: 每节点 Agent 输出 + 审计事件 + 总耗时。"""
     from database.models import AgentRun, AgentOutput, AuditLog
     with get_session() as s:
         runs = s.query(AgentRun).filter_by(trace_id=trace_id) \
             .order_by(AgentRun.start_time).all()
         nodes = []
+        start_min = None
+        end_max = None
         for r in runs:
             out = s.query(AgentOutput).filter_by(run_id=r.run_id).first()
+            cost = round((r.end_time - r.start_time).total_seconds(), 2) \
+                if r.end_time else None
+            if r.start_time and (start_min is None or r.start_time < start_min):
+                start_min = r.start_time
+            if r.end_time and (end_max is None or r.end_time > end_max):
+                end_max = r.end_time
             nodes.append({
                 "agent": r.agent_name,
                 "status": r.status,
                 "start": str(r.start_time)[:19],
-                "cost": round((r.end_time - r.start_time).total_seconds(), 2)
-                if r.end_time else None,
+                "cost": cost,
                 "model": r.model_name,
                 "output": out.output_json if out else None,
                 "error": r.error,
             })
         events = s.query(AuditLog).filter_by(trace_id=trace_id) \
             .order_by(AuditLog.created_at).all()
+        # 总耗时: 从首个审计事件(含数据采集)到最后一个节点结束
+        duration = None
+        start_ts = start_min
+        end_ts = end_max
+        if events and (start_ts is None or events[0].created_at < start_ts):
+            start_ts = events[0].created_at
+        if events and (end_ts is None or events[-1].created_at > end_ts):
+            end_ts = events[-1].created_at
+        if start_ts and end_ts:
+            duration = round((end_ts - start_ts).total_seconds(), 1)
         return {
             "trace_id": trace_id,
+            "duration": duration,
             "nodes": nodes,
             "events": [{"event_type": e.event_type, "actor": e.actor,
                         "time": str(e.created_at)[:19], "payload": e.payload_json}
