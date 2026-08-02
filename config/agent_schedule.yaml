@@ -49,6 +49,10 @@ jobs:
   daily_report:
     cron: "0 17 * * 1-5"
     enabled: true
+  # 市场牛熊诊断(交易时段每小时)
+  market_diagnosis:
+    cron: "0 10-14 * * 1-5"
+    enabled: true
   # 周报(周五 18:00)
   weekly_report:
     cron: "0 18 * * 5"

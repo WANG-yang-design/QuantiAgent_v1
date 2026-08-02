@@ -267,6 +267,11 @@ if _FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"),
               name="assets")
 
+# 报告静态目录(回测报告/日报文件可直接访问)
+_REPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "reports"
+if _REPORTS_DIR.exists():
+    app.mount("/reports", StaticFiles(directory=_REPORTS_DIR), name="reports")
+
 
 # ---------------------------------------------------------------
 # 风控状态

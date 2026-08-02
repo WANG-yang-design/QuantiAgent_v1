@@ -6,6 +6,7 @@ import {
 } from "recharts";
 import { Play, History, Download } from "lucide-react";
 import { api, poll } from "../api/client";
+import BacktestKline from "../components/BacktestKline";
 import { SystemBar, fmt, Empty } from "../components/Common";
 
 function downloadJson(filename, data) {
@@ -37,20 +38,52 @@ function MetricCard({ label, value, color = "" }) {
   );
 }
 
+/** 买卖点K线图卡片: 按回测交易过的标的分tab切换, 显示买卖点+成本/止损包络 */
+function TradeKlineCard({ runId, trades }) {
+  const symbols = [...new Set((trades || []).map((t) => t.symbol))];
+  const [cur, setCur] = useState(symbols[0] || "");
+  const { data } = useQuery({
+    queryKey: ["btkline", runId, cur],
+    queryFn: () => api.get(`/api/backtest/${runId}/kline/${cur}`),
+    enabled: !!cur && !!runId,
+  });
+  if (!symbols.length) return null;
+  return (
+    <div className="card">
+      <div className="card-title">买卖点K线图(红B=买入 绿S=卖出 · 蓝虚=成本 橙虚=止损)</div>
+      <div className="flex flex-wrap gap-1.5 mb-2">
+        {symbols.map((s) => (
+          <button key={s} className={`badge ${cur === s ? "bg-brand-600 text-white" : "bg-gray-100 text-gray-600"}`}
+            onClick={() => setCur(s)}>
+            {s} · {(trades || []).filter((t) => t.symbol === s).length}笔
+          </button>
+        ))}
+      </div>
+      {data?.candles?.length ? (
+        <BacktestKline candles={data.candles} marks={data.marks || []} envelopes={data.envelopes || []} />
+      ) : (
+        <Empty text="加载K线中(先执行 fetch-daily)" />
+      )}
+    </div>
+  );
+}
+
 /** 回测中心: 表单 → 异步任务轮询 → 指标/图表/明细/历史 */
 export default function BacktestCenter() {
   const [form, setForm] = useState({
-    symbols: HOT_ETFS.slice(0, 5), start: "2025-06-01", end: "2026-07-31",
-    initial_cash: 100000, mode: "daily", use_agents: false, name: "",
+    symbols: [], start: "2026-04-01", end: "2026-07-31",
+    initial_cash: 20000, mode: "daily", use_agents: false, name: "",
     params: { top_n: 3, mom_window: 20, min_amount: 30000000, max_vol: 0.5,
               target_weight: 0.2, rebalance_threshold: 0.15, max_total_position: 0.9,
-              stop_loss_pct: 0.08, market_filter: true, min_hold_days: 3 },
+              stop_loss_pct: 0.08, market_filter: true, min_hold_days: 3,
+              max_buy_momentum: 0.3 },
   });
   const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [error, setError] = useState(null);
   const setParam = (k, v) => setForm({ ...form, params: { ...form.params, [k]: v } });
+  const clearSymbols = () => setForm({ ...form, symbols: [] });
 
   // 标的池: 来自监控列表(代码+中文名) + 常用ETF + 自定义添加
   const { data: watch } = useQuery({ queryKey: ["watchlist"], queryFn: () => api.get("/api/watchlist"), refetchInterval: 60000 });
@@ -135,6 +168,8 @@ export default function BacktestCenter() {
             <input className="input w-28" placeholder="自定义代码" value={customCode}
               onChange={(e) => setCustomCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addCustom()} />
             <button type="button" className="btn-ghost" onClick={addCustom}>添加</button>
+            <button type="button" className="btn-ghost" onClick={clearSymbols} disabled={!form.symbols.length}>清空</button>
+            <span className="text-[11px] text-gray-400 self-center">已选 {form.symbols.length} 只</span>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-3">
@@ -317,8 +352,11 @@ export default function BacktestCenter() {
             </div>
           </div>
 
+          {/* 买卖点K线图(多标的切换) */}
+          <TradeKlineCard runId={metrics.run_id} trades={metrics.trade_details || []} />
+
           <div className="card">
-            <div className="card-title">交易明细 ({(metrics.trade_details || []).length}) {metrics.report_path && <a className="text-xs text-brand-600 underline ml-2" href={`/${metrics.report_path.split("/").pop()}`} target="_blank">查看报告</a>}
+            <div className="card-title">交易明细 ({(metrics.trade_details || []).length}) {metrics.report_path && <a className="text-xs text-brand-600 underline ml-2" href={`/reports/${metrics.report_path.split("/").pop()}`} target="_blank">查看报告</a>}
               <span className="ml-auto flex gap-2">
                 <button className="btn-ghost text-xs" onClick={() => downloadJson(`backtest_${metrics.run_id}.json`, metrics)}>
                   <Download size={13} className="inline mr-1" />导出JSON
@@ -374,4 +412,6 @@ export default function BacktestCenter() {
     </div>
   );
 }
+
+
 

@@ -119,7 +119,7 @@ class BacktestEngine:
     def __init__(self, start: date, end: date, initial_cash: float = 100000.0,
                  slippage: Optional[float] = None, mode: str = "daily",
                  use_agents: bool = False, agent_interval_days: int = 5,
-                 name: str = ""):
+                 name: str = "", run_id: Optional[str] = None):
         self.start = start
         self.end = end
         self.mode = mode
@@ -135,7 +135,7 @@ class BacktestEngine:
         self.transfer_rate = float(fees.get("transfer_fee_rate", 0.00001))
         self.broker = BacktestBroker(initial_cash)
         self.initial_cash = initial_cash     # 保存真实初始资金(结果展示用)
-        self.run_id = gen_backtest_id()
+        self.run_id = run_id or gen_backtest_id()   # 复用提交时的 run_id(避免重复记录)
         self.equity_curve: List[float] = [initial_cash]
         self.equity_dates: List[str] = [str(start)]
         self.position_curve: List[float] = [0.0]     # 每日持仓市值曲线
@@ -233,10 +233,11 @@ class BacktestEngine:
         bench = data_loader.load_benchmark(benchmark_symbol, self.start, self.end)
         if bench:
             b0 = bench[0]["close"]
-            # 与净值曲线对齐: 初始点 + 每日收盘 + 期末点
-            self.benchmark_curve = [100000.0] + \
-                [b / b0 * 100000 for b in [x["close"] for x in bench]] + \
-                [bench[-1]["close"] / b0 * 100000]
+            # 与净值曲线对齐: 基准归一化到与回测相同的初始资金(非固定10万)
+            init = self.initial_cash
+            self.benchmark_curve = [init] + \
+                [b / b0 * init for b in [x["close"] for x in bench]] + \
+                [bench[-1]["close"] / b0 * init]
             if len(self.benchmark_curve) > len(self.equity_curve):
                 self.benchmark_curve = self.benchmark_curve[:len(self.equity_curve)]
 

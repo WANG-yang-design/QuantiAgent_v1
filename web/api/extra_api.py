@@ -68,13 +68,22 @@ def get_quotes(symbols: str = "", limit: int = 100):
 
 
 # ================================================================
-# 2. K线(蜡烛图+均线+成交量)
+# 2. K线(蜡烛图+均线+成交量), 支持指数代码(000001/000300/000905/399006)
 # ================================================================
+_INDEX_CODES = {"000001", "000300", "000905", "399006"}
+
+
 @router.get("/kline/{symbol}", dependencies=[Depends(require_auth)])
 def get_kline(symbol: str, days: int = 250):
     end = date.today()
     start = end - timedelta(days=int(days * 1.6))
-    bars, rep = get_market_service().get_daily_bars(symbol, start, end, "etf")
+    if symbol in _INDEX_CODES:
+        # 指数K线(新浪源)
+        bars = get_market_service().get_index_bars(symbol, start, end)
+        quality = "VALID"
+    else:
+        bars, rep = get_market_service().get_daily_bars(symbol, start, end, "etf")
+        quality = rep.status
     df = to_frame(bars)
     if df.empty:
         raise HTTPException(status_code=404, detail=f"无 {symbol} K线数据(先执行 fetch-daily)")
@@ -95,7 +104,8 @@ def get_kline(symbol: str, days: int = 250):
             "ma20": round(float(r["ma20"]), 4) if r["ma20"] == r["ma20"] else None,
             "ma60": round(float(r["ma60"]), 4) if r["ma60"] == r["ma60"] else None,
         })
-    return {"symbol": symbol, "quality": rep.status, "candles": candles}
+    return {"symbol": symbol, "quality": quality, "is_index": symbol in _INDEX_CODES,
+            "candles": candles}
 
 
 # ================================================================
@@ -112,6 +122,25 @@ def get_symbol_detail(symbol: str):
     if hit and hit[0] > now:
         return hit[1]
     svc = get_market_service()
+    # 指数代码 → 指数详情(简化: 无盘口/ETF/新闻)
+    if symbol in _INDEX_CODES:
+        bars = svc.get_index_bars(symbol, date.today() - timedelta(days=400), date.today())
+        tech = compute_technical_features(bars) if bars else {}
+        quote = {"symbol": symbol, "latest_price": tech.get("close", 0),
+                 "change_pct": tech.get("change_pct", 0), "quote_time": datetime.now()}
+        name = {"000001": "上证指数", "000300": "沪深300", "000905": "中证500",
+                "399006": "创业板指"}.get(symbol, symbol)
+        data = {
+            "symbol": symbol, "name": name, "is_index": True,
+            "quote": quote, "quote_quality": "VALID",
+            "order_book": {}, "order_book_quality": "none",
+            "etf_info": {}, "technical": {k: v for k, v in tech.items()
+                                          if not isinstance(v, (list, dict))},
+            "news": [], "announcements": [],
+            "time": datetime.now().strftime("%H:%M:%S"),
+        }
+        _symbol_cache[symbol] = (now + _SYMBOL_CACHE_TTL, data)
+        return data
     quote, qrep = svc.get_realtime_quote(symbol, "etf")
     ob, obrep = svc.get_order_book(symbol, "etf")
     etf_info = svc.get_etf_info(symbol)
@@ -161,6 +190,65 @@ def get_announcements_web(symbol: str, limit: int = 30):
             "announcements": [{"title": a.title, "publish_time": str(a.publish_time)[:16],
                                "risk_level": a.risk_level, "event_type": a.event_type,
                                "url": a.url} for a in anns]}
+
+
+@router.get("/backtest/{run_id}/kline/{symbol}", dependencies=[Depends(require_auth)])
+def get_backtest_kline(run_id: str, symbol: str):
+    """
+    回测买卖点K线: 标的历史K线 + 回测中该标的的买卖点 + 策略包络线。
+    envelope: 每笔买入的成本价与止损价(虚线), 便于观察策略进出场位置。
+    """
+    result = repo.get_backtest_result(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="回测结果不存在")
+    metrics = result.metrics_json or {}
+    trades = [t for t in (metrics.get("trade_details") or []) if t.get("symbol") == symbol]
+
+    # K线(回测区间)
+    end = date.today()
+    start = end - timedelta(days=int(250 * 1.6))
+    bars, _ = get_market_service().get_daily_bars(symbol, start, end, "etf")
+    df = to_frame(bars)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"无 {symbol} K线数据")
+    for w in (5, 20, 60):
+        df[f"ma{w}"] = df["close"].rolling(w).mean()
+    candles = []
+    for _, r in df.iterrows():
+        candles.append({
+            "date": str(r["trade_date"].date() if hasattr(r["trade_date"], "date") else r["trade_date"])[:10],
+            "open": round(float(r["open"]), 4), "high": round(float(r["high"]), 4),
+            "low": round(float(r["low"]), 4), "close": round(float(r["close"]), 4),
+            "volume": float(r["volume"]),
+            "ma5": round(float(r["ma5"]), 4) if r["ma5"] == r["ma5"] else None,
+            "ma20": round(float(r["ma20"]), 4) if r["ma20"] == r["ma20"] else None,
+            "ma60": round(float(r["ma60"]), 4) if r["ma60"] == r["ma60"] else None,
+        })
+
+    # 买卖点标记
+    marks = []
+    envelopes = []   # [{date, cost, stop}] 每笔买入后的成本线+止损线
+    for t in trades:
+        d = str(t.get("date"))[:10]
+        marks.append({"date": d, "price": round(float(t.get("price", 0)), 4),
+                      "side": t.get("side"), "qty": t.get("qty"),
+                      "pnl": round(float(t.get("pnl", 0) or 0), 2)})
+        if t.get("side") == "BUY":
+            cost = round(float(t.get("price", 0)), 4)
+            stop = round(cost * (1 - 0.08), 4)
+            envelopes.append({"date": d, "cost": cost, "stop": stop})
+    # 名字
+    name_map: Dict[str, str] = {}
+    try:
+        from database.models import WatchItem as _WI
+        with get_session() as s:
+            for w in s.query(_WI).all():
+                name_map[w.symbol] = w.name
+    except Exception:
+        pass
+    return {"symbol": symbol, "name": name_map.get(symbol, ""),
+            "candles": candles, "marks": marks, "envelopes": envelopes,
+            "trade_count": len(trades)}
 
 
 # ================================================================
@@ -258,6 +346,7 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
             mode=body.get("mode", "daily"),
             use_agents=bool(body.get("use_agents", False)),
             name=body.get("name", ""),
+            run_id=run_id,          # 复用提交时的 run_id(避免产生重复回测记录)
         )
         engine.progress_cb = progress_cb
         engine.params = params
@@ -296,7 +385,7 @@ def submit_backtest(body: dict):
                                    "body": body, "metrics": None}
     repo.save_backtest_run({
         "run_id": run_id,
-        "name": body.get("name", f"回测{body['start']}-{body['end']}"),
+        "name": body.get("name") or f"回测{body['start']}-{body['end']}",
         "start_date": date.fromisoformat(body["start"]),
         "end_date": date.fromisoformat(body["end"]),
         "mode": body.get("mode", "daily"),
@@ -583,14 +672,15 @@ def get_index_overview():
 @router.get("/market/diagnosis", dependencies=[Depends(require_auth)])
 def get_market_diagnosis(refresh: int = 0):
     """
-    牛熊诊断(规则为主, 30分钟缓存):
+    牛熊诊断(规则为主, 结果落库, 默认1小时更新):
     基于四大指数 20日动量/均线排列/回撤 → 判断 risk_on/neutral/risk_off + 建议。
-    refresh=1 时强制重新计算。
+    refresh=1 时强制重新计算; 否则优先返回库内1小时内的诊断。
     """
-    global _diagnosis_cache
-    now_ts = time.time()
-    if refresh != 1 and _diagnosis_cache and now_ts - _diagnosis_cache[0] < 1800:
-        return _diagnosis_cache[1]
+    from database import repository as _repo
+    if refresh != 1:
+        cached = _repo.get_latest_market_diagnostic(max_age_minutes=60)
+        if cached:
+            return cached
 
     from datetime import timedelta as _td
     svc = get_market_service()
@@ -629,11 +719,15 @@ def get_market_diagnosis(refresh: int = 0):
     result = {"state": state, "label": label, "advice": advice,
               "score": total, "detail": detail,
               "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    _diagnosis_cache = (now_ts, result)
+    # 落库(历史可查)
+    try:
+        _repo.save_market_diagnostic({
+            "state": state, "label": label, "advice": advice,
+            "score": total, "detail": detail,
+        })
+    except Exception as exc:
+        logger.warning("市场诊断落库失败: %s", exc)
     return result
-
-
-_diagnosis_cache: Optional[tuple] = None
 
 
 # ================================================================

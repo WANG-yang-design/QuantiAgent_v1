@@ -56,10 +56,12 @@ export default function Dashboard() {
         <SystemBar />
       </div>
 
-      {/* 大盘指数 + 牛熊诊断 */}
+      {/* 大盘指数 + 牛熊诊断(点击指数卡片查看K线) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
         {(idx?.indexes || []).map((ix) => (
-          <div key={ix.code} className="card flex items-center justify-between">
+          <button key={ix.code} className="card flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer text-left"
+            onClick={() => nav(`/symbol/${ix.code.replace(/^sh|^sz/, "")}`)}
+            title="点击查看指数K线">
             <div>
               <div className="text-xs text-gray-500">{ix.name}</div>
               <div className={`text-xl font-bold ${ix.color === "up" ? "text-up" : ix.color === "down" ? "text-down" : ""}`}>
@@ -69,7 +71,7 @@ export default function Dashboard() {
             <div className={`text-sm font-semibold ${ix.color === "up" ? "text-up" : ix.color === "down" ? "text-down" : ""}`}>
               {ix.change_pct > 0 ? "+" : ""}{ix.change_pct}%
             </div>
-          </div>
+          </button>
         ))}
         <div className={`card border-l-4 ${diag?.state === "risk_on" ? "border-red-500" : diag?.state === "risk_off" ? "border-green-500" : "border-amber-500"}`}>
           <div className="flex items-center gap-2 text-xs text-gray-500">

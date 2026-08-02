@@ -694,3 +694,17 @@ class WatchItem(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
+
+class MarketDiagnostic(Base):
+    """市场牛熊诊断记录表(每1小时更新, 历史可查)"""
+    __tablename__ = "market_diagnostics"
+    __table_args__ = (Index("ix_diag_time", "created_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    state: Mapped[str] = mapped_column(String(16), default="neutral")    # risk_on/neutral/risk_off
+    label: Mapped[str] = mapped_column(String(32), default="")
+    advice: Mapped[str] = mapped_column(Text, default="")
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[dict] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+

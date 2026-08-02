@@ -524,10 +524,18 @@ def get_account_snapshots(account_id: str = "PA-001", limit: int = 1000) -> List
 # ================================================================
 
 def save_backtest_run(r: Dict[str, Any]):
+    """回测任务记录(幂等: run_id 已存在则更新而非重复插入)。"""
+    from database.models import BacktestRun
     with get_session() as s:
         if not r.get("run_id"):
             r["run_id"] = gen_id("BT")
-        s.add(BacktestRun(**r))
+        exist = s.query(BacktestRun).filter_by(run_id=r["run_id"]).first()
+        if exist:
+            for k, v in r.items():
+                if k != "run_id":
+                    setattr(exist, k, v)
+        else:
+            s.add(BacktestRun(**r))
 
 
 def update_backtest_run(run_id: str, status: str, finished_at=None):
@@ -680,3 +688,30 @@ def get_watchlist(enabled_only: bool = False) -> List[Dict[str, Any]]:
              "added_at": str(r.added_at)[:16]}
             for r in rows
         ]
+
+
+# ================================================================
+# 市场诊断
+# ================================================================
+
+def save_market_diagnostic(d: Dict[str, Any]):
+    from database.models import MarketDiagnostic
+    with get_session() as s:
+        s.add(MarketDiagnostic(**d))
+        s.commit()
+
+
+def get_latest_market_diagnostic(max_age_minutes: int = 60):
+    """最近一次市场诊断(超过 max_age 分钟返回 None, 需重新计算)。"""
+    from database.models import MarketDiagnostic
+    with get_session() as s:
+        row = s.query(MarketDiagnostic).order_by(
+            MarketDiagnostic.created_at.desc()).first()
+        if row is None:
+            return None
+        age = (datetime.now() - row.created_at).total_seconds() / 60
+        if age > max_age_minutes:
+            return None
+        return {"state": row.state, "label": row.label, "advice": row.advice,
+                "score": row.score, "detail": row.detail,
+                "time": str(row.created_at)[:16]}

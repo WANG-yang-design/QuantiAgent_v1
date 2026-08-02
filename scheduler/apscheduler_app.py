@@ -213,6 +213,19 @@ class QuantScheduler:
         from workflows.daily_review_workflow import run_daily_review
         asyncio.run(run_daily_review())
 
+    def job_market_diagnosis(self):
+        """市场牛熊诊断(交易时段每小时, 落库)。"""
+        import httpx
+        try:
+            resp = httpx.post("http://localhost:8080/api/market/diagnosis?refresh=1",
+                              headers={"Authorization": "Bearer quantiagent-admin"},
+                              timeout=60)
+            if resp.status_code == 200:
+                d = resp.json()
+                logger.info("市场诊断更新: %s (%s)", d.get("label"), d.get("state"))
+        except Exception as exc:
+            logger.warning("市场诊断任务失败: %s", exc)
+
     def job_weekly_report(self):
         """周报(周五18:00)。"""
         from reports.report_generator import get_report_generator
