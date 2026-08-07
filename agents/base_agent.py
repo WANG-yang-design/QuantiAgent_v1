@@ -54,6 +54,7 @@ class BaseAgent(ABC):
         self.logger = get_logger(f"agent.{self.name}")
         self.llm = get_llm()
         self.prompt = get_prompt_manager().get(self.name)
+        self._current_run_id = ""
 
     # ---------------------------------------------------------------
     # 主入口: 带审计/日志/权限的 run 包装
@@ -62,10 +63,11 @@ class BaseAgent(ABC):
         """执行 Agent: 记录 run_id, 校验工具权限, 调用业务逻辑, 落库。"""
         trace_id = get_trace_id() or gen_run_id()
         run = repo.start_agent_run(self.name, input_data.symbol, trace_id,
-                                   model_name=self.llm.get_model(self.task_route))
+                                   model_name=self.llm.get_model(self.name))
         # 注意: run_id 必须用 start_agent_run 返回对象里的(数据库实际入库的),
         # 不能另生成, 否则 finish/save 查不到记录(此前审计表一直为空的原因)
         run_id = run.run_id
+        self._current_run_id = run_id
         try:
             # 工具权限预检: 每个 Agent 的方法即"工具", 由权限表控制
             self.check_tool_access("run")
@@ -97,9 +99,20 @@ class BaseAgent(ABC):
     # ---------------------------------------------------------------
     async def call_llm(self, user_content: str,
                        schema: Optional[Type[BaseModel]] = None) -> Dict[str, Any]:
-        """调用 LLM: 系统提示=Agent prompt, 用户内容=上下文摘要。"""
+        """调用 LLM: 系统提示=Agent prompt, 用户内容=上下文摘要。
+        按 Agent 名路由模型(model_routes.agent_task_map)。
+        真实 token 用量回调落库(修复: 成本大头是输出token, 之前无统计)。"""
         messages = [{"role": "user", "content": user_content}]
-        return await self.llm.complete(messages, task=self.task_route, schema=schema)
+        return await self.llm.complete(
+            messages, task=self.name, schema=schema,
+            usage_cb=self._usage_cb)
+
+    def _usage_cb(self, prompt_tokens: int, completion_tokens: int):
+        try:
+            repo.update_agent_usage(self._current_run_id, prompt_tokens,
+                                    completion_tokens)
+        except Exception:
+            pass
 
     def build_messages(self, summary: str) -> str:
         """把市场状态摘要组装为用户消息(含 Agent prompt 引导)。"""

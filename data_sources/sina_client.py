@@ -3,11 +3,11 @@
 新浪财经客户端 (实时行情备源 + ETF日K备源)
 ==========================================
 hq.sinajs.cn 接口, 免费, 需带 Referer 头。返回 GBK 编码。
-注意: 新浪部分接口 SSL 证书 hostname 不匹配(第三方数据源常见),
-需要关闭证书校验才能访问。
+注意: 原实现全局 monkey-patch requests.get 强制 verify=False, 会关闭整个进程
+所有 requests 调用(含 akshare 东财接口)的 SSL 证书校验, 存在 MITM 风险。
+已移除: 新浪自身接口走 httpx.Client(verify=True 默认)。
 """
 import logging
-import warnings
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -15,22 +15,6 @@ import httpx
 
 from data_sources.base import BaseDataSource
 from data_sources.akshare_client import _safe_float, _safe_str
-
-# 关闭 requests/httpx 对新浪的 SSL 证书校验(新浪证书 hostname 不匹配)
-warnings.filterwarnings("ignore")
-import urllib3  # noqa: E402
-urllib3.disable_warnings()
-try:
-    import requests  # noqa: E402
-    _orig_requests_get = requests.get
-
-    def _insecure_get(*args, **kwargs):
-        kwargs.setdefault("verify", False)
-        return _orig_requests_get(*args, **kwargs)
-
-    requests.get = _insecure_get          # akshare 内部走 requests.get
-except Exception:
-    pass
 
 logger = logging.getLogger("data.sina")
 
@@ -45,13 +29,52 @@ def _sina_symbol(symbol: str) -> str:
 
 
 class SinaClient(BaseDataSource):
-    """新浪行情客户端: 实时行情 + ETF日K(备源)。"""
+    """新浪行情客户端: 实时行情 + ETF日K(备源) + 历史分钟K(指数/ETF)。"""
 
     name = "sina"
 
     def __init__(self):
-        self.client = httpx.Client(headers=_HEADERS, timeout=10)
+        # 修复: 绕过系统代理直连(与腾讯/东财客户端一致, 防 ProxyError)
+        self.client = httpx.Client(headers=_HEADERS, timeout=10,
+                                   proxy=None, trust_env=False)
         self._ak = None
+
+    # ---------------- 历史分钟K (指数/ETF/股票通用, 免费直连) ----------------
+    def get_hist_minute_bars(self, symbol: str, scale: int = 5,
+                             datalen: int = 240) -> List[Dict[str, Any]]:
+        """新浪分钟K线(近 N 根, 5/15/30/60分钟)。
+        symbol 传 sh000001/sz399006/sh510300 等带交易所前缀的代码。
+        返回 [{bar_time, open, high, low, close, volume, amount, source}]"""
+        import json
+        url = ("https://quotes.sina.cn/cn/api/json_v2.php/"
+               "CN_MarketDataService.getKLineData"
+               f"?symbol={symbol}&scale={scale}&ma=no&datalen={int(datalen)}")
+        try:
+            resp = self.client.get(url)
+            data = json.loads(resp.text)
+        except Exception as exc:
+            raise RuntimeError(f"新浪分钟K失败 {symbol}: {exc}") from exc
+        if not isinstance(data, list) or not data:
+            raise RuntimeError(f"新浪无 {symbol} 分钟K")
+        rows = []
+        for r in data:
+            try:
+                t = datetime.strptime(str(r.get("day", ""))[:19], "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+            rows.append({
+                "symbol": symbol,
+                "bar_time": t,
+                "freq": f"{scale}m",
+                "open": _safe_float(r.get("open")),
+                "high": _safe_float(r.get("high")),
+                "low": _safe_float(r.get("low")),
+                "close": _safe_float(r.get("close")),
+                "volume": _safe_float(r.get("volume")),
+                "amount": _safe_float(r.get("amount")),
+                "source": self.name,
+            })
+        return rows
 
     def _ak_module(self):
         if self._ak is None:
@@ -72,6 +95,9 @@ class SinaClient(BaseDataSource):
             d = r.get("date")
             if isinstance(d, str):
                 d = datetime.strptime(d[:10], "%Y-%m-%d").date()
+            elif hasattr(d, "date"):
+                # 修复: pandas Timestamp 与 date 直接比较抛 TypeError, 导致整源被 Hub 判失败
+                d = d.date()
             if not (start <= d <= end):
                 continue
             rows.append({
@@ -103,6 +129,8 @@ class SinaClient(BaseDataSource):
             d = r.get("date")
             if isinstance(d, str):
                 d = datetime.strptime(d[:10], "%Y-%m-%d").date()
+            elif hasattr(d, "date"):
+                d = d.date()
             if not (start <= d <= end):
                 continue
             rows.append({

@@ -59,25 +59,80 @@ class NotificationService:
     def __init__(self):
         self.mail = get_email_sender()
 
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _plan_source(plan: Dict[str, Any]) -> str:
+        """订单/计划来源: 持仓风控巡检(PLAN-PM-) vs Agent决策。
+        修复: 用户在邮件里分不清操作是谁发起的。"""
+        plan_id = str(plan.get("plan_id", ""))
+        if plan_id.startswith("PLAN-PM") or plan_id.startswith("PLAN-POS"):
+            return "持仓风控巡检(硬止损/止盈/降仓)"
+        return "Agent决策链路"
+
+    @staticmethod
+    def _confirm_links(confirm_id: str) -> tuple:
+        """人工确认邮件按钮链接(带HMAC签名, 点开即确认, 无需登录Web)。
+        修复: 原实现写死 127.0.0.1 —— 手机/其他设备打开邮件点确认会
+        打到自己设备上。改用 config.yaml web.public_base_url(可配局域网IP)。"""
+        import hashlib
+        import hmac as _hmac
+        from core.config import get_settings
+        token = get_settings().get("web.admin_token", "quantiagent-admin")
+        web = get_settings().section("web")
+        base = str(web.get("public_base_url", "") or
+                   f"http://127.0.0.1:{int(web.get('port', 8080))}").rstrip("/")
+
+        def link(decision: str) -> str:
+            sig = _hmac.new(token.encode(), f"{confirm_id}:{decision}".encode(),
+                            hashlib.sha256).hexdigest()[:16]
+            return f"{base}/api/confirmations/{confirm_id}/email?decision={decision}&sig={sig}"
+        return link("approve"), link("reject")
+
     # ---------------- 1. 交易计划邮件 (文档15.2 全字段) ----------------
-    def send_trade_plan_email(self, plan: Dict[str, Any], risk: Optional[Dict[str, Any]] = None):
+    def send_trade_plan_email(self, plan: Dict[str, Any],
+                              risk: Optional[Dict[str, Any]] = None,
+                              confirm_id: str = "", reason: str = ""):
         risk = risk or {}
+        source = self._plan_source(plan)
         rows = [
             ("交易动作", plan.get("action", "")),
-            ("标的", f"{plan.get('symbol', '')} {plan.get('name', '')}"),
+            ("标的代码", plan.get("symbol", "")),
+            ("标的名称", plan.get("name", "") or "-"),
             ("计划数量", f"{plan.get('estimated_quantity', 0)} 份"),
             ("计划价格", f"{plan.get('limit_price', '市价')}"),
             ("预计金额", f"¥{plan.get('order_amount', 0):,.0f}"),
-            ("当前持仓", f"{plan.get('name', '')}"),
+            ("操作来源", source),
             ("风控结论", f"{risk.get('risk_decision', '')} ({risk.get('risk_level', '')})"),
             ("是否需要人工确认", "是" if risk.get("risk_decision") in
              ("CONFIRM_REQUIRED", "REDUCE") else "否"),
         ]
+        # 需要人工确认的原因(修复: 原邮件看不到为什么需要确认)
+        need_confirm = risk.get("risk_decision") in ("CONFIRM_REQUIRED", "REDUCE")
+        confirm_reason = reason or risk.get("blocked_reason", "") or ""
+        extra = ""
+        if need_confirm and confirm_id:
+            approve_url, reject_url = self._confirm_links(confirm_id)
+            extra = f"""
+<div class="card">
+  <div class="reason" style="border-left:3px solid #f59f00;margin-bottom:10px">
+    <b>为什么需要人工确认:</b><br/>{confirm_reason}</div>
+  <div style="display:flex;gap:8px">
+    <a href="{approve_url}" style="flex:1;text-align:center;padding:10px;border-radius:8px;
+       background:#1c7a3e;color:#fff;text-decoration:none;font-weight:700;font-size:14px">✅ 批准交易</a>
+    <a href="{reject_url}" style="flex:1;text-align:center;padding:10px;border-radius:8px;
+       background:#c0392b;color:#fff;text-decoration:none;font-weight:700;font-size:14px">❌ 拒绝交易</a>
+  </div>
+  <div style="font-size:11px;color:#999;margin-top:6px">点击按钮后立即生效, 无需登录网页。若已在网页处理过, 再次点击将提示"已处理"。
+  若2分钟内无人处理, 系统将按轮动策略方向自动执行(策略给买入信号→自动批准; 否则自动拒绝)。</div>
+</div>"""
+        elif confirm_reason:
+            extra = f'<div class="reason" style="border-left:3px solid #f59f00"><b>原因:</b> {confirm_reason}</div>'
         body = _wrap("📋 交易计划", datetime.now().strftime("%Y-%m-%d %H:%M"),
                      _card(rows, str(plan.get("action", "")),
-                           "；".join(plan.get("reasons", []) or [])))
+                           "；".join(str(x) for x in (plan.get("reasons") or [])[:6])) + extra)
         self.mail.send_email(
-            f"【交易计划】{plan.get('action')} {plan.get('symbol', '')} {plan.get('name', '')}",
+            f"【交易计划】{source.split('(')[0]} {plan.get('action')} "
+            f"{plan.get('symbol', '')} {plan.get('name', '')}",
             body, dedup_key=f"plan:{plan.get('plan_id', '')}", dedup_minutes=1440)
 
     # ---------------- 2. 盘中风险提醒 ----------------
@@ -87,29 +142,42 @@ class NotificationService:
         cards = "".join(
             _card([
                 ("标的", f"{a.get('symbol', '')} {a.get('name', '')}"),
+                ("操作来源", "持仓风控巡检"),
                 ("风险", a.get("risk", "")),
                 ("触发时间", a.get("time", datetime.now().strftime("%H:%M"))),
             ], "REJECT", a.get("detail", "")) for a in alerts)
         body = _wrap("⚠️ 盘中风险提醒", f"{len(alerts)} 条 · {datetime.now():%Y-%m-%d %H:%M}",
                      cards, color="#e67e22")
+        # 修复: 去重键用批次摘要(全部标的+时间窗), 原实现只用第一个标的,
+        # 不同标的的多条告警会被错误合并去重吞掉
+        batch_key = ",".join(sorted({str(a.get("symbol", "")) for a in alerts}))
         self.mail.send_email(f"【量化风控】盘中风险提醒 {len(alerts)}条",
-                             body, dedup_key=f"risk:{alerts[0].get('symbol', '')}",
-                             dedup_minutes=30)
+                             body,
+                             dedup_key=f"risk:{batch_key}:{datetime.now():%Y%m%d%H}",
+                             dedup_minutes=60)
 
     # ---------------- 3. 模拟成交确认 ----------------
-    def send_trade_confirmation_email(self, trade: Dict[str, Any], account: Dict[str, Any]):
+    def send_trade_confirmation_email(self, trade: Dict[str, Any],
+                                      account: Dict[str, Any],
+                                      source: str = "Agent决策"):
+        pnl = trade.get("pnl")
         rows = [
             ("成交方向", trade.get("side", "")),
-            ("标的", f"{trade.get('symbol', '')} {trade.get('name', '')}"),
+            ("标的代码", trade.get("symbol", "")),
+            ("标的名称", trade.get("name", "") or "-"),
             ("成交价", f"{trade.get('price', 0):.3f}"),
             ("成交数量", f"{trade.get('qty', 0)}"),
             ("手续费", f"¥{trade.get('fee', 0):.2f}"),
+            ("已实现盈亏", f"{pnl:+,.2f}" if pnl is not None else "-"),
+            ("操作来源", source),
             ("成交时间", str(trade.get("trade_time", ""))[:19]),
             ("总资产", f"¥{account.get('total_asset', 0):,.0f}"),
+            ("累计盈亏", f"¥{account.get('total_pnl', 0):+,.2f}"),
         ]
         body = _wrap("✅ 模拟成交确认", datetime.now().strftime("%Y-%m-%d %H:%M"),
                      _card(rows, str(trade.get("side", ""))))
-        self.mail.send_email(f"【模拟成交】{trade.get('side')} {trade.get('symbol', '')} {trade.get('qty', 0)}份",
+        self.mail.send_email(f"【模拟成交】{source.split('(')[0]} {trade.get('side')} "
+                             f"{trade.get('symbol', '')} {trade.get('qty', 0)}份",
                              body, dedup_key=f"trade:{trade.get('trade_id', '')}", dedup_minutes=1440)
 
     # ---------------- 4. 异常告警 ----------------

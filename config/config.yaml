@@ -28,6 +28,12 @@ universe:
   stock_whitelist: []
   max_symbols_per_scan: 20       # 盘中监控单轮最多分析标的数
   min_etf_amount: 50000000       # 最小日成交额(元), 过滤低流动性 ETF
+  # ---- 智能扫描调度 (成本控制, 修复: 监控池全部标的每30分钟全量分析) ----
+  # smart_scan=true 时: 持仓标的+近3日轮动交易过的标的 → 每轮都分析;
+  # 其余监控标的 → 按 tier2_interval_rounds 轮询(每N轮覆盖一轮)。
+  smart_scan: true
+  tier2_interval_rounds: 4
+  tier2_max_per_round: 8
 
 # ---- LLM 调用 ----
 llm:
@@ -53,6 +59,23 @@ intraday:
     major_news: true
     stop_loss_near: true
 
+# ---- Agent 开关 (成本控制, 修复: 之前15个Agent全部无条件参与) ----
+# 关闭的 Agent 不再调用 LLM(改用规则化输出占位, 决策链路保持完整)。
+# 必须启用(禁关): data_admin(数据闸门)/chief_researcher(结论)/
+#                trader(交易员)/risk_manager(风控)/compliance(合规)
+# 建议: ETF 场景可关 fundamental(无基本面数据); 保守可关 sentiment/money_flow
+agents:
+  enabled:
+    technical_analyst: true
+    etf_analyst: true
+    fundamental_analyst: true
+    news_analyst: true
+    sentiment_analyst: true
+    money_flow_analyst: true
+    macro_analyst: true
+    bull_researcher: true
+    bear_researcher: true
+
 # ---- 策略参数 (无Agent参与时的规则策略, 见 strategies/rotation_executor.py) ----
 strategies:
   etf_momentum_rotation:
@@ -71,9 +94,21 @@ strategies:
     warmup_days: 20             # 预热期(交易日, 引擎已预加载起点前历史数据)
     min_hold_days: 3            # 最小持仓天数(防"今天买明天卖")
     hold_buffer: 1              # 卖出滞回: 排名跌出前(top_n+1)才卖, 减少震荡进出
-    max_buy_momentum: 0.30       # 追高保护: 20日涨幅超30%禁止买入(防高位站岗)
+    max_buy_momentum: 0.25       # 追高保护: 20日涨幅超25%禁止买入(修复: 原30%仍常买在最高点)
     initial_ratio: 0.50          # 首仓比例: 首次买入只建目标仓位的50%(分批建仓)
     bottom_ratio: 0.20           # 底仓比例: 排名跌出时减仓至20%留观察仓, 不全清
+    fresh_stop_mult: 1.5         # 新仓止损放宽: 持有<min_hold_days时止损线放宽倍数(8%→12%)
+    # ---- 买点质量过滤(修复: 买在最高点→8%止损清仓的反复磨损) ----
+    require_above_ma20: true     # 必须站上MA20才买(防下跌趋势中接刀)
+    max_distance_from_ma20: 0.12 # 收盘价高出MA20超12%=短线过热, 不追
+    # ---- 低位启动(修复: 纯动量排名漏掉刚启动的低位看涨标的) ----
+    low_rebound_bonus: 0.015     # 距60日低点回升≥10%且站上MA20的标的, 排名动量+1.5%
+    low_rebound_from_low_pct: 0.10
+  # ---- 实盘轮动执行 (回测策略的落地应用, 见 strategies/live_rotation.py) ----
+  live_rotation:
+    enabled: true                # 每日14:40由调度器自动执行轮动调仓
+    max_orders_per_day: 6        # 每日最多提交订单数(防失控)
+    # params: {}                 # 可选: 覆盖上方 etf_momentum_rotation 参数
 
 # ---- RAG ----
 rag:
@@ -87,8 +122,22 @@ rag:
 web:
   host: "0.0.0.0"
   port: 8080
-  # 人工确认令牌(简单实现, 实盘前应换为正式鉴权)
+  # 邮件确认链接的对外地址(修复: 原写死127.0.0.1, 手机收到邮件点确认打不开)。
+  # 局域网使用填 http://<本机IP>:8080; 留空则用 http://127.0.0.1:8080
+  public_base_url: "http://10.67.249.226:8080"
+  # 人工确认令牌(实测盘前应替换为正式鉴权)
   admin_token: "quantiagent-admin"
+  # Web 启动时自动内嵌拉起调度器(默认true)。
+  # 修复: 以前调度器依赖单独的 start.bat 窗口, 窗口一关/重启忘启动就整天无决策链。
+  # 单例锁(data/scheduler.pid)保证全系统只有一个调度器实例, 重复启动自动退出。
+  embed_scheduler: true
+  # CORS 白名单(前端同源托管时无需跨域; 若需局域网访问请把访问地址加入列表)
+  cors_origins:
+    - "http://localhost:8080"
+    - "http://127.0.0.1:8080"
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+    - "http://10.67.249.226:8080"
 
 # ---- 报告 ----
 report:

@@ -37,3 +37,4 @@ PyYAML>=6.0.2
 rich>=13.9.0
 httpx>=0.27.2
 jieba>=0.42.1                 # RAG 中文分词
+tzdata>=2024.1   # Windows 上 zoneinfo 时区数据(修复调度/合规时区错判)

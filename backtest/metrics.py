@@ -82,21 +82,30 @@ def compute_metrics(equity_curve: List[float],
             monthly = {}
 
     # 基准对比
+    # 修复: 原实现要求基准曲线长度与净值曲线严格相等, 数据缺一天就整段丢弃
+    # (基准收益恒为0, 回测中心"净值vs沪深300"图上没有基准线)。
+    # 收益指标用基准自身首末; 曲线对齐到净值长度(缺失用前值补齐)。
     benchmark = {}
-    if benchmark_curve and len(benchmark_curve) == len(eq):
+    benchmark_curve_out = None
+    if benchmark_curve and len(benchmark_curve) >= 2:
         b_eq = pd.Series(benchmark_curve, dtype=float)
-        b_daily = b_eq.pct_change().dropna()
-        diff = ret - b_daily.reindex(ret.index).fillna(0)
-        ir = float(diff.mean() / diff.std() * math.sqrt(trading_days)) if diff.std() > 0 else 0.0
+        bench_ret = float(b_eq.iloc[-1] / b_eq.iloc[0] - 1)
         benchmark = {
-            "benchmark_return": round(float(b_eq.iloc[-1] / b_eq.iloc[0] - 1), 6),
-            "excess_return": round(float(total_return - (b_eq.iloc[-1] / b_eq.iloc[0] - 1)), 6),
-            "information_ratio": round(ir, 4),
-            "tracking_error": round(float(diff.std() * math.sqrt(trading_days)), 6),
+            "benchmark_return": round(bench_ret, 6),
+            "excess_return": round(float(total_return) - bench_ret, 6),
         }
-        benchmark_curve_out = [round(float(v), 4) for v in benchmark_curve]
-    else:
-        benchmark_curve_out = None
+        # 曲线: 对齐到净值曲线长度(不足按最后值补齐, 超出截断)
+        if len(benchmark_curve) == len(eq):
+            benchmark_curve_out = [round(float(v), 4) for v in benchmark_curve]
+        else:
+            aligned = b_eq.reindex(range(len(eq)), method="ffill").ffill().bfill()
+            benchmark_curve_out = [round(float(v), 4) for v in aligned.tolist()]
+        if len(benchmark_curve) == len(eq):
+            b_daily = b_eq.pct_change().dropna()
+            diff = ret - b_daily.reindex(ret.index).fillna(0)
+            ir = float(diff.mean() / diff.std() * math.sqrt(trading_days)) if diff.std() > 0 else 0.0
+            benchmark["information_ratio"] = round(ir, 4)
+            benchmark["tracking_error"] = round(float(diff.std() * math.sqrt(trading_days)), 6)
 
     # 交易明细 JSON 序列化(日期转字符串)
     trade_details = [

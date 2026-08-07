@@ -90,12 +90,25 @@ class CircuitBreaker:
                 self.trip("fail_orders", f"连续失败订单{self._fail_order_streak}次")
 
     def on_order_success(self):
+        """订单成功: 清零连败计数, 连续成功自动解除失败单熔断。"""
         with self._lock:
             self._fail_order_streak = 0
+            # 修复: 原实现熔断后无任何自动复位路径, 一次误触发系统永久停摆
+            if "fail_orders" in self._trip_reasons:
+                self._trip_reasons.pop("fail_orders")
+                logger.info("连续成功订单, 自动解除失败单熔断")
 
     def check_daily_loss(self, day_pnl: float, total_asset: float) -> bool:
-        """单日亏损熔断。"""
+        """单日亏损熔断。修复: 跨日后自动清除昨日的 daily_loss 熔断,
+        否则一次单日亏损(或误判)会让系统永久停摆直到人工干预。"""
         limit = float(self.cfg.get("daily_loss_pct", 0.05))
+        with self._lock:
+            today = date.today()
+            if getattr(self, "_daily_loss_date", None) != today:
+                self._daily_loss_date = today
+                if "daily_loss" in self._trip_reasons:
+                    self._trip_reasons.pop("daily_loss")
+                    logger.info("新交易日, 自动清除单日亏损熔断")
         if total_asset <= 0:
             return False
         if day_pnl < 0 and abs(day_pnl) / total_asset >= limit:
@@ -104,14 +117,22 @@ class CircuitBreaker:
         return False
 
     def check_quote_delay(self, delay_seconds: float) -> bool:
+        """行情延迟熔断。修复: 行情恢复后自动清除, 原实现延迟一次即永久停摆。"""
         limit = float(self.cfg.get("quote_delay_seconds", 60))
         if delay_seconds > limit:
             self.trip("quote_delay", f"行情延迟{delay_seconds:.0f}s")
             return True
+        if "quote_delay" in self._trip_reasons:
+            with self._lock:
+                self._trip_reasons.pop("quote_delay", None)
+            logger.info("行情延迟恢复, 自动解除熔断")
         return False
 
     def check_risk_service(self, healthy: bool) -> bool:
         if not healthy and self.cfg.get("risk_service_down", True):
             self.trip("risk_service", "风控服务不可用")
             return True
+        if healthy and "risk_service" in self._trip_reasons:
+            with self._lock:
+                self._trip_reasons.pop("risk_service", None)
         return False

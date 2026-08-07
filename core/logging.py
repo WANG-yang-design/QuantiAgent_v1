@@ -28,16 +28,20 @@ _MODULE_DIR = {
 _FORMAT = "%(asctime)s [%(levelname)s] [%(trace_id)s] %(name)s: %(message)s"
 
 
-import threading
+import contextvars
 
-_tls = threading.local()          # 线程本地: 存放当前线程 trace_id
+# 修复: 原 threading.local 在 asyncio 并发任务间互踩(run_pool_scan 3-5路并发
+# 共享同一线程, set_trace_id 相互覆盖, 审计日志 trace_id 张冠李戴)。
+# contextvars 在每个任务/协程有独立上下文, 并发的 Agent 调用不再互相污染。
+_trace_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "trace_id", default=None)
 
 
 class TraceFilter(logging.Filter):
-    """把当前线程的 trace_id 注入日志记录。"""
+    """把当前上下文的 trace_id 注入日志记录。"""
 
     def filter(self, record):
-        record.trace_id = getattr(_tls, "trace_id", "-")[:16]
+        record.trace_id = (get_trace_id() or "-")[:16]
         return True
 
 
@@ -45,12 +49,12 @@ _trace = TraceFilter()
 
 
 def set_trace_id(tid: str):
-    """设置当前线程的 trace_id (工作流入口调用, 子线程需自行调用)。"""
-    _tls.trace_id = tid
+    """设置当前上下文的 trace_id (工作流入口调用, 子线程需自行调用)。"""
+    _trace_var.set(tid)
 
 
 def get_trace_id() -> Optional[str]:
-    return getattr(_tls, "trace_id", None)
+    return _trace_var.get()
 
 
 def _attach_trace(handler: logging.Handler):

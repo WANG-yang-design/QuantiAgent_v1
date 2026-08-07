@@ -76,11 +76,25 @@ class RiskManagerAgent(BaseAgent):
         return result
 
     def mock_output(self, input_data: AgentInput) -> Dict[str, Any]:
-        return self._run_impl_blocking(input_data)
-
-    def _run_impl_blocking(self, input_data: AgentInput) -> Dict[str, Any]:
-        import asyncio
-        return asyncio.run(self._run_impl(input_data))
+        # 修复: 原实现 asyncio.run() 在异步上下文中被调用时抛
+        # "cannot be called from a running event loop"。风控规则为同步计算, 直接内联。
+        ctx = input_data.context or {}
+        plan = ctx.get("plan") or {}
+        account = ctx.get("account") or {}
+        features = ctx.get("technical") or {}
+        etf = ctx.get("etf") or {}
+        broker = ctx.get("broker")
+        engine = get_risk_engine()
+        rv = engine.check_plan(plan, account, features, etf, broker).to_dict()
+        return {
+            "risk_decision": rv["result"],
+            "approved_weight": 0.0,
+            "approved_amount": rv["approved_amount"],
+            "approved_quantity": rv["approved_quantity"],
+            "risk_level": rv["risk_level"],
+            "blocked_reason": rv["blocked_reason"],
+            "risk_warnings": rv["warnings"],
+        }
 
 
 # ================================================================
@@ -110,8 +124,14 @@ class ComplianceAgent(BaseAgent):
         rules = get_settings().section("trading_rules")
         risk_cfg = get_settings().get("risk", {})
 
-        # 1. 交易时段
-        now = datetime.now()
+        # 1. 交易时段(修复: 原实现用服务器本地时区, UTC 服务器上合规闸门
+        #    错判 —— 与调度器一致统一 Asia/Shanghai)
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            now = now.replace(tzinfo=None)
+        except Exception:
+            now = datetime.now()
         if ctx.get("enforce_trading_hours", True) and not self._in_trading_hours(now):
             return {"compliance_status": "BLOCKED",
                     "reason": f"非交易时段({now:%H:%M}), 禁止下单",
@@ -120,14 +140,18 @@ class ComplianceAgent(BaseAgent):
         # 2. 重复下单: 同 symbol+side+qty+price 的活跃订单
         from database import repository as repo
         open_orders = repo.get_open_orders()
+        limit_price = float(plan.get("limit_price", 0) or 0)
         for o in open_orders:
-            if (o.symbol == plan.get("symbol") and o.side == plan.get("action")
-                    and abs(o.price - float(plan.get("limit_price", 0) or 0)) < 1e-6):
-                warnings.append(f"存在同方向同价格活跃订单 {o.order_id}, 视为重复下单风险")
+            if o.symbol == plan.get("symbol") and o.side == plan.get("action"):
+                # 修复: 市价单(price=0)同标的同方向全部互判重复 —— 价格0时跳过比对
+                if o.price == 0 or limit_price == 0 or abs(o.price - limit_price) < 1e-6:
+                    warnings.append(f"存在同方向活跃订单 {o.order_id}, 视为重复下单风险")
 
-        # 3. 每日次数/金额
+        # 3. 每日次数/金额(修复: 只统计非终态的当日订单 —— 原实现把
+        #    CANCELLED/REJECTED 也计入, 多次撤单后当日被锁死)
         today = date.today()
-        orders_today = repo.get_orders_today(today)
+        orders_today = [o for o in repo.get_orders_today(today)
+                        if o.status not in ("CANCELLED", "REJECTED", "FAILED")]
         daily_count = len(orders_today)
         daily_amount = sum(o.price * o.qty for o in orders_today if o.qty and o.price)
         acc_cfg = risk_cfg.get("account_level", {})
@@ -146,9 +170,15 @@ class ComplianceAgent(BaseAgent):
         qty = int(plan.get("estimated_quantity", 0) or 0)
         lot = int(rules.get("lot", {}).get("etf", 100))
         if qty % lot != 0:
-            return {"compliance_status": "BLOCKED",
-                    "reason": f"数量{qty}不是交易单位{lot}的整数倍",
-                    "warnings": warnings}
+            # A股规则: 持仓碎股(非100整数倍)必须一次性全部卖出 —— 这是合法订单。
+            # 修复: 原实现一律拦截, 导致含碎股持仓的止损/止盈单永远无法执行。
+            # 补充: 卖出后剩余持仓为整手时同样合法(如持350卖250剩100)。
+            holding = int(ctx.get("holding_qty") or 0)
+            if plan.get("action") != "SELL" or (
+                    qty != holding and (holding - qty) % lot != 0):
+                return {"compliance_status": "BLOCKED",
+                        "reason": f"数量{qty}不是交易单位{lot}的整数倍",
+                        "warnings": warnings}
         if qty <= 0 and plan.get("action") in ("BUY", "SELL"):
             return {"compliance_status": "BLOCKED",
                     "reason": "订单数量为0", "warnings": warnings}

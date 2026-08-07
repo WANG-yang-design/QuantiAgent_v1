@@ -38,11 +38,12 @@ async def run_daily_review(broker: Optional[PaperBroker] = None,
     # 1. 刷新持仓市值(收盘价由数据服务最新行情注入)
     account = broker.get_account()
 
-    # 2. 统计当日订单与成交
+    # 2. 统计当日订单与成交(只统计本账户, 排除测试/其他账户的成交)
     orders_today = repo.get_orders_today(date_)
     trades = repo.get_trades(start=datetime.combine(date_, datetime.min.time()),
-                             end=datetime.combine(date_, datetime.max.time()))
-    fee_total = sum(t.fee for t in trades)
+                             end=datetime.combine(date_, datetime.max.time()),
+                             account_id=broker.account_id)
+    fee_total = sum((t.fee or 0) for t in trades)   # 修复: 历史 NULL fee 导致 TypeError 复盘崩溃
     day_pnl = float(account.get("day_pnl", 0) or 0)
 
     stats = {

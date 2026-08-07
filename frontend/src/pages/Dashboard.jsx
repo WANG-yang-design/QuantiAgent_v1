@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+﻿import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area,
@@ -15,22 +15,44 @@ export default function Dashboard() {
   const { data: orders } = useQuery({ queryKey: ["orders"], queryFn: () => api.get("/api/orders?limit=10"), refetchInterval: 15000 });
   const { data: mode } = useQuery({ queryKey: ["sysmode"], queryFn: () => api.get("/api/system/mode"), refetchInterval: 15000 });
 
-  const pause = useMutation({ mutationFn: () => api.post("/api/emergency/pause?reason=dashboard"), onSuccess: () => qc.invalidateQueries() });
-  const resume = useMutation({ mutationFn: () => api.post("/api/emergency/resume"), onSuccess: () => qc.invalidateQueries() });
-  const cancelAll = useMutation({ mutationFn: () => api.post("/api/emergency/cancel_all"), onSuccess: () => qc.invalidateQueries() });
+  const pause = useMutation({
+    // 修复: 原实现把 window.confirm 放进 mutationFn, 取消时返回 resolved
+    // Promise 仍触发 onSuccess 刷新 —— 取消确认移到调用点
+    mutationFn: () => api.post("/api/emergency/pause?reason=dashboard"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["sysmode"] }),
+    onError: (e) => window.alert("暂停失败: " + (e.response?.data?.detail || e.message)),
+  });
+  const resume = useMutation({
+    mutationFn: () => api.post("/api/emergency/resume"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["sysmode"] }),
+    onError: (e) => window.alert("恢复失败: " + (e.response?.data?.detail || e.message)),
+  });
+  const cancelAll = useMutation({
+    mutationFn: () => api.post("/api/emergency/cancel_all"),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["orders"] }); qc.invalidateQueries({ queryKey: ["sysmode"] }); },
+    onError: (e) => window.alert("撤单失败: " + (e.response?.data?.detail || e.message)),
+  });
   const doSnapshot = useMutation({
     mutationFn: () => api.post("/api/account/snapshot"),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["equity"] }),
+    onError: (e) => window.alert("快照失败: " + (e.response?.data?.detail || e.message)),
   });
 
   // 净值曲线: 快照不足时用 [初始资金, 当前资产] 兜底, 保证始终有曲线
+  // (修复: 快照是定时任务(每30分钟)写的, 曲线末端停留在上次快照值,
+  //  看起来像"不动"; 追加一个"现在"实时点让曲线始终延伸到当前总资产)
   const rawEq = equity || [];
   const hasSnapshot = rawEq.length >= 2;
+  const liveV = Math.round(acc?.total_asset || 0);
+  const lastV = rawEq.length ? rawEq[rawEq.length - 1].total_asset : null;
   const eqData = hasSnapshot
-    ? rawEq.map((p) => ({ t: p.time.slice(5, 16), v: p.total_asset }))
+    ? [
+        ...rawEq.map((p) => ({ t: (p.time || "").slice(5, 16), v: p.total_asset })),
+        ...(lastV == null || Math.abs(lastV - liveV) > 0.01 ? [{ t: "现在", v: liveV }] : []),
+      ]
     : [
         { t: "初始", v: Math.round((acc?.total_asset || 0) - (acc?.total_pnl || 0)) },
-        { t: "现在", v: Math.round(acc?.total_asset || 0) },
+        { t: "现在", v: liveV },
       ];
 
   const cards = [
@@ -50,7 +72,7 @@ export default function Dashboard() {
   const diagColor = diag?.state === "risk_on" ? "text-up" : diag?.state === "risk_off" ? "text-down" : "text-amber-600";
 
   return (
-    <div className="p-5 space-y-4">
+    <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold text-brand-600">仪表盘</h1>
         <SystemBar />
@@ -98,7 +120,7 @@ export default function Dashboard() {
             <div className="text-xl font-bold mt-1">¥{value}</div>
             {label === "总盈亏" && (
               <div className={`text-xs ${(acc?.total_pnl || 0) >= 0 ? "text-up" : "text-down"}`}>
-                {(acc?.total_return || 0) >= 0 ? "+" : ""}{(acc?.total_return * 100)?.toFixed(2)}%
+                {acc?.total_return != null ? `${(acc.total_return || 0) >= 0 ? "+" : ""}${(acc.total_return * 100).toFixed(2)}%` : "-"}
               </div>
             )}
           </button>
@@ -108,13 +130,17 @@ export default function Dashboard() {
       {/* 紧急按钮 + 今日限额 */}
       <div className="card flex flex-wrap items-center gap-3">
         <span className="text-sm font-semibold text-gray-600">紧急控制:</span>
-        <button className="btn-danger" disabled={pause.isPending} onClick={() => pause.mutate()}>
+        <button className="btn-danger" disabled={pause.isPending} onClick={() => {
+          if (window.confirm("确认暂停全部交易? 暂停后所有自动交易将被拦截。")) pause.mutate();
+        }}>
           <Pause size={14} className="inline mr-1" />一键暂停
         </button>
         <button className="btn-green" disabled={resume.isPending} onClick={() => resume.mutate()}>
           <Play size={14} className="inline mr-1" />恢复交易
         </button>
-        <button className="btn-danger" disabled={cancelAll.isPending} onClick={() => cancelAll.mutate()}>
+        <button className="btn-danger" disabled={cancelAll.isPending} onClick={() => {
+          if (window.confirm("确认撤销全部未成交委托? 该操作不可恢复。")) cancelAll.mutate();
+        }}>
           <XCircle size={14} className="inline mr-1" />撤销全部委托
         </button>
         <span className="ml-auto text-xs text-gray-500">
@@ -176,26 +202,47 @@ export default function Dashboard() {
       <div className="card">
         <div className="card-title">最近订单</div>
         {orders?.length ? (
-          <table className="w-full">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px]">
             <thead>
               <tr>
-                <th className="th">时间</th><th className="th">标的</th><th className="th">方向</th>
-                <th className="th">价格</th><th className="th">数量</th><th className="th">状态</th>
+                <th className="th">时间</th><th className="th">标的</th><th className="th">名称</th><th className="th">方向</th>
+                <th className="th">价格</th><th className="th">数量</th>
+                <th className="th">来源</th><th className="th">状态</th>
               </tr>
             </thead>
             <tbody>
-              {orders.map((o) => (
-                <tr key={o.order_id}>
-                  <td className="td text-gray-500">{(o.submit_time || "").slice(11, 19)}</td>
-                  <td className="td font-medium">{o.symbol}</td>
-                  <td className="td"><span className={`badge ${o.side === "BUY" ? "bg-red-50 text-up" : "bg-green-50 text-down"}`}>{o.side}</span></td>
-                  <td className="td">{fmt(o.price)}</td>
-                  <td className="td">{o.filled_qty}/{o.qty}</td>
-                  <td className="td"><span className="badge bg-gray-100 text-gray-600">{o.status}</span></td>
-                </tr>
-              ))}
+              {orders.map((o) => {
+                // 订单来源(修复: 用户分不清自动卖单来自哪 — 风控巡检单 vs Agent决策单 vs 策略轮动)
+                const src = {
+                  risk_monitor: { label: "风控巡检", cls: "bg-amber-50 text-amber-700" },
+                  rotation: { label: "策略轮动", cls: "bg-cyan-50 text-cyan-700" },
+                }[o.source] || { label: "Agent决策", cls: "bg-blue-50 text-blue-700" };
+                const st = {
+                  FILLED: { label: "已成交", cls: "bg-green-50 text-green-600" },
+                  PARTIALLY_FILLED: { label: "部分成交", cls: "bg-green-50 text-green-600" },
+                  CANCELLED: { label: "已撤单", cls: "bg-gray-100 text-gray-500" },
+                  SUBMITTED: { label: "已提交", cls: "bg-amber-50 text-amber-700" },
+                  ACCEPTED: { label: "已受理", cls: "bg-amber-50 text-amber-700" },
+                  REJECTED: { label: "已拒绝", cls: "bg-red-50 text-red-600" },
+                  FAILED: { label: "失败", cls: "bg-red-50 text-red-600" },
+                }[o.status] || { label: o.status, cls: "bg-gray-100 text-gray-600" };
+                return (
+                  <tr key={o.order_id}>
+                    <td className="td text-gray-500">{(o.submit_time || "").slice(5, 19)}</td>
+                    <td className="td font-medium">{o.symbol}</td>
+                    <td className="td text-gray-500">{o.name || "-"}</td>
+                    <td className="td"><span className={`badge ${o.side === "BUY" ? "bg-red-50 text-up" : "bg-green-50 text-down"}`}>{o.side === "BUY" ? "买入" : "卖出"}</span></td>
+                    <td className="td">{fmt(o.price)}</td>
+                    <td className="td">{o.filled_qty}/{o.qty}</td>
+                    <td className="td"><span className={`badge ${src.cls}`}>{src.label}</span></td>
+                    <td className="td"><span className={`badge ${st.cls}`}>{st.label}</span></td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
+          </div>
         ) : <Empty text="今日暂无订单" />}
       </div>
     </div>

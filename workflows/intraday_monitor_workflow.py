@@ -10,6 +10,7 @@
 """
 import asyncio
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 from core.config import get_settings
@@ -18,12 +19,45 @@ from core.logging import set_trace_id
 from memory.audit_log import AuditLogger
 from paper_trading.paper_broker import PaperBroker
 from workflows.graph import WorkflowState
-from workflows.research_workflow import build_research_graph, node_collect_data
+from workflows.research_workflow import build_research_graph
 from workflows.trading_workflow import run_trading_workflow
 
 logger = logging.getLogger("workflow.intraday")
 
 _broker: Optional[PaperBroker] = None
+# 节点级进度回调(Web 异步任务设置, 用于前端实时显示)。
+# 修复: 原为进程级全局变量 —— 调度器自动扫描与 Web 手动扫描并发时互相覆盖,
+# 进度显示错乱; 且 A 扫描结束后 finally 清空回调会让 B 扫描的进度丢失。
+# 改为线程本地: 每个扫描线程各自持有自己的回调, 互不影响。
+_progress_local = threading.local()
+
+
+def set_scan_progress_cb(cb):
+    """设置当前线程的节点进度回调。"""
+    _progress_local.cb = cb
+
+
+def get_scan_progress_cb():
+    """读取当前线程的进度回调(无则 None)。"""
+    return getattr(_progress_local, "cb", None)
+
+
+# 节点中文名映射(前端进度展示)
+NODE_LABELS = {
+    "collect_data": "数据采集",
+    "data_gate": "数据质量闸门",
+    "features": "特征计算",
+    "summary": "市场摘要",
+    "analysts": "7分析师并行分析",
+    "bull": "看多研究员",
+    "bear": "看空研究员(反驳)",
+    "chief": "首席研究员汇总",
+    "trader": "交易员计划",
+    "risk_manager": "五层风控审核",
+    "compliance": "合规审计",
+    "execute": "订单执行",
+    "supervise": "执行监督",
+}
 
 
 def get_broker() -> PaperBroker:
@@ -57,9 +91,10 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
               {"symbol": symbol, "name": name, "force": force})
 
     # 阶段1: 投研(数据闸门→特征→分析师→辩论→首席)
+    # 注意: 不再手动调用 node_collect_data —— 原实现先手动采集(结果丢弃),
+    # 随后 research_graph.run 又采集一次, 每轮行情/盘口/资金流双倍请求(修复)。
     research_graph = build_research_graph()
-    # 先采集数据(复用投研图的采集节点)
-    data_res = await node_collect_data(state)
+    research_graph.progress_cb = get_scan_progress_cb()
     state = await research_graph.run(state)
 
     result: Dict[str, Any] = {
@@ -83,7 +118,8 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
     # 阶段2: 交易(仅当首席结论不是 EXCLUDE/HOLD 时进入交易员, 减少无效调用)
     chief = state.get("chief") or {}
     if chief.get("research_decision") in ("BUY_CANDIDATE", "SELL_CANDIDATE"):
-        state = await run_trading_workflow(state, account_snapshot, broker)
+        state = await run_trading_workflow(state, account_snapshot, broker,
+                                           progress_cb=get_scan_progress_cb())
         result["plan"] = state.get("plan")
         result["risk"] = state.get("risk")
         result["execution"] = state.get("execution")

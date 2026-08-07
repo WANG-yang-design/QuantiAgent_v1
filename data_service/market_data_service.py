@@ -43,24 +43,54 @@ class MarketDataService:
         if use_cache:
             hit = daily_cache.get(key)
             if hit is not None:
-                return hit, DataQualityReport(symbol, "daily_bar")
+                # 命中时重新做质量检查(坏数据不再以 VALID 标签进入决策链)
+                return hit, self.qc.check_daily_bars(symbol, hit)
 
         try:
             bars, source = self.hub.get_daily_bars(symbol, start, end, asset_type)
         except Exception as exc:
             logger.error("日K获取失败 %s: %s", symbol, exc)
             return [], self._failed_report(symbol, "daily_bar", str(exc))
+        # 修复: 主源(baostock)故障时回退源只返回当日1根K线, 直接透传会
+        # 导致前端K线图只剩当天、AI特征全 NaN。少于20根视为采集失败,
+        # 回退到本地日K库(历史多次采集已落库)。
+        if len(bars) < 20:
+            logger.warning("日K仅 %d 根(%s), 回退本地日K库", len(bars), symbol)
+            try:
+                from database.models import DailyBar
+                from database.db_session import get_session
+                with get_session() as s:
+                    rows = s.query(DailyBar).filter(
+                        DailyBar.symbol == symbol,
+                        DailyBar.trade_date >= start,
+                        DailyBar.trade_date <= end,
+                    ).order_by(DailyBar.trade_date).all()
+                if len(rows) > len(bars):
+                    bars = [{
+                        "symbol": r.symbol, "trade_date": r.trade_date,
+                        "open": r.open, "high": r.high, "low": r.low,
+                        "close": r.close, "volume": r.volume, "amount": r.amount,
+                    } for r in rows]
+            except Exception as exc2:
+                logger.warning("日K库回退失败 %s: %s", symbol, exc2)
 
         rep = self.qc.check_daily_bars(symbol, bars)
-        if rep.status in ALLOWED_QUALITY and save_db:
-            try:
-                for b in bars:
-                    b["quality_status"] = rep.status
-                repo.upsert_daily_bars(bars)
-            except Exception as exc:
-                logger.error("日K落库失败 %s: %s", symbol, exc)
-
-        daily_cache.set(key, bars)
+        if rep.status in ALLOWED_QUALITY:
+            if save_db:
+                try:
+                    for b in bars:
+                        b["quality_status"] = rep.status
+                    repo.upsert_daily_bars(bars)
+                except Exception as exc:
+                    logger.error("日K落库失败 %s: %s", symbol, exc)
+            # 只缓存合格数据: SUSPICIOUS/DELAYED 不缓存, 保证下次请求重新校验
+            # 修复: 数据源故障时(如 baostock 断连)回退源只返回当日1根K线, 质量
+            # 检查仍判 VALID 并被缓存1小时 -> 前端K线图一整天只显示当天一根。
+            # 少于20根视为采集失败, 不缓存(下次重新拉取, 直到主源恢复)。
+            if len(bars) >= 20:
+                daily_cache.set(key, bars, ttl=600)   # 10分钟TTL(原1小时, 失败数据滞留过久)
+            else:
+                logger.warning("日K仅 %d 根(%s), 疑似数据源降级, 不缓存", len(bars), symbol)
         return bars, rep
 
     # ================================================================
@@ -86,9 +116,9 @@ class MarketDataService:
                 for b in bars:
                     b["quality_status"] = rep.status
                 repo.upsert_minute_bars(bars)
-            except Exception:
-                pass
-        minute_cache.set(key, bars)
+            except Exception as exc:
+                logger.error("分钟K落库失败 %s: %s", symbol, exc)
+            minute_cache.set(key, bars)
         return bars, rep
 
     # ================================================================
@@ -108,9 +138,10 @@ class MarketDataService:
         if rep.status in ALLOWED_QUALITY:
             try:
                 repo.save_realtime_quote(quote)
-            except Exception:
-                pass
-        quote_cache.set(key, quote)
+            except Exception as exc:
+                # 修复: 原实现静默吞异常, 实时行情入库失败无任何日志
+                logger.error("实时行情落库失败 %s: %s", symbol, exc)
+            quote_cache.set(key, quote)
         return quote, rep
 
     # ================================================================
@@ -130,9 +161,9 @@ class MarketDataService:
         if rep.status in ALLOWED_QUALITY:
             try:
                 repo.save_order_book(ob)
-            except Exception:
-                pass
-        order_book_cache.set(key, ob)
+            except Exception as exc:
+                logger.error("盘口落库失败 %s: %s", symbol, exc)
+            order_book_cache.set(key, ob)
         return ob, rep
 
     # ================================================================
@@ -177,6 +208,20 @@ class MarketDataService:
             return []
 
     def get_trade_calendar(self, start: date, end: date) -> List[date]:
+        """交易日历: 优先读本地缓存(data/trade_calendar.json, 由调度任务
+        每日更新), 缓存缺失/覆盖不足时回源拉取。"""
+        import json
+        from core.config import ROOT_DIR
+        try:
+            path = ROOT_DIR / "data" / "trade_calendar.json"
+            if path.exists():
+                cached = json.loads(path.read_text(encoding="utf-8"))
+                cached = [datetime.strptime(x, "%Y-%m-%d").date() for x in cached]
+                # 缓存覆盖请求区间才直接用(避免旧缓存误判交易日)
+                if cached and cached[0] <= start and cached[-1] >= end:
+                    return [d for d in cached if start <= d <= end]
+        except Exception:
+            pass
         try:
             dates, source = self.hub.get_trade_calendar(start, end)
             return dates
@@ -189,11 +234,22 @@ class MarketDataService:
         if d.weekday() >= 5:
             return False
         dates = self.get_trade_calendar(d - timedelta(days=10), d + timedelta(days=1))
+        # 修复: 交易日历获取失败(返回[])与"确实非交易日"要区分。
+        # 失败时按工作日近似判定并告警, 避免真实交易日被静默跳过。
+        if not dates:
+            logger.warning("交易日历获取失败, 按工作日近似判定 %s", d)
+            return True
         return d in dates
 
     def get_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        """基本面数据(拉取并落库, 供DB查询/回放)。"""
         try:
             fund, source = self.hub.get_fundamentals(symbol)
+            if fund:
+                try:
+                    repo.upsert_fundamentals([fund])
+                except Exception as exc:
+                    logger.warning("基本面落库失败 %s: %s", symbol, exc)
             return fund
         except Exception as exc:
             logger.warning("基本面获取失败 %s: %s", symbol, exc)

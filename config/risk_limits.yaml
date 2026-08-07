@@ -16,7 +16,9 @@ position_level:
   max_single_position: 0.30       # 单标的最大仓位
   max_single_loss: 0.10           # 单标的最大亏损
   min_single_amount: 50000000     # 单标的最小日成交额(元)
-  max_volatility: 0.035           # 单标的最大日波动率(20日)
+  max_volatility: 0.5           # 单标的年化波动率上限(修复: 原0.035按日波动口径写,
+                                # 但特征值是年化(×√252), 28.7%年化波动全被拒, 与策略max_vol=50%严重不一致。
+                                # 现在跟随轮动策略 active max_vol, 此项仅作覆盖)
   forbid_high_premium_etf: true
   max_premium_rate: 0.03          # ETF 溢价率超过3%禁止买入
   min_etf_premium_rate: -0.05     # 折价超5%也警示
@@ -63,17 +65,23 @@ circuit_breaker:
 
 confirmation_policy:
   auto_execute:
-    max_order_amount: 1000
+    max_order_amount: 5000      # 修复: 原1000 —— 5000元以内自动执行, 无需人工确认
     risk_level: low
   email_or_ui_confirm:
     max_order_amount: 5000
     risk_level: medium
   block:
     risk_level: high
+  # 人工确认超时自动决定(修复: 需确认的单子2分钟内无人处理, 自动按策略执行)
+  # BUY: 策略给买入信号→自动批准; 策略未给→自动拒绝(跟随策略)
+  # SELL: 默认自动批准(持仓保护优先), 策略明确看多时拒绝
+  auto_decide_timeout_seconds: 120
 
 # =========================================================
-# 持仓风控巡检 (硬性止损, 不依赖Agent及时性)
+# 持仓风控巡检 (硬性止损/移动止盈, 不依赖Agent及时性)
 # 交易时段按间隔自动扫描持仓, 触发条件满足立即执行(经风控)
+# 注意: 已移除"市场 risk_off 降仓"自动卖出 —— 大盘状态只作
+# Agent 决策参考, 不自动触发卖出(原实现每轮巡检卖50%直到清仓)
 # =========================================================
 position_monitor:
   enabled: true
@@ -81,8 +89,7 @@ position_monitor:
   only_trading_hours: true           # 仅交易时段巡检
   stop_loss_pct: 0.08                # 硬止损: 浮亏超过成本8%立即卖出
   trailing_stop_pct: 0.08            # 移动止盈: 从持仓最高价回撤8%卖出(锁定利润)
-  market_risk_filter: true           # 大盘risk_off时降低仓位
-  market_risk_reduce_ratio: 0.5      # risk_off时卖出持仓的一半
+  market_risk_filter: false          # 已禁用: 大盘risk_off不再自动降仓(仅作Agent参考)
   auto_execute: true                 # 自动执行(经风控+合规); false=仅告警不下单
   max_daily_stop_orders: 10          # 每日最大自动止损单次数(防失控)
   min_sell_qty: 100                  # 最小卖出数量(低于则不执行)

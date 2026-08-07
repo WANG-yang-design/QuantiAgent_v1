@@ -1,7 +1,7 @@
 ﻿import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { Plus, Trash2, ArrowUpDown, RefreshCw } from "lucide-react";
+import { Plus, Trash2, ArrowUpDown, RefreshCw, Star } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmt, fmtWan, Empty } from "../components/Common";
 
@@ -44,34 +44,53 @@ export default function Watchlist() {
     setPrev(now);
     if (Object.keys(flashNow).length) {
       setFlash(flashNow);
-      setTimeout(() => setFlash({}), 2000);
+      const t = setTimeout(() => setFlash({}), 2000);
+      return () => clearTimeout(t);   // 清理定时器(修复: 组件卸载后仍 setState)
     }
   }, [data]);
 
   const add = useMutation({
-    mutationFn: async () => {
-      const code = addCode.trim().toUpperCase();
+    mutationFn: async (codeArg) => {
+      const code = (codeArg || addCode).trim().toUpperCase();
       if (!/^\d{6}$/.test(code)) throw new Error("请输入6位代码");
       await api.post("/api/watchlist", { symbol: code, categories: ["watched"] });
       setAddCode("");
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onError: (e) => window.alert("添加失败: " + (e.response?.data?.detail || e.message)),
   });
   const remove = useMutation({
     mutationFn: (code) => api.delete(`/api/watchlist/${code}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onError: (e) => window.alert("移除失败: " + (e.response?.data?.detail || e.message)),
   });
+  // 监控开关(修复: 自选池每行没有"加入监控/停用监控"入口)
+  const toggleWatch = useMutation({
+    mutationFn: ({ symbol, enabled }) => api.post(`/api/watchlist/${symbol}/enable`, { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onError: (e) => window.alert("操作失败: " + (e.response?.data?.detail || e.message)),
+  });
+  const watchState = Object.fromEntries((watch?.items || []).map((i) => [i.symbol, i]));
 
   const rows = useMemo(() => {
     const arr = [...(data?.quotes || [])];
     if (sortKey === "change_pct") arr.sort((a, b) => b.change_pct - a.change_pct);
     else if (sortKey === "amount") arr.sort((a, b) => b.amount - a.amount);
+    else if (sortKey === "latest_price") arr.sort((a, b) => b.latest_price - a.latest_price);
     else arr.sort((a, b) => a.symbol.localeCompare(b.symbol));
     return arr;
   }, [data, sortKey]);
 
+  // 排序方法下拉(修复: 原实现只能点表头排序, 用户无从发现, 且无法按最新价排序)
+  const SORT_OPTIONS = [
+    ["change_pct", "按涨跌幅(降序)"],
+    ["amount", "按成交额(降序)"],
+    ["latest_price", "按最新价(降序)"],
+    ["symbol", "按代码"],
+  ];
+
   return (
-    <div className="p-5 space-y-4">
+    <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">实时盯盘</h1>
         <SystemBar />
@@ -90,6 +109,10 @@ export default function Watchlist() {
             <button type="submit" className="btn-primary"><Plus size={14} className="inline mr-1" />添加</button>
           </form>
         )}
+        <select className="input !w-44 text-sm" value={sortKey}
+          onChange={(e) => setSortKey(e.target.value)} title="排序方法">
+          {SORT_OPTIONS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+        </select>
         <button className="btn-ghost ml-auto" onClick={() => qc.invalidateQueries({ queryKey: ["quotes"] })}>
           <RefreshCw size={14} className={`inline mr-1 ${isFetching ? "animate-spin" : ""}`} />刷新
         </button>
@@ -103,7 +126,7 @@ export default function Watchlist() {
             <tr>
               <th className="th cursor-pointer" onClick={() => setSortKey("symbol")}>代码 <ArrowUpDown size={11} className="inline" /></th>
               <th className="th">名称</th>
-              <th className="th cursor-pointer" onClick={() => setSortKey("change_pct")}>最新价 <ArrowUpDown size={11} className="inline" /></th>
+              <th className="th cursor-pointer" onClick={() => setSortKey("latest_price")}>最新价 <ArrowUpDown size={11} className="inline" /></th>
               <th className="th cursor-pointer" onClick={() => setSortKey("change_pct")}>涨跌幅</th>
               <th className="th cursor-pointer" onClick={() => setSortKey("amount")}>成交额</th>
               <th className="th">溢价率</th>
@@ -115,6 +138,7 @@ export default function Watchlist() {
             {rows.map((q) => {
               const f = flash[q.symbol];
               const bg = f === "up" ? "bg-red-100" : f === "down" ? "bg-green-100" : "";
+              const inWatch = watchSymbols.includes(q.symbol);
               return (
                 <tr key={q.symbol} className={`cursor-pointer hover:bg-gray-50 ${bg} transition-colors`}
                   onClick={() => nav(`/symbol/${q.symbol}`)}>
@@ -127,10 +151,28 @@ export default function Watchlist() {
                   <td className="td text-gray-600">{fmtWan(q.amount)}</td>
                   <td className="td text-gray-600">{q.premium_rate ? (q.premium_rate * 100).toFixed(2) + "%" : "-"}</td>
                   <td className="td text-gray-500">{fmt(q.iopv)}</td>
-                  <td className="td">
-                    {mode === "watchlist" && (
-                      <button className="text-gray-300 hover:text-red-500" onClick={(e) => { e.stopPropagation(); remove.mutate(q.symbol); }}>
-                        <Trash2 size={14} />
+                  <td className="td" onClick={(e) => e.stopPropagation()}>
+                    {mode === "watchlist" ? (
+                      <div className="flex items-center gap-1">
+                        <button
+                          className={watchState[q.symbol]?.enabled ? "text-brand-500" : "text-gray-300 hover:text-brand-500"}
+                          title={watchState[q.symbol]?.enabled ? "监控中, 点击停用" : "停用中, 点击加入监控"}
+                          onClick={() => toggleWatch.mutate({ symbol: q.symbol, enabled: !watchState[q.symbol]?.enabled })}
+                        >
+                          <Star size={15} className={watchState[q.symbol]?.enabled ? "fill-current" : ""} />
+                        </button>
+                        <button className="text-gray-300 hover:text-red-500" title="移除监控"
+                          onClick={() => remove.mutate(q.symbol)}>
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        className={inWatch ? "text-brand-500" : "text-gray-300 hover:text-brand-500"}
+                        title={inWatch ? "已在监控列表" : "一键加入监控列表"}
+                        onClick={() => { if (!inWatch) add.mutate(q.symbol); }}
+                      >
+                        <Star size={15} className={inWatch ? "fill-current" : ""} />
                       </button>
                     )}
                   </td>
@@ -139,7 +181,7 @@ export default function Watchlist() {
             })}
           </tbody>
         </table>
-        {!rows.length && <Empty text="无行情数据(先执行 fetch-symbols)" />}
+        {!rows.length && (isFetching ? <div className="text-center text-gray-400 text-sm py-8">加载中...</div> : <Empty text="无行情数据(先执行 fetch-symbols)" />)}
       </div>
     </div>
   );

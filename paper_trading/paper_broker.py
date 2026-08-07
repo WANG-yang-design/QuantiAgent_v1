@@ -53,6 +53,7 @@ class PaperBroker:
             order_intent_id=intent,
             plan_id=order_request.get("plan_id", ""),
             name=order_request.get("name", ""),
+            source=order_request.get("source", "agent"),
         )
 
     def cancel_order(self, order_id: str, reason: str = "manual") -> dict:
@@ -68,9 +69,12 @@ class PaperBroker:
         from database import repository as repo
         return [
             {"trade_id": t.trade_id, "order_id": t.order_id, "symbol": t.symbol,
-             "side": t.side, "price": t.price, "qty": t.qty, "fee": t.fee,
+             "name": t.name or "", "side": t.side, "price": t.price,
+             "qty": t.qty, "fee": t.fee, "pnl": t.pnl,
              "trade_time": str(t.trade_time)}
-            for t in repo.get_trades(symbol=symbol, limit=limit)
+            # 修复: 必须按账户过滤 —— 测试套件/其他账户的成交都在全局 trades 表
+            for t in repo.get_trades(symbol=symbol, limit=limit,
+                                     account_id=self.account_id)
         ]
 
     def match_order(self, order_id: str, bar: dict, mode: str = "simple",
@@ -83,8 +87,31 @@ class PaperBroker:
 
     # ---------------- 组合 ----------------
     def rebalance_plan(self, target_weights: Dict[str, float]) -> List[dict]:
-        """根据目标权重生成调仓订单意图列表(交易员用)。"""
-        return self.portfolio.generate_rebalance_orders(target_weights)
+        """根据目标权重生成调仓订单意图列表(交易员用)。
+        修复: 原实现不传 prices(默认{}), 所有订单因 price<=0 被跳过, 功能不可用。
+        价格从行情服务获取(失败回退持仓最新价)。"""
+        from data_service.market_data_service import get_market_service
+        from database import repository as repo
+        prices: Dict[str, float] = {}
+        names: Dict[str, str] = {}
+        try:
+            for w in repo.get_watchlist():
+                names[w["symbol"]] = w["name"]
+        except Exception:
+            pass
+        for sym in target_weights:
+            try:
+                q, _ = get_market_service().get_realtime_quote(sym, "etf")
+                p = float((q or {}).get("latest_price", 0) or 0)
+                if p > 0:
+                    prices[sym] = p
+            except Exception:
+                continue
+        # 目标外持仓的价格回退: 持仓最新价
+        for pos in self.get_positions():
+            if pos["symbol"] not in prices and pos.get("latest_price", 0) > 0:
+                prices[pos["symbol"]] = float(pos["latest_price"])
+        return self.portfolio.generate_rebalance_orders(target_weights, prices, names)
 
     def mark_to_market(self, prices: Dict[str, float]):
         """按最新价刷新持仓市值。"""

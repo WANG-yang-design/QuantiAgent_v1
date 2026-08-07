@@ -54,15 +54,19 @@ class DataSourceHub:
         if source_name in self._clients:
             return self._clients[source_name]
         from data_sources.akshare_client import AkShareClient
+        from data_sources.baostock_client import BaostockClient
         from data_sources.cninfo_client import CninfoClient
         from data_sources.eastmoney_client import EastMoneyClient
         from data_sources.sina_client import SinaClient
+        from data_sources.tencent_client import TencentClient
         from data_sources.tushare_client import TushareClient
 
         classes: Dict[str, Type[BaseDataSource]] = {
             "akshare": AkShareClient,
+            "baostock": BaostockClient,
             "eastmoney": EastMoneyClient,
             "sina": SinaClient,
+            "tencent": TencentClient,
             "cninfo": CninfoClient,
             "tushare": TushareClient,
         }
@@ -82,7 +86,11 @@ class DataSourceHub:
         return [c for c in chain if c]
 
     def _call(self, category: str, method: str, *args, **kwargs):
-        """按容灾链调用, 返回 (结果, 成功源)。整体失败后重试一轮(防瞬时限流)。"""
+        """按容灾链调用, 返回 (结果, 成功源)。整体失败后重试一轮(防瞬时限流)。
+        修复: 空结果视为失败 —— 原实现 akshare 限流返回空 DataFrame 时被当作
+        成功返回, 备源(sina/tushare)永远不会被尝试, 全部标的数据被静默标 MISSING。"""
+        # 允许空结果的类别: 新闻/公告/舆情本身可能确实没有内容(不算失败)
+        empty_ok = {"news", "announcement", "sentiment", "trade_calendar"}
         errors = []
         for attempt in range(2):
             for source_name in self._chain(category):
@@ -93,6 +101,15 @@ class DataSourceHub:
                     if fn is None:
                         continue
                     result = fn(*args, **kwargs)
+                    if result is None or (
+                        isinstance(result, (list, tuple)) and not empty_ok
+                        and len(result) == 0
+                    ):
+                        raise RuntimeError(
+                            f"{source_name} 返回空结果({category})")
+                    if isinstance(result, dict) and not empty_ok and not result:
+                        raise RuntimeError(
+                            f"{source_name} 返回空结果({category})")
                     key = (category, source_name)
                     self.failover_stats[key] = 0
                     return result, source_name

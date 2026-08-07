@@ -45,7 +45,10 @@ class EastMoneyClient(BaseDataSource):
     name = "eastmoney"
 
     def __init__(self):
-        self.client = httpx.Client(headers=_HEADERS, timeout=10)
+        # 修复: 绕过系统代理直连 —— 用户网络环境有代理时,
+        # 东财接口报 ProxyError 导致数据获取失败(数据源容灾链全灭)
+        self.client = httpx.Client(headers=_HEADERS, timeout=10,
+                                   proxy=None, trust_env=False)
 
     # ---------------- 实时行情 ----------------
     def get_realtime_quote(self, symbol: str, asset_type: str = "etf") -> Dict[str, Any]:

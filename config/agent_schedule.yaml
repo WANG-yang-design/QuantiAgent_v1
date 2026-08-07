@@ -17,9 +17,9 @@ jobs:
   premarket_news:
     cron: "30 8 * * 1-5"
     enabled: true
-  # 实时行情采集(交易时段 5-15秒) -> 简化: 每10秒, 只采池内标的
+  # 实时行情采集(交易时段, 池内标的; 每轮含容灾重试约20-30秒, 间隔30秒防任务重叠)
   collect_realtime_quote:
-    interval_seconds: 10
+    interval_seconds: 30
     enabled: true
     only_trading_hours: true
   # 盘口快照(15秒, 落库降频为每60秒)
@@ -37,6 +37,10 @@ jobs:
     interval_seconds: 600
     enabled: true
   # Agent 常规分析(默认30分钟, 可配置)
+  # Agent 常规分析(间隔可调, 单位分钟; 30 = 每30分钟一次)
+  # 修复: 与时钟对齐 —— 自动换算成绝对时刻 cron(*/N 9-15 交易时段),
+  # 每天 9:30 开盘后整点扫描(30分钟 → 9:30/10:00/10:30/.../15:00),
+  # 程序重启/改间隔后立即按新时间表执行, 不再从启动时刻重新计时。
   agent_routine_analysis:
     interval_minutes: 30
     enabled: true
@@ -49,18 +53,42 @@ jobs:
   daily_report:
     cron: "0 17 * * 1-5"
     enabled: true
-  # 市场牛熊诊断(交易时段每小时)
+  # 市场牛熊诊断(交易时段每小时; 修复: 原 10-14 覆盖12:00午休空转且漏掉15:00)
   market_diagnosis:
-    cron: "0 10-14 * * 1-5"
+    cron: "0 10,11,14,15 * * 1-5"
     enabled: true
   # 持仓风控巡检(间隔读 risk_limits.yaml position_monitor.check_interval_seconds)
   position_monitor:
     interval_seconds: 0
     enabled: true
     only_trading_hours: true
+  # 盘中订单撮合+超时撤单(每30秒, 修复订单永不成交问题)
+  match_pending_orders:
+    interval_seconds: 30
+    enabled: true
+    only_trading_hours: true
+  # 账户净值快照(交易时段每30分钟, 仪表盘净值曲线数据源)
+  # 修复: 原只在日终17:00与手动快照落库, 一天仅1-2个点, 净值曲线是直线
+  account_snapshot:
+    interval_seconds: 1800
+    enabled: true
+    only_trading_hours: true
   # 周报(周五 18:00)
   weekly_report:
     cron: "0 18 * * 5"
+    enabled: true
+  # ETF动量轮动实盘执行(14:40收盘前, 回测策略在实盘的落地应用)
+  # 修复: 原回测策略从未应用到实盘; 是否启用见 config.yaml strategies.live_rotation
+  strategy_rotation:
+    cron: "40 14 * * 1-5"
+    enabled: true
+  # 月报(每月1日18:00, 生成上月; 修复: 原无月报任务)
+  monthly_report:
+    cron: "0 18 1 * *"
+    enabled: true
+  # 年报(每年1月2日18:00, 生成上一年)
+  annual_report:
+    cron: "0 18 2 1 *"
     enabled: true
 
 # 紧急触发条件(与 config.yaml intraday.urgent 一致, 供调度复用)

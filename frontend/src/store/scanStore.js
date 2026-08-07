@@ -16,6 +16,8 @@ export const useScanStore = create(
       update: (patch) => set(patch),
       clear: () => set({ taskId: null, symbol: "", status: null, error: "" }),
     }),
-    { name: "quantiagent_scan_task" }   // sessionStorage 持久化, 刷新页面不丢失
+    { name: "quantiagent_scan_task" }   // localStorage 持久化, 刷新页面不丢失
+    // 注: zustand persist 默认使用 localStorage(跨标签页共享)。
+    // 如需每次会话独立的任务状态, 改用 createJSONStorage(() => sessionStorage)
   )
 );

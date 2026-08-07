@@ -71,7 +71,11 @@ def compute_technical_features(bars: List[Dict[str, Any]],
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
-    rsi = (100 - 100 / (1 + rs)).fillna(50).iloc[-1]
+    rsi_series = 100 - 100 / (1 + rs)
+    # 修复: 连续上涨(无下跌日)时 RSI 应为 100, 原 fillna(50) 会把强势行情误判中性
+    no_loss = (loss == 0) & (gain > 0)
+    rsi_series = rsi_series.where(~no_loss, 100.0)
+    rsi = float(rsi_series.fillna(50.0).iloc[-1])   # 窗口不足(NaN) → 中性50
     rsi_overbought = bool(rsi > 70)
     rsi_oversold = bool(rsi < 30)
 
@@ -107,9 +111,16 @@ def compute_technical_features(bars: List[Dict[str, Any]],
     max_drawdown_60d = float(drawdown.min())
 
     # ---------------- 动量 ----------------
-    mom_5 = float(close.iloc[-1] / close.iloc[-6] - 1) if len(close) > 6 else 0.0
-    mom_20 = float(close.iloc[-1] / close.iloc[-21] - 1) if len(close) > 21 else 0.0
-    mom_60 = float(close.iloc[-1] / close.iloc[-61] - 1) if len(close) > 61 else 0.0
+    # 修复: 补齐 10/15/30 日动量 —— 轮动策略 mom_window 可配 10/15/30,
+    # 原实现只有 5/20/60, 其余窗口读不到动量恒为0, 整批参数组合静默不交易
+    def _mom(n: int) -> float:
+        return float(close.iloc[-1] / close.iloc[-n - 1] - 1) if len(close) > n else 0.0
+    mom_5 = _mom(5)
+    mom_10 = _mom(10)
+    mom_15 = _mom(15)
+    mom_20 = _mom(20)
+    mom_30 = _mom(30)
+    mom_60 = _mom(60)
 
     # ---------------- 成交量 ----------------
     vol_ma5 = float(volume.rolling(5).mean().iloc[-1]) if len(volume) >= 5 else 0.0
@@ -172,7 +183,8 @@ def compute_technical_features(bars: List[Dict[str, Any]],
         "volatility_20d": vol_20, "volatility_5d": vol_5,
         "max_drawdown_60d": max_drawdown_60d,
         # 动量
-        "momentum_5d": mom_5, "momentum_20d": mom_20, "momentum_60d": mom_60,
+        "momentum_5d": mom_5, "momentum_10d": mom_10, "momentum_15d": mom_15,
+        "momentum_20d": mom_20, "momentum_30d": mom_30, "momentum_60d": mom_60,
         # 量能
         "volume_ratio": vol_ratio, "amount_ma5": amount_ma5, "amount_ma20": amount_ma20,
         # 执行参考
@@ -232,4 +244,61 @@ def compute_money_flow_features(flow: Dict[str, Any]) -> Dict[str, Any]:
         "super_inflow": super_,
         "flow_score": 100.0 if main > 0 else 0.0,       # 简化: 净流入方向打分
         "flow_direction": "in" if main > 0 else "out",
+    }
+
+
+def compute_intraday_features(minute_bars: List[Dict[str, Any]],
+                              prev_close: Optional[float] = None,
+                              latest: Optional[float] = None) -> Dict[str, Any]:
+    """当日分时特征(喂给 Agent 的分时信息, 与日K特征互补)。
+
+    分钟数据由腾讯今日分时提供(1分钟粒度, 价格+成交量)。
+    产出: 当日涨跌/振幅/均价偏离/上午下午强弱/尾盘放量/分时点数。
+    """
+    if not minute_bars:
+        return {"available": False, "point_count": 0}
+    closes = [_f(b.get("close")) for b in minute_bars if _f(b.get("close")) > 0]
+    vols = [_f(b.get("volume")) for b in minute_bars]
+    if not closes:
+        return {"available": False, "point_count": 0}
+    times = [str(b.get("bar_time", ""))[11:16] for b in minute_bars]
+    last_price = closes[-1]
+    hi, lo = max(closes), min(closes)
+    cum_turn = sum(c * v for c, v in zip(closes, vols))
+    cum_vol = sum(vols)
+    vwap = cum_turn / cum_vol if cum_vol else last_price
+
+    # 上午/下午(11:30为界)
+    morning = [c for c, t in zip(closes, times) if t and t <= "11:30"]
+    afternoon = [c for c, t in zip(closes, times) if t and t > "11:30"]
+    base = prev_close if prev_close and prev_close > 0 else (closes[0] if len(closes) > 1 else last_price)
+
+    def _ret(seg):
+        return (seg[-1] / seg[0] - 1) if len(seg) > 1 else 0.0
+
+    # 尾盘强弱: 最后30分钟 vs 前30分钟 成交量占比
+    n = len(vols)
+    last30 = sum(vols[-30:]) if n > 30 else sum(vols)
+    first30 = sum(vols[:30]) if n > 30 else 0
+    vol_tail = (last30 / first30 - 1) if first30 > 0 else 0.0
+    avg_min_vol = (sum(vols) / n) if n else 0.0
+    last_min_vol = vols[-1] if vols else 0.0
+
+    return {
+        "available": True,
+        "point_count": len(closes),
+        "latest_price": round(last_price, 4),
+        "prev_close": round(base, 4),
+        "day_change_pct": round((last_price / base - 1) * 100, 2) if base else 0.0,
+        "intraday_high": round(hi, 4),
+        "intraday_low": round(lo, 4),
+        "intraday_amplitude_pct": round((hi / lo - 1) * 100, 2) if lo else 0.0,
+        "vwap": round(vwap, 4),
+        "price_vs_vwap_pct": round((last_price / vwap - 1) * 100, 2) if vwap else 0.0,
+        "morning_change_pct": round(_ret(morning) * 100, 2),
+        "afternoon_change_pct": round(_ret(afternoon) * 100, 2),
+        "tail_volume_ratio": round(vol_tail, 2),
+        "last_minute_volume_ratio": round(last_min_vol / avg_min_vol, 2) if avg_min_vol else 0.0,
+        "trend": "强势" if (last_price > vwap and vol_tail > 0.2)
+        else ("弱势" if (last_price < vwap and vol_tail < -0.2) else "震荡"),
     }

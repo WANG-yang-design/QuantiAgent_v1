@@ -12,10 +12,7 @@ __pycache__/
 
 # ===== 日志/缓存/运行时数据 =====
 logs/
-data/etf_spot_cache.json
-data/charts/
-data/*.db
-data/*.sqlite
+data/
 
 # ===== 前端构建产物 =====
 frontend/node_modules/

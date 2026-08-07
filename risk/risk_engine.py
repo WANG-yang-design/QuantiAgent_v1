@@ -126,19 +126,39 @@ class RiskEngine:
         result.warnings = warnings
 
         # 确认分级(文档 14): ≤1000元低风险自动 / ≤5000元中风险邮件界面确认 / 高风险禁止
+        # 修复: 原实现"高风险=一律REJECT", 导致:
+        #   1) 交易员标注 human_confirm_required 的计划(主动要求人工确认)被直接拒绝,
+        #      人工确认队列永远为空, 用户无法干预;
+        #   2) 高风险 SELL(止损/止盈/轮动离场)也被拒绝, 仓位无法退出。
+        #   现改为: 人工确认标注或卖出单 → CONFIRM_REQUIRED(人工确认时附带分析原因);
+        #   仅买入类高风险才 REJECT。
         amount = float(plan.get("order_amount", 0) or 0)
         risk_level = self._risk_level(plan, features, etf_features)
         result.risk_level = risk_level
         cp = self.cfg.get("confirmation_policy", {})
+        action = str(plan.get("action", "HOLD")).upper()
+        forced_confirm = bool(plan.get("human_confirm_required"))
 
-        if risk_level == "HIGH" or model.get("result") == "REJECT":
+        if model.get("result") == "REJECT":
             result.result = "REJECT"
-            result.blocked_reason = model.get("reason") or "高风险交易禁止执行"
-        elif plan.get("confidence", 0) < float(self.cfg.get("model_level.min_confidence", 0.55)):
+            result.blocked_reason = model.get("reason") or "交易计划缺少解释(不可解释不得自动交易)"
+        elif forced_confirm:
+            result.result = "CONFIRM_REQUIRED"
+            result.blocked_reason = "交易员标注需人工确认(特殊情况/高风险)"
+        elif risk_level == "HIGH" and action != "SELL":
+            result.result = "REJECT"
+            result.blocked_reason = "高风险交易禁止执行"
+        elif risk_level == "HIGH":
+            # 高风险卖出(止损/止盈/减仓): 离场保护动作, 交人工确认而非直接拒绝
+            result.result = "CONFIRM_REQUIRED"
+            result.blocked_reason = f"高风险卖出(等级{risk_level}), 需人工确认"
+        elif plan.get("confidence", 0) < float(
+                (self.cfg.get("model_level") or {}).get("min_confidence", 0.55)):
             result.result = "CONFIRM_REQUIRED"
             result.blocked_reason = "模型置信度低于自动交易阈值"
         elif risk_level == "MEDIUM":
             result.result = "CONFIRM_REQUIRED"
+            result.blocked_reason = "中风险交易, 需要人工确认"
         elif amount <= float(cp.get("auto_execute", {}).get("max_order_amount", 1000)):
             result.result = "APPROVE"          # 低风险+小额 → 自动
             # 降仓: 把金额折半等保护性动作由交易员回传
@@ -149,13 +169,27 @@ class RiskEngine:
             result.approved_amount = amount
             result.approved_quantity = plan.get("estimated_quantity", 0)
 
-        # REDUCE: 若账户层或标的层有"降仓建议"
-        if sym.get("reduce_to"):
+        # REDUCE: 仅当尚未被 REJECT/CONFIRM_REQUIRED 时生效
+        # (降仓是保护动作, 但不能绕过"需要人工确认"的分级)
+        if sym.get("reduce_to") and result.result not in ("REJECT", "CONFIRM_REQUIRED"):
             result.result = "REDUCE"
             ratio = float(sym["reduce_to"])
             result.approved_amount = round(amount * ratio, 2)
-            result.approved_quantity = int(plan.get("estimated_quantity", 0) * ratio)
-            result.warnings.append(f"标的层降仓至 {ratio:.0%}: {sym.get('reason', '')}")
+            # 修复: 原实现按比例折算数量不做整手对齐, 非100整数倍的
+            # 降仓数量被合规层 BLOCKED, 降仓计划必被拒。向下取整到交易单位。
+            qty = int(plan.get("estimated_quantity", 0) * ratio)
+            lot = int((get_settings().section("trading_rules").get("lot", {}) or {}).get("etf", 100))
+            result.approved_quantity = qty // lot * lot
+            if result.approved_quantity < lot:
+                result.result = "REJECT"
+                result.blocked_reason = f"降仓后数量{result.approved_quantity}不足1手({lot}), 拒绝"
+            else:
+                result.warnings.append(f"标的层降仓至 {ratio:.0%}: {sym.get('reason', '')}")
+
+        # 需人工确认时把原因写入 warnings(前端链路页可直接看到分析原因)
+        if result.result == "CONFIRM_REQUIRED" and result.blocked_reason \
+                and result.blocked_reason not in result.warnings:
+            result.warnings.append(f"需人工确认: {result.blocked_reason}")
 
         return self._finalize(plan, result)
 
@@ -195,6 +229,10 @@ class RiskEngine:
         out = {"result": "PASS", "warnings": []}
 
         if action == "BUY":
+            if total_asset <= 0:
+                # 账户未初始化(无行情估值)时无法判断比率 → 放行, 由订单层资金校验兜底
+                out["warnings"].append("账户总资产为0, 跳过账户比率检查")
+                return out
             # 总仓位检查
             market_value = float(account_view.get("market_value", 0) or 0)
             total_position = (market_value + float(plan.get("order_amount", 0))) / total_asset
@@ -224,8 +262,12 @@ class RiskEngine:
         symbol = plan.get("symbol", "")
         action = plan.get("action", "HOLD")
         if symbol in sym_cfg.get("blacklist", []):
-            out["result"] = "REJECT"
-            out["reason"] = f"{symbol} 在黑名单中"
+            if action == "BUY":
+                out["result"] = "REJECT"
+                out["reason"] = f"{symbol} 在黑名单中"
+            else:
+                # 卖出必须放行: 黑名单标的需要能止损离场
+                out["warnings"].append(f"{symbol} 在黑名单中(卖出放行)")
             return out
         # ETF 溢价禁止(仅买入; 卖出不受溢价限制)
         if etf_features and action == "BUY":
@@ -240,11 +282,20 @@ class RiskEngine:
                 out["reduce_to"] = 0.5
                 out["reason"] = "流动性不足降仓"
         # 波动率限制(仅买入; 卖出止损不受波动率拦截)
+        # 修复: volatility_20d 是年化值(×√252), 策略 max_vol 默认50%。
+        # 原实现用 0.035 当阈值, 28.7%年化波动的标的全部被拒, 与策略严重不一致。
+        # 现在以轮动策略的 active max_vol 为准(改策略自动跟随), yaml 可覆盖。
         if features and action == "BUY":
             vol = float(features.get("volatility_20d", 0) or 0)
-            if vol > float(sym_cfg.get("max_volatility", 0.035)):
+            try:
+                from strategies.rotation_executor import load_rotation_params
+                _vol_default = float(load_rotation_params().get("max_vol", 0.5) or 0.5)
+            except Exception:
+                _vol_default = 0.5
+            vol_limit = float(sym_cfg.get("max_volatility", _vol_default))
+            if vol > vol_limit:
                 out["result"] = "REJECT"
-                out["reason"] = f"20日波动率{vol:.1%}超过上限, 禁止买入"
+                out["reason"] = f"20日波动率{vol:.1%}超过上限{vol_limit:.0%}, 禁止买入"
                 return out
             amount = float(features.get("amount_ma20", 0) or 0)
             if amount and amount < float(sym_cfg.get("min_avg_amount_20d", 3e7)):
@@ -260,17 +311,22 @@ class RiskEngine:
         out = {"result": "PASS", "warnings": []}
         amount = float(plan.get("order_amount", 0) or 0)
         qty = int(plan.get("estimated_quantity", 0) or 0)
-        if amount > float(ord_cfg.get("max_order_amount", 20000)):
+        if plan.get("action") != "SELL" and amount > float(ord_cfg.get("max_order_amount", 20000)):
             out["result"] = "REJECT"
             out["reason"] = f"单笔金额{amount:.0f}超过上限{ord_cfg.get('max_order_amount')}"
             return out
+        if plan.get("action") == "SELL" and amount > float(ord_cfg.get("max_order_amount", 20000)):
+            # 卖出(止损/止盈/减仓)不受单笔金额上限约束, 但记录告警
+            out["warnings"].append(f"卖出金额{amount:.0f}超过常规限额(止损放行)")
         if qty > int(ord_cfg.get("max_order_quantity", 1000000)):
             out["result"] = "REJECT"
             out["reason"] = "单笔数量超限"
             return out
         # 价格偏离保护(方向性):
         #   BUY : 限价高于现价 2% 拒绝(防追高/手误)
-        #   SELL: 限价低于现价 5% 拒绝(防手误低价贱卖); 正常止损价放行
+        #   SELL: 限价低于现价 2% 拒绝(防手误低价贱卖)
+        # 修复: 止损/止盈/风控降仓类卖出用放宽阈值 —— 行情急跌时快照
+        # 陈旧的止损限价会被原规则误拒, 止损单永远无法提交
         limit_price = float(plan.get("limit_price", 0) or 0)
         if features and limit_price > 0:
             close = float(features.get("close", 0) or 0)
@@ -281,9 +337,12 @@ class RiskEngine:
                     out["reason"] = f"买入限价高于最新价{dev:.2%}超过2%"
                     return out
                 if plan.get("action") == "SELL" and dev < -float(ord_cfg.get("max_price_deviation", 0.02)):
-                    out["result"] = "REJECT"
-                    out["reason"] = f"卖出限价低于最新价{abs(dev):.2%}超过2%"
-                    return out
+                    is_stop = any(kw in " ".join(plan.get("reasons", []) or [])
+                                  for kw in ("止损", "止盈", "降仓", "风控"))
+                    if not is_stop:
+                        out["result"] = "REJECT"
+                        out["reason"] = f"卖出限价低于最新价{abs(dev):.2%}超过2%"
+                        return out
         # 卖出可用数量(T+1: 不能卖超过可用)
         if plan.get("action") == "SELL":
             positions = account_view.get("positions") or []
@@ -330,7 +389,14 @@ class RiskEngine:
             score += 1
         if features:
             vol = float(features.get("volatility_20d", 0) or 0)
-            if vol > 0.03:
+            # 修复: 年化口径与策略一致(原 0.03 把28.7%年化波动也算高风险,
+            # 几乎所有买入都被评为 MEDIUM 需人工确认)
+            try:
+                from strategies.rotation_executor import load_rotation_params
+                _vmax = float(load_rotation_params().get("max_vol", 0.5) or 0.5)
+            except Exception:
+                _vmax = 0.5
+            if vol > _vmax:
                 score += 1
         if etf_features and float(etf_features.get("premium_rate", 0) or 0) > 0.02:
             score += 1

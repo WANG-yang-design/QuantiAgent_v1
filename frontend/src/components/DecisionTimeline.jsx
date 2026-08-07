@@ -1,6 +1,14 @@
 import { useState } from "react";
 import { api } from "../api/client";
 
+/** 首席研究员结论 → 中文+配色(修复: 决策结论不明显, 只有英文缩写) */
+const DEC_META = {
+  BUY_CANDIDATE: { label: "买入候选", cls: "bg-red-50 text-red-600 border-red-200" },
+  SELL_CANDIDATE: { label: "卖出候选", cls: "bg-green-50 text-green-600 border-green-200" },
+  HOLD: { label: "持有观望", cls: "bg-gray-100 text-gray-600 border-gray-200" },
+  EXCLUDE: { label: "排除", cls: "bg-gray-100 text-gray-400 border-gray-200" },
+};
+
 /**
  * 决策链路时间线: 展示一次工作流 trace 的完整 Agent 节点链
  * nodes: [{agent, status, cost, model, output, error}]
@@ -26,19 +34,24 @@ const AGENT_META = {
 
 function summarize(node) {
   const o = node.output || {};
+  // 标的中文名(修复: 决策链路只显示代码, 股票名常为空)
+  const nm = node.symbol_name || o?.name || "";
+  const sym = node.symbol || o?.symbol || "";
+  const label = nm ? `${sym} ${nm}` : sym;
   if (node.agent === "chief_researcher")
     return `结论: ${o.research_decision} · 置信 ${(o.confidence * 100)?.toFixed(0)}% · 评分 ${o.score?.toFixed(0)}`;
   if (node.agent === "risk_manager")
     return `风控: ${o.risk_decision} · 等级 ${o.risk_level}${o.blocked_reason ? " · " + o.blocked_reason : ""}`;
   if (node.agent === "trader")
-    return `${o.action} ${o.symbol} ${o.estimated_quantity}份 @ ${o.limit_price ?? "市价"} · 金额 ${o.order_amount?.toFixed(0)}`;
+    return `${o.action} ${label} ${o.estimated_quantity}份 @ ${o.limit_price ?? "市价"} · 金额 ${o.order_amount?.toFixed(0)}`;
   if (node.agent === "compliance")
     return `合规: ${o.compliance_status}${o.reason ? " · " + o.reason : ""}`;
   if (node.agent === "data_admin")
     return `数据: ${o.data_status}${o.blocked_reason ? " · " + o.blocked_reason : ""}`;
   if (o.agent && o.view)
     return `${o.agent} · ${o.view} · 评分 ${o.score?.toFixed(0)} · 置信 ${(o.confidence * 100)?.toFixed(0)}%`;
-  return JSON.stringify(o).slice(0, 80) || "-";
+  const s = JSON.stringify(o).slice(0, 80);
+  return s || "-";
 }
 
 function statusBadge(status) {
@@ -67,6 +80,11 @@ export default function DecisionTimeline({ trace }) {
               onClick={() => setExpanded(exp ? null : i)}
             >
               <span className={`badge ${meta.color}`}>{meta.label}</span>
+              {n.agent === "chief_researcher" && n.output?.research_decision && (
+                <span className={`badge border shrink-0 ${(DEC_META[n.output.research_decision] || { cls: "bg-gray-100 text-gray-600 border-gray-200" }).cls}`}>
+                  {(DEC_META[n.output.research_decision] || { label: n.output.research_decision }).label}
+                </span>
+              )}
               <span className="flex-1 text-xs text-gray-600 truncate">{summarize(n)}</span>
               {statusBadge(n.status)}
               <span className="text-[10px] text-gray-400">

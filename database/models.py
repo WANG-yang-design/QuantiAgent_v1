@@ -293,6 +293,9 @@ class AgentRun(Base):
     status: Mapped[str] = mapped_column(String(12), default="RUNNING")  # RUNNING/OK/FAILED
     model_name: Mapped[str] = mapped_column(String(48), default="")
     error: Mapped[str] = mapped_column(Text, default="")
+    # LLM 真实用量(修复: 输出token是成本大头, 必须可统计审计)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AgentOutput(Base):
@@ -448,7 +451,9 @@ class Order(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     order_id: Mapped[str] = mapped_column(String(32), unique=True)
-    order_intent_id: Mapped[str] = mapped_column(String(32), unique=True)  # 幂等键
+    # 修复: 原 String(32) 放不下 "INTENT-DEC<18位>"(35)与"INTENT-PM-xxx-降仓-20260805#HHMMSSffffff"(48),
+    # 重报单/人工确认下单时 INSERT 直接 StringDataRightTruncation 报错, 订单永远下不去
+    order_intent_id: Mapped[str] = mapped_column(String(64), unique=True)  # 幂等键
     plan_id: Mapped[str] = mapped_column(String(32), default="")
     account_id: Mapped[str] = mapped_column(String(32), default="PA-001")
     symbol: Mapped[str] = mapped_column(String(12))
@@ -479,10 +484,12 @@ class Trade(Base):
     trade_id: Mapped[str] = mapped_column(String(32), unique=True)
     order_id: Mapped[str] = mapped_column(String(32), index=True)
     symbol: Mapped[str] = mapped_column(String(12))
+    name: Mapped[str] = mapped_column(String(64), default="")   # 成交时标的中文名
     side: Mapped[str] = mapped_column(String(8))
     price: Mapped[float] = mapped_column(Float, default=0)
     qty: Mapped[int] = mapped_column(Integer, default=0)
     fee: Mapped[float] = mapped_column(Float, default=0)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)  # 已实现盈亏(卖出时按成本价计算)
     trade_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

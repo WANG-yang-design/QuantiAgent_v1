@@ -72,15 +72,22 @@ class DataAdminAgent(BaseAgent):
         if self.llm.is_mock():
             return {"data_status": "PASS", "warnings": warnings, "blocked_reason": None}
 
-        result = await self.call_llm(
-            f"数据质量检查结果:\n" + "\n".join(str(w) for w in quality_reports),
-            schema=DataAdminOutput)
-        # 硬规则兜底: 以规则结论为准(文档: 硬规则负责风控边界)
-        result["data_status"] = "PASS"
-        result["blocked_reason"] = None
-        if not warnings:
-            result["warnings"] = result.get("warnings") or []
-        return result
+        try:
+            result = await self.call_llm(
+                f"数据质量检查结果:\n" + "\n".join(str(w) for w in quality_reports),
+                schema=DataAdminOutput)
+            # 硬规则兜底: 以规则结论为准(文档: 硬规则负责风控边界)
+            result["data_status"] = "PASS"
+            result["blocked_reason"] = None
+            if not warnings:
+                result["warnings"] = result.get("warnings") or []
+            return result
+        except Exception as exc:
+            # 修复: LLM 故障不应拖死整个投研/交易链路 —— 结论由硬规则决定,
+            # LLM 只负责警告润色, 失败时降级返回规则结论
+            logger = __import__("logging").getLogger("agent.data_admin")
+            logger.warning("数据闸门 LLM 润色失败, 降级为规则结论: %s", exc)
+            return {"data_status": "PASS", "warnings": warnings, "blocked_reason": None}
 
     # 模拟输出: 直接复用规则结果, 不让 LLM 参与
     def mock_output(self, input_data: AgentInput) -> Dict[str, Any]:

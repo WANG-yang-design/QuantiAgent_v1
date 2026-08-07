@@ -1,21 +1,29 @@
 # =========================================================
 # 数据源配置: 主源 + 备源 + 多源比对阈值
 # 主源失败自动切换备源; 多源冲突触发 CONFLICT 质量标签
+#
+# 2026-08 修复: 东财/akshare 依赖的系统代理在本机不可用导致
+# 数据获取几乎全部失败, 主源切换为直连/免费稳定通道:
+#   - 日K:     baostock(前复权, 盘中即含当日K线)
+#   - 分钟K:   tencent(今日分时实时) + baostock(历史)
+#   - 实时行情: tencent(qt.gtimg.cn CDN直连, 无代理)
+#   - 盘口:     tencent(内置买卖五档)
+#   - 全市场ETF列表/新闻/舆情: 仍用 akshare(有磁盘缓存)
 # =========================================================
 
 sources:
   daily_bar:
-    primary: akshare
-    backups: [sina, eastmoney, tushare]
+    primary: baostock
+    backups: [akshare, tencent, sina]
   minute_bar:
-    primary: akshare
-    backups: [eastmoney]
+    primary: tencent
+    backups: [baostock, akshare]
   realtime_quote:
-    primary: akshare
-    backups: [eastmoney, sina]
+    primary: tencent
+    backups: [eastmoney, sina, akshare]
   order_book:
-    primary: eastmoney
-    backups: [akshare]
+    primary: tencent
+    backups: [eastmoney, akshare]
   money_flow:
     primary: eastmoney
     backups: [akshare]
@@ -29,8 +37,8 @@ sources:
     primary: akshare
     backups: []
   trade_calendar:
-    primary: akshare
-    backups: [tushare]
+    primary: baostock
+    backups: [akshare, tushare]
   etf_info:
     primary: akshare
     backups: []

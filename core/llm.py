@@ -14,6 +14,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+import threading
 import time
 from typing import Any, Dict, List, Optional, Type
 
@@ -39,23 +41,53 @@ class LLMClient:
         self.settings = get_settings()
         llm = self.settings.section("llm")
         self.mock = self.settings.mock_mode()
-        self.client: Optional[AsyncOpenAI] = None
-        if not self.mock:
-            self.client = AsyncOpenAI(
-                base_url=llm.get("base_url") or None,
-                api_key=llm.get("api_key") or "EMPTY",
-                timeout=llm.get("timeout_seconds", 60),
-                max_retries=0,  # 由本类自控重试
-            )
+        # 修复: 原实现用单例 AsyncOpenAI 客户端跨事件循环复用 —— 调度器/Web
+        # 各自线程 asyncio.run() 每次新建并关闭 loop, httpx 连接池绑定首个
+        # 使用它的 loop, 后续请求抛 "Event loop is closed", 所有 Agent 的
+        # LLM 调用静默失败, 交易链路停止。改为按事件循环惰性创建/复用。
+        self._clients: Dict[int, Any] = {}   # id(loop) -> (loop, AsyncOpenAI)
+        self._client_lock = threading.Lock()
         self.fast_model = llm.get("fast_model") or "fast-model"
         self.deep_model = llm.get("deep_model") or "deep-model"
         self.embedding_model = llm.get("embedding_model") or ""
         self.temperature = float(llm.get("temperature", 0.2))
         self.max_retries = int(llm.get("max_retries", 3))
+        # 修复: 原 2048 上限让模型每调用最多可生成 2000+ 输出token,
+        # 模型常在 JSON 外夹带解释文字(被 regex 剥离但已计费),
+        # 2500 次调用 → 输出 token 高达 200 万+。收紧到 1024 并配
+        # 紧凑系统提示(列表字段已由 Prompt 限幅), 输出成本约降一半。
+        self.max_tokens = int(llm.get("max_tokens", 1024) or 1024)
+        self.max_concurrent = max(int(llm.get("max_concurrent", 5) or 5), 1)
+        self._in_flight = 0            # 在途请求计数(简单并发门控)
         self.cost_log = bool(llm.get("cost_log", True))
         self.total_cost = 0.0      # 累计成本(估算)
         self.call_count = 0
         self.fail_count = 0
+
+    # ---------------------------------------------------------------
+    def _client_for(self):
+        """获取当前事件循环对应的 AsyncOpenAI 客户端(惰性创建)。"""
+        import asyncio
+        loop = asyncio.get_running_loop()
+        if loop.is_closed():
+            raise LLMError("当前事件循环已关闭")
+        key = id(loop)
+        with self._client_lock:
+            entry = self._clients.get(key)
+            if entry is not None and entry[0] is loop:
+                return entry[1]
+            # 清理已关闭 loop 的旧客户端, 防止连接池泄漏
+            for k in [k for k, (l, _) in list(self._clients.items()) if l is not loop and l.is_closed()]:
+                del self._clients[k]
+            llm = self.settings.section("llm")
+            client = AsyncOpenAI(
+                base_url=llm.get("base_url") or None,
+                api_key=llm.get("api_key") or "EMPTY",
+                timeout=llm.get("timeout_seconds", 60),
+                max_retries=0,  # 由本类自控重试
+            )
+            self._clients[key] = (loop, client)
+            return client
 
     # ---------------------------------------------------------------
     def is_mock(self) -> bool:
@@ -68,11 +100,18 @@ class LLMClient:
     def get_model(self, task: str = "fast") -> str:
         """
         按任务路由模型: deep 任务用深模型, 其余用快模型。
+        task 传 Agent 名(如 "trader"/"news_analyst"), 通过 model_routes.agent_task_map
+        映射到 fast/deep; 也兼容直接传语义任务名(如 "bull_bear_debate")或字面 fast/deep。
+        修复: 原实现拿字面 "fast"/"deep" 与语义任务名集合比对, 深模型路由永远失效。
         容错: 深模型未配置时自动回退快模型(避免请求不存在的模型名)。
         """
-        deep_tasks = set(self.settings.section("model_routes").get("deep_model_tasks", []))
-        if task in deep_tasks and self.deep_model and self.deep_model not in ("deep-model", ""):
-            return self.deep_model
+        routes = self.settings.section("model_routes") or {}
+        agent_map = routes.get("agent_task_map", {}) or {}
+        route = str(agent_map.get(task, task))
+        deep_tasks = set(routes.get("deep_model_tasks", []))
+        if route == "deep" or task in deep_tasks:
+            if self.deep_model and self.deep_model not in ("deep-model", ""):
+                return self.deep_model
         return self.fast_model
 
     # ---------------------------------------------------------------
@@ -82,16 +121,17 @@ class LLMClient:
         task: str = "fast",
         schema: Optional[Type[BaseModel]] = None,
         temperature: Optional[float] = None,
+        usage_cb=None,
     ) -> Dict[str, Any]:
         """
         发起一次聊天补全并返回结构化 JSON dict。
         - schema: Pydantic 模型, 输出会按其字段校验;
+        - usage_cb: 回调(prompt_tokens, completion_tokens), 供落库统计真实用量;
         - 返回 dict 已通过 schema 校验(字段合法)。
         """
         if self.mock:
             return self._mock_complete(messages, schema)
-        if self.client is None:
-            raise LLMError("LLM 未配置且非模拟模式")
+        client = self._client_for()
 
         model = self.get_model(task)
         prompt_json = json.dumps(self._schema_hint(schema), ensure_ascii=False)
@@ -100,8 +140,11 @@ class LLMClient:
             "role": "system",
             "content": (
                 "你是一个严谨的量化交易系统智能体。请只输出一个 JSON 对象, "
-                f"不要输出任何其他文字。输出必须匹配以下 JSON Schema:\n{prompt_json}\n"
+                "不要输出任何其他文字、解释、思考过程或 markdown 代码块。"
+                f"输出必须匹配以下 JSON Schema:\n{prompt_json}\n"
                 "所有数值必须为有限数字, 字符串不能为空。"
+                "输出必须紧凑: 列表字段按 Schema 中的字段名给出最少必要条数, "
+                "每条文字尽量短, 总输出控制在 600 token 以内。"
             )
         }
         msgs = [sys_msg] + list(messages)
@@ -109,16 +152,33 @@ class LLMClient:
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await self.client.chat.completions.create(
-                    model=model,
-                    messages=msgs,
-                    temperature=temperature if temperature is not None else self.temperature,
-                    response_format={"type": "json_object"},
-                )
+                # 简单并发门控: 超过在途上限时等待(防止 7 分析师并行+池扫描 触发 ~35 路并发)
+                while self._in_flight >= self.max_concurrent:
+                    await asyncio.sleep(0.2)
+                self._in_flight += 1
+                try:
+                    resp = await client.chat.completions.create(
+                        model=model,
+                        messages=msgs,
+                        temperature=temperature if temperature is not None else self.temperature,
+                        max_tokens=self.max_tokens,
+                        response_format={"type": "json_object"},
+                    )
+                finally:
+                    self._in_flight -= 1
                 self.call_count += 1
                 self.fail_count = 0
                 content = resp.choices[0].message.content or "{}"
                 data = self._parse_and_validate(content, schema)
+                # 真实用量上报(供审计/成本统计落库)
+                if usage_cb is not None:
+                    try:
+                        usage = resp.usage
+                        if usage is not None:
+                            usage_cb(int(usage.prompt_tokens or 0),
+                                     int(usage.completion_tokens or 0))
+                    except Exception:
+                        pass
                 self._log_cost(resp, model, data)
                 return data
             except Exception as e:  # noqa: BLE001
@@ -130,9 +190,11 @@ class LLMClient:
                         "role": "user",
                         "content": f"你的输出不符合要求: {e}\n请重新输出严格的 JSON。",
                     }]
+                # 重试分类: 网络/超时/服务端错误才重试; 4xx 客户端错误不重试(白等)
+                retriable = self._is_retriable_error(e)
                 logger.warning("LLM 调用失败(第%d次): %s", attempt + 1, e)
-                if attempt < self.max_retries:
-                    await asyncio.sleep(2 ** attempt)
+                if attempt < self.max_retries and retriable:
+                    await asyncio.sleep(2 ** attempt + (time.time() % 0.5))   # 退避+jitter
 
         # 连续失败告警交给 notification 层(通过 audit 事件)
         from memory.audit_log import AuditLogger
@@ -143,6 +205,73 @@ class LLMClient:
         raise LLMError(f"LLM 调用失败: {last_err}")
 
     # ---------------------------------------------------------------
+    @staticmethod
+    def _is_retriable_error(e: Exception) -> bool:
+        """是否值得重试: 网络/超时/服务端 5xx 重试; 4xx 客户端错误不重试。"""
+        name = type(e).__name__.lower()
+        if isinstance(e, (json.JSONDecodeError, ValueError)):
+            return True   # 输出格式问题: 反馈后让模型重出
+        if any(k in name for k in ("apiconnection", "apitimeout", "timeout",
+                                   "apiconnectionerror", "internal")):
+            return True
+        code = getattr(e, "status_code", None) or getattr(e, "code", None)
+        try:
+            code = int(code or 0)
+        except (TypeError, ValueError):
+            code = 0
+        return code >= 500 or code == 429 or code == 0
+
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _repair_json(content: str) -> str:
+        """修复模型输出的常见截断(修复: "Unterminated string" 一类失败):
+        1. 若内容截断在未闭合字符串内 → 从该字符串起点起补成 ""(结构合法);
+        2. 括号未闭合 → 按开闭顺序补全右括号([→], {→})。"""
+        s = content.rstrip()
+        # 1. 字符串状态跟踪: 若扫描结束仍在字符串内, 说明被截断
+        in_str = False
+        esc = False
+        last_open = -1
+        for i, ch in enumerate(s):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                if in_str:
+                    in_str = False
+                else:
+                    in_str = True
+                    last_open = i
+        if in_str and last_open >= 0:
+            s = s[:last_open] + '""'
+        # 2. 括号补齐(跳过字符串内的括号)
+        stack = []
+        in_str = False
+        esc = False
+        for ch in s:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "[{":
+                stack.append("]" if ch == "[" else "}")
+            elif ch in "]}":
+                if stack:
+                    stack.pop()
+        if stack:
+            s += "".join(reversed(stack))
+        return s
+
     def _parse_and_validate(self, content: str, schema: Optional[Type[BaseModel]]) -> Dict[str, Any]:
         # 容错: 去掉可能的 ```json 包裹
         content = content.strip()
@@ -150,7 +279,21 @@ class LLMClient:
             content = content.strip("`")
             if content.startswith("json"):
                 content = content[4:]
-        data = json.loads(content)
+                content = content.strip()
+        # 容错: 提取首个 { ... } 块(容忍模型输出前后缀文字)
+        if not content.startswith("{"):
+            m = re.search(r"\{.*\}", content, re.S)
+            if m:
+                content = m.group(0)
+        # 容错: 修复尾逗号(对象与数组)
+        content = re.sub(r",\s*([}\]])", r"\1", content)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # 修复: 输出被 max_tokens 截断(Unterminated string / 括号未闭合)时
+            # 先尝试自动修复再判失败, 显著降低"LLM 调用失败"节点数
+            repaired = self._repair_json(content)
+            data = json.loads(repaired)
         if schema is not None:
             model = schema.model_validate(data)   # 字段级校验
             return model.model_dump()
@@ -188,7 +331,8 @@ class LLMClient:
         if self.mock or not self.embedding_model:
             return [self._hash_embed(t) for t in texts]
         try:
-            resp = await self.client.embeddings.create(model=self.embedding_model, input=texts)
+            client = self._client_for()
+            resp = await client.embeddings.create(model=self.embedding_model, input=texts)
             return [d.embedding for d in resp.data]
         except Exception as e:
             logger.warning("embedding 接口失败, 降级为哈希向量: %s", e)

@@ -27,17 +27,46 @@ setup_logging()
 logger = get_logger("database.init")
 
 
+def _ensure_columns():
+    """轻量迁移: 为已存在的表补充新增列(Postgres ADD COLUMN IF NOT EXISTS)。
+    create_all 不会改动已有表, 新功能依赖的新列在此补齐, 幂等可重复执行。"""
+    statements = [
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS name VARCHAR(64) DEFAULT ''",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT",
+        # 修复: 订单幂等键超长(INTENT-DEC...+重报后缀超过32字符)导致下单失败
+        "ALTER TABLE orders ALTER COLUMN order_intent_id TYPE VARCHAR(64)",
+        # LLM 真实用量统计(输出token是成本大头)
+        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER DEFAULT 0",
+        "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER DEFAULT 0",
+    ]
+    with get_engine().connect() as conn:
+        for stmt in statements:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception as e:
+                logger.warning("列补齐失败(%s): %s", stmt[:60], e)
+
+
 def init_db(seed: bool = True):
     """建表 + 可选种子数据。"""
     engine = get_engine()
     # 1. 确保 vector 扩展可用 (已由 DBA 预建, 这里兜底)
-    with engine.connect() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.commit()
+    #    修复: 托管 PG(RDS等)普通用户无 CREATE EXTENSION 权限,
+    #    原实现直接抛异常中断初始化 —— 改为告警降级(向量功能不可用)
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.commit()
+    except Exception as e:
+        logger.warning("pgvector 扩展创建失败(向量检索将不可用): %s", e)
 
     # 2. 建表
     Base.metadata.create_all(engine)
     logger.info("数据库表结构创建完成")
+
+    # 2.5 轻量迁移(新增列)
+    _ensure_columns()
 
     # 3. HNSW 向量索引 (pgvector 余弦距离)
     try:

@@ -32,15 +32,26 @@ class DataReplayer:
     # ------------------------------------------------------------------
     def trade_dates(self, start: date, end: date) -> List[date]:
         if not self._cal:
-            self._cal = get_market_service().get_trade_calendar(start, end)
-            if not self._cal:   # 数据源失败兜底: 工作日
-                self._cal = []
-                d = start
-                while d <= end:
-                    if d.weekday() < 5:
-                        self._cal.append(d)
-                    d += timedelta(days=1)
+            cal = get_market_service().get_trade_calendar(start, end)
+            if cal:
+                self._cal = cal
+            else:
+                # 修复: 数据源失败时的"工作日"兜底不再写入永久缓存 ——
+                # 原实现节假日被当成交易日, asof 切片无新K线 → 相同数据重复
+                # 产生信号(超量建仓), 且数据源恢复后依然用错误日历。
+                logger.warning("交易日历获取失败, 本次按工作日近似")
+                return [d for d in self._weekdays(start, end)]
         return [d for d in self._cal if start <= d <= end]
+
+    @staticmethod
+    def _weekdays(start: date, end: date) -> List[date]:
+        out = []
+        d = start
+        while d <= end:
+            if d.weekday() < 5:
+                out.append(d)
+            d += timedelta(days=1)
+        return out
 
     # ------------------------------------------------------------------
     def load_all_daily(self, symbol: str, start: date, end: date) -> List[dict]:
@@ -70,12 +81,22 @@ class DataReplayer:
         return norm
 
     @staticmethod
-    def _smooth_ex_dividend(bars: List[dict], jump_threshold: float = 0.78) -> List[dict]:
+    def _smooth_ex_dividend(bars: List[dict], jump_threshold: float = None) -> List[dict]:
         """
         除息平滑: 修正前复权(qfq)数据漏处理的 ETF 分红除息跳变。
-        阈值 ±22%: A股ETF涨跌幅限制为10%(主板)/20%(科创创业), 正常单日极限
-        不会超过±20%; 除息跳变通常≥25%, 不会被误判也不会漏判。
+        阈值语义: 单日跳空幅度超过 ±(1-jump_threshold) 判定为除息跳变并平滑。
+        修复: 原硬编码 0.78(±22%) 会把 ±20% 涨跌幅品种(588xxx/159915等)的
+        真实涨跌停/复牌跳空误判为除息并重算整个后续序列。默认 0.88(±12%)
+        对 10% 品种安全(极限涨跌 0.90/1.111 不触发), 可在 config.yaml
+        backtest.ex_dividend_jump_ratio 调整。
         """
+        if jump_threshold is None:
+            try:
+                from core.config import get_settings
+                jump_threshold = float(get_settings().get(
+                    "backtest.ex_dividend_jump_ratio", 0.88))
+            except Exception:
+                jump_threshold = 0.88
         if not bars:
             return bars
         out: List[dict] = []
@@ -85,7 +106,18 @@ class DataReplayer:
                 prev_close = out[-1]["close"]
                 if prev_close > 0:
                     ratio = b["open"] / prev_close
-                    if ratio < jump_threshold or ratio > (2 - jump_threshold):
+                    # 修复: 阈值按标的涨跌幅动态取 —— ±20% 品种(588/159915等)
+                    # 真实涨跌停跳空 ratio≈0.80/1.20, 原 0.88 阈值会误判为除息,
+                    # 整个后续序列被错误缩放, 系统性污染回测数据。
+                    thr = jump_threshold
+                    try:
+                        from core.symbol_utils import price_limit_pct
+                        limit = price_limit_pct(b.get("symbol", ""), "etf")
+                        if limit >= 0.20:
+                            thr = min(jump_threshold, 0.80)
+                    except Exception:
+                        pass
+                    if ratio < thr or ratio > (2 - thr):
                         # 除息跳变: 按开盘跳空比例调整(把分红算回持仓)
                         factor = prev_close / b["open"]
                         logger.info("检测到除息跳变 %s %s: 昨收%.4f→今开%.4f (%.1f%%), 已平滑",

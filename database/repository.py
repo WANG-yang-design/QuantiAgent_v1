@@ -29,8 +29,10 @@ from database.models import (
 
 def upsert_symbols(symbols: List[Dict[str, Any]]):
     """批量写入/更新标的信息。"""
+    cols = _model_columns(Symbol)
     with get_session() as s:
         for item in symbols:
+            item = {k: v for k, v in item.items() if k in cols}
             sym = s.get(Symbol, item["symbol"])
             if sym is None:
                 s.add(Symbol(**item))
@@ -47,6 +49,14 @@ def get_universe(asset_type: Optional[str] = None) -> List[Symbol]:
         return list(q.all())
 
 
+def get_symbol(symbol: str) -> Optional[Symbol]:
+    """读取单个标的(手续费按资产类型计算等场景用)。"""
+    with get_session() as s:
+        sy = s.query(Symbol).filter_by(symbol=symbol).first()
+        s.expunge(sy) if sy else None
+        return sy
+
+
 # ================================================================
 # 行情
 # ================================================================
@@ -55,8 +65,10 @@ def upsert_daily_bars(bars: List[Dict[str, Any]]):
     """日K批量写入(去重: symbol+date+source)。"""
     if not bars:
         return
+    cols = _model_columns(DailyBar)
     with get_session() as s:
         for b in bars:
+            b = {k: v for k, v in b.items() if k in cols}
             exist = s.query(DailyBar).filter_by(
                 symbol=b["symbol"], trade_date=b["trade_date"],
                 source=b.get("source", "akshare")).first()
@@ -68,7 +80,10 @@ def upsert_daily_bars(bars: List[Dict[str, Any]]):
 
 
 def get_daily_bars(symbol: str, start: date, end: date,
-                   quality: Optional[str] = "VALID") -> List[DailyBar]:
+                   quality: Optional[str] = None) -> List[DailyBar]:
+    """读取日K。多源去重: 同一日期只保留主源行 —— 防止前复权(qfq)与不复权
+    数据混写导致指标/回测被污染。quality=None 时不过滤(ESTIMATED 也返回)。"""
+    from core.config import get_settings
     with get_session() as s:
         q = s.query(DailyBar).filter(
             DailyBar.symbol == symbol,
@@ -77,14 +92,32 @@ def get_daily_bars(symbol: str, start: date, end: date,
         )
         if quality:
             q = q.filter(DailyBar.quality_status == quality)
-        return list(q.order_by(DailyBar.trade_date).all())
+        rows = list(q.order_by(DailyBar.trade_date).all())
+    # 数据源优先级(主源优先)
+    try:
+        cfg = get_settings().section("data_sources")
+        spec = cfg.get("sources", {}).get("daily_bar", {})
+        chain = [spec.get("primary", "")] + spec.get("backups", [])
+        priority = {name: i for i, name in enumerate(chain) if name}
+    except Exception:
+        priority = {}
+    seen: Dict[date, DailyBar] = {}
+    for r in rows:
+        cur = seen.get(r.trade_date)
+        if cur is None:
+            seen[r.trade_date] = r
+        elif priority.get(r.source, 99) < priority.get(cur.source, 99):
+            seen[r.trade_date] = r
+    return [seen[d] for d in sorted(seen)]
 
 
 def upsert_minute_bars(bars: List[Dict[str, Any]]):
     if not bars:
         return
+    cols = _model_columns(MinuteBar)
     with get_session() as s:
         for b in bars:
+            b = {k: v for k, v in b.items() if k in cols}
             exist = s.query(MinuteBar).filter_by(
                 symbol=b["symbol"], bar_time=b["bar_time"], freq=b.get("freq", "5m"),
                 source=b.get("source", "akshare")).first()
@@ -97,6 +130,8 @@ def upsert_minute_bars(bars: List[Dict[str, Any]]):
 
 def get_minute_bars(symbol: str, start: datetime, end: datetime,
                     freq: str = "5m", limit: Optional[int] = None) -> List[MinuteBar]:
+    """读取分钟K。修复: 与日K一致做多源去重 —— 原实现盘中 failover 切源后
+    同一 bar_time 存在两个源的行, 指标/回测数据被翻倍。"""
     with get_session() as s:
         q = s.query(MinuteBar).filter(
             MinuteBar.symbol == symbol,
@@ -106,12 +141,36 @@ def get_minute_bars(symbol: str, start: datetime, end: datetime,
         ).order_by(MinuteBar.bar_time)
         if limit:
             q = q.limit(limit)
-        return list(q.all())
+        rows = list(q.all())
+    try:
+        cfg = get_settings().section("data_sources")
+        spec = cfg.get("sources", {}).get("minute_bar", {})
+        chain = [spec.get("primary", "")] + spec.get("backups", [])
+        priority = {name: i for i, name in enumerate(chain) if name}
+    except Exception:
+        priority = {}
+    seen: Dict[datetime, MinuteBar] = {}
+    for r in rows:
+        cur = seen.get(r.bar_time)
+        if cur is None:
+            seen[r.bar_time] = r
+        elif priority.get(r.source, 99) < priority.get(cur.source, 99):
+            seen[r.bar_time] = r
+    return [seen[t] for t in sorted(seen)]
+
+
+def _model_columns(model) -> set:
+    """模型全部列名(入库白名单用, 防止数据源多余键导致 TypeError)。"""
+    return set(model.__table__.columns.keys())
 
 
 def save_realtime_quote(q: Dict[str, Any]):
+    """实时行情入库。修复: 按模型列白名单过滤 —— 原实现 akshare/eastmoney
+    返回的 iopv、sina 返回的 name 等多余键导致 RealtimeQuote(**q) 抛 TypeError,
+    且上层静默吞异常, 实时行情从未写入数据库。"""
     with get_session() as s:
-        s.add(RealtimeQuote(**q))
+        cols = _model_columns(RealtimeQuote)
+        s.add(RealtimeQuote(**{k: v for k, v in q.items() if k in cols}))
 
 
 def get_latest_quote(symbol: str) -> Optional[RealtimeQuote]:
@@ -123,7 +182,8 @@ def get_latest_quote(symbol: str) -> Optional[RealtimeQuote]:
 
 def save_order_book(ob: Dict[str, Any]):
     with get_session() as s:
-        s.add(OrderBookSnapshot(**ob))
+        cols = _model_columns(OrderBookSnapshot)
+        s.add(OrderBookSnapshot(**{k: v for k, v in ob.items() if k in cols}))
 
 
 def get_latest_order_book(symbol: str) -> Optional[OrderBookSnapshot]:
@@ -151,7 +211,9 @@ def get_money_flow(symbol: str, start: datetime, end: datetime) -> List[MoneyFlo
         ).order_by(MoneyFlowRecord.record_time).all())
 
 
-def upsert_news(news_list: List[Dict[str, Any]]):
+def upsert_news(news_list: List[Dict[str, Any]]) -> int:
+    """新闻批量入库(去重), 返回实际新增条数。"""
+    added = 0
     with get_session() as s:
         for n in news_list:
             if not n.get("news_id"):
@@ -159,6 +221,8 @@ def upsert_news(news_list: List[Dict[str, Any]]):
             exist = s.query(NewsRecord).filter_by(news_id=n["news_id"]).first()
             if exist is None:
                 s.add(NewsRecord(**n))
+                added += 1
+    return added
 
 
 def get_news(symbol: Optional[str] = None, start: Optional[datetime] = None,
@@ -174,13 +238,17 @@ def get_news(symbol: Optional[str] = None, start: Optional[datetime] = None,
         return list(q.order_by(NewsRecord.publish_time.desc()).limit(limit).all())
 
 
-def upsert_announcements(ann_list: List[Dict[str, Any]]):
+def upsert_announcements(ann_list: List[Dict[str, Any]]) -> int:
+    """公告批量入库(去重), 返回实际新增条数。"""
+    added = 0
     with get_session() as s:
         for a in ann_list:
             exist = s.query(AnnouncementRecord).filter_by(
                 announcement_id=a["announcement_id"]).first()
             if exist is None:
                 s.add(AnnouncementRecord(**a))
+                added += 1
+    return added
 
 
 def get_announcements(symbol: Optional[str] = None, start: Optional[datetime] = None,
@@ -198,7 +266,8 @@ def get_announcements(symbol: Optional[str] = None, start: Optional[datetime] = 
 
 def save_sentiment(rec: Dict[str, Any]):
     with get_session() as s:
-        s.add(SentimentRecord(**rec))
+        cols = _model_columns(SentimentRecord)
+        s.add(SentimentRecord(**{k: v for k, v in rec.items() if k in cols}))
 
 
 def get_sentiment(symbol: str, start: datetime, end: datetime, limit: int = 200) -> List[SentimentRecord]:
@@ -306,6 +375,15 @@ def finish_agent_run(run_id: str, status: str, error: str = ""):
             run.error = error
 
 
+def update_agent_usage(run_id: str, prompt_tokens: int, completion_tokens: int):
+    """记录单次 LLM 调用的真实 token 用量(成本审计, 修复: 之前完全无记录)。"""
+    with get_session() as s:
+        run = s.query(AgentRun).filter_by(run_id=run_id).first()
+        if run:
+            run.prompt_tokens = int(prompt_tokens or 0)
+            run.completion_tokens = int(completion_tokens or 0)
+
+
 def save_agent_output(run_id: str, agent_name: str, view: str, score: float,
                       confidence: float, output_json: dict):
     with get_session() as s:
@@ -348,10 +426,13 @@ def save_risk_check(r: Dict[str, Any]):
 
 
 def save_human_confirmation(c: Dict[str, Any]):
+    """保存人工确认单。修复: 原实现不返回值, 调用方拿到 None,
+    人工确认闭环(按 confirm_id 直连确认)断裂。"""
     with get_session() as s:
         if not c.get("confirm_id"):
             c["confirm_id"] = gen_id("CFM")
         s.add(HumanConfirmation(**c))
+        return c["confirm_id"]
 
 
 def list_pending_confirmations() -> List[HumanConfirmation]:
@@ -367,6 +448,22 @@ def decide_confirmation(confirm_id: str, approved: bool, by: str = "web"):
             c.status = "APPROVED" if approved else "REJECTED"
             c.decided_at = datetime.now()
             c.decided_by = by
+
+
+def get_confirmation(confirm_id: str) -> Optional[HumanConfirmation]:
+    """读取确认单(人工确认闭环用)。"""
+    with get_session() as s:
+        c = s.query(HumanConfirmation).filter_by(confirm_id=confirm_id).first()
+        s.expunge(c) if c else None
+        return c
+
+
+def get_trade_plan(plan_id: str) -> Optional[TradePlan]:
+    """读取交易计划(人工确认批准后恢复执行用)。"""
+    with get_session() as s:
+        p = s.query(TradePlan).filter_by(plan_id=plan_id).first()
+        s.expunge(p) if p else None
+        return p
 
 
 # ================================================================
@@ -494,9 +591,18 @@ def save_trade(t: Dict[str, Any]):
 
 
 def get_trades(symbol: Optional[str] = None, start: Optional[datetime] = None,
-               end: Optional[datetime] = None, limit: int = 500) -> List[Trade]:
+               end: Optional[datetime] = None, limit: int = 500,
+               account_id: Optional[str] = None) -> List[Trade]:
+    """最近成交。
+    修复: 原实现无账户过滤 —— 测试套件(PA-TEST-*)、回测等其他账户的成交
+    全部混入 trades 表(表本身无 account_id 列), 模拟盘页面会看到与真实
+    持仓无关的"幽灵成交"(29条成交但持仓没动)。现按订单表 join 过滤。"""
     with get_session() as s:
         q = s.query(Trade)
+        if account_id:
+            from database.models import Order
+            q = q.join(Order, Trade.order_id == Order.order_id).filter(
+                Order.account_id == account_id)
         if symbol:
             q = q.filter(Trade.symbol == symbol)
         if start:
@@ -566,6 +672,15 @@ def save_report(r: Dict[str, Any]):
         if not r.get("report_id"):
             r["report_id"] = gen_id("RPT")
         s.add(ReportRecord(**r))
+
+
+def list_reports(report_type: Optional[str] = None, limit: int = 30) -> List[ReportRecord]:
+    """报告列表(按生成时间倒序)。"""
+    with get_session() as s:
+        q = s.query(ReportRecord)
+        if report_type:
+            q = q.filter(ReportRecord.report_type == report_type)
+        return list(q.order_by(ReportRecord.created_at.desc()).limit(limit).all())
 
 
 def save_memory(m: Dict[str, Any]):

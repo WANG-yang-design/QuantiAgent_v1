@@ -32,11 +32,16 @@ class CninfoClient(BaseDataSource):
             if df is None or df.empty:
                 return rows
             sub = df[df["代码"].astype(str) == symbol].head(limit)
+            import hashlib as _hashlib
             for _, r in sub.iterrows():
+                title = _safe_str(r.get("公告标题"))
+                pub = _safe_str(r.get("公告日期"))
+                # 修复: 原用行号 r.name 生成 ID, 不同日期行号相同会被 unique 去重丢弃
+                h = _hashlib.md5(f"{symbol}|{title}|{pub}".encode("utf-8")).hexdigest()[:16]
                 rows.append({
-                    "announcement_id": f"cninfo_{symbol}_{_safe_str(r.get('公告标题'))}_{r.name}",
+                    "announcement_id": f"cninfo_{symbol}_{h}",
                     "symbol": symbol,
-                    "title": _safe_str(r.get("公告标题")),
+                    "title": title,
                     "url": _safe_str(r.get("网址")),
                     "publish_time": r.get("公告日期"),
                 })

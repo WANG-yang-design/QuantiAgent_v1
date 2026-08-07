@@ -15,8 +15,9 @@ def _prefix(kind: str) -> str:
 
 
 def gen_id(kind: str = "id") -> str:
-    """生成唯一 ID: 前缀 + 时间戳 + uuid 短尾。"""
-    return f"{_prefix(kind)}_{uuid.uuid4().hex[:8].upper()}"
+    """生成唯一 ID: 前缀 + 时间戳 + uuid 短尾。
+    修复: 尾部由 8 hex 位(32bit)提升到 12 hex 位(48bit), 降低高频并发下单的碰撞率。"""
+    return f"{_prefix(kind)}_{uuid.uuid4().hex[:12].upper()}"
 
 
 def gen_trace_id() -> str:

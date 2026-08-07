@@ -14,6 +14,11 @@ from typing import Any, Dict
 import yaml
 from dotenv import load_dotenv
 
+# 修复: 本机系统代理不可用(ProxyError)导致 akshare(内部 requests) 数据获取
+# 几乎全部失败 —— 本应用的所有数据接口均需直连, 全局禁用代理。
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
+
 # 项目根目录 (config/ 的上一级)
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT_DIR / "config"
@@ -30,6 +35,16 @@ class Settings:
     def __init__(self):
         self.data: Dict[str, Any] = {}
         self._load_yaml("config.yaml", "config")
+        # 修复(重要): config.yaml 内容被整体挂在 data["config"] 下,
+        # 而全站大量使用 get_settings().get("web.xxx")/("strategies.xxx")
+        # 顶层点分路径读取 —— 全部返回默认值, 用户修改 config.yaml 永不生效
+        # (轮动参数/风控阈值/监控开关等都静默失效)。把 config.yaml 的各顶层
+        # 节平铺到 data, 同时保留 "config" 键兼容旧代码。
+        for _k, _v in (self.data.get("config") or {}).items():
+            if isinstance(_v, dict) and _k not in self.data:
+                self.data[_k] = _v
+            elif not isinstance(_v, dict):
+                self.data.setdefault(_k, _v)
         self._load_yaml("risk_limits.yaml", "risk")
         self._load_yaml("data_sources.yaml", "data_sources")
         self._load_yaml("model_routes.yaml", "model_routes")
@@ -49,7 +64,7 @@ class Settings:
 
     # ---------------------------------------------------------------
     def _apply_env(self):
-        """密钥类配置从 .env 注入, 覆盖 yaml 中的占位值。"""
+        """密钥类配置从 .env 注入, 覆盖 yaml 中的占位值(env 优先)。"""
         env_map = {
             "LLM_BASE_URL": ("llm", "base_url"),
             "LLM_API_KEY": ("llm", "api_key"),
@@ -94,16 +109,19 @@ class Settings:
         return node
 
     def database_url(self) -> str:
-        """拼接 PostgreSQL 连接串 (SQLAlchemy + psycopg3)。"""
+        """拼接 PostgreSQL 连接串 (SQLAlchemy + psycopg3)。
+        修复: 原实现手工拼接不 URL 编码, 密码含 @ : / % 等特殊字符即连接失败。"""
         cfg = self.data.get("database", {})
         if cfg.get("url"):
             return cfg["url"]
+        from urllib.parse import quote
         host = os.getenv("DB_HOST", "localhost")
         port = os.getenv("DB_PORT", "5432")
         name = os.getenv("DB_NAME", "quantiagent")
         user = os.getenv("DB_USER", "quantiagent")
         pwd = os.getenv("DB_PASSWORD", "quantiagent")
-        return f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{name}"
+        return (f"postgresql+psycopg://{quote(user, safe='')}:"
+                f"{quote(pwd, safe='')}@{host}:{port}/{name}")
 
     def llm_configured(self) -> bool:
         """是否已配置真实 LLM(有 base_url + api_key)。"""

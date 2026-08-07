@@ -9,13 +9,13 @@
 - 异步发送队列(不阻塞主流程)
 - 统一 HTML 模板(卡片式, 手机友好)
 """
-import asyncio
 import logging
+import queue
 import smtplib
 import ssl
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -34,10 +34,15 @@ class EmailSender:
     def __init__(self):
         self.cfg = get_settings().section("email")
         self.enabled = str(self.cfg.get("enabled", "false")).lower() in ("true", "1", "yes")
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self._worker: Optional[asyncio.Task] = None
+        # 修复: 原实现用 asyncio.Queue + create_task —— 非运行中事件循环里
+        # create_task 的任务永不执行, 邮件静默丢失。改为独立发送线程 +
+        # 线程安全队列, 不依赖任何事件循环。
+        self._queue: "queue.Queue" = queue.Queue(maxsize=200)
+        self._worker_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._dedup_cache: Dict[str, float] = {}
+        if self.enabled:
+            self._start_worker()
 
     # ------------------------------------------------------------------
     def is_enabled(self) -> bool:
@@ -95,59 +100,87 @@ class EmailSender:
                    extra_receivers: Optional[List[str]] = None,
                    dedup_key: Optional[str] = None,
                    dedup_minutes: int = 30) -> bool:
-        """发送入口: 去重检查 + 异步入队。"""
+        """发送入口: 入队发送(去重检查在发送线程内完成)。
+        修复: 原实现发送前就写入内存去重缓存, 发送失败(网络/SMTP异常)
+        也会被当成"已发送" —— 之后重试/重新触发全部被去重吞掉,
+        用户永远收不到邮件。去重移到发送成功后记录。"""
         if dedup_key:
             dedup_key = f"{self.cfg.get('sender','')}:{dedup_key}"
-            # 内存去重
-            with self._lock:
-                last = self._dedup_cache.get(dedup_key)
-                if last and (time.time() - last) < dedup_minutes * 60:
-                    logger.debug("邮件去重跳过: %s", subject)
-                    return False
-                self._dedup_cache[dedup_key] = time.time()
-            # 持久化去重(重启不重复)
-            if self._sent_before(dedup_key, dedup_minutes):
-                logger.debug("邮件持久化去重跳过: %s", subject)
-                return False
-        # 异步发送
         self._enqueue(subject, html_body, extra_receivers, dedup_key)
         return True
 
     def _sent_before(self, dedup_key: str, minutes: int) -> bool:
         try:
             with get_session() as s:
+                # 修复: 只按"成功发送"去重 —— FAILED 记录不得阻塞重发
                 return s.query(NotificationRecord).filter(
                     NotificationRecord.dedup_key == dedup_key,
+                    NotificationRecord.status == "SENT",
                     NotificationRecord.created_at >=
-                    datetime.now() - __import__("datetime").timedelta(minutes=minutes),
+                    datetime.now() - timedelta(minutes=minutes),
                 ).first() is not None
         except Exception:
             return False
 
     def _record_sent(self, dedup_key: str, ok: bool):
+        # 修复: 仅发送成功才落库(失败不占去重名额)
+        if not ok:
+            return
         try:
             with get_session() as s:
-                s.add(NotificationRecord(dedup_key=dedup_key or "", status="SENT" if ok else "FAILED"))
+                s.add(NotificationRecord(dedup_key=dedup_key or "",
+                                         status="SENT"))
         except Exception:
             pass
 
-    def _enqueue(self, subject, html, extra, dedup_key):
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self._worker_send(subject, html, extra, dedup_key))
-            else:
-                asyncio.run(self._worker_send(subject, html, extra, dedup_key))
-        except Exception as exc:
-            logger.warning("邮件入队失败, 转为同步发送: %s", exc)
-            ok = self._send_sync(subject, html, extra)
+    # ------------------------------------------------------------------
+    # 后台发送线程(不阻塞主流程, 也不依赖事件循环)
+    # ------------------------------------------------------------------
+    def _start_worker(self):
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            return
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="email-sender")
+        self._worker_thread.start()
+
+    def _worker_loop(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            subject, html, extra, dedup_key = item
+            # 去重在发送线程内完成(发送成功才记录, 失败可重发)
             if dedup_key:
+                with self._lock:
+                    last = self._dedup_cache.get(dedup_key)
+                    if last and (time.time() - last) < 1440 * 60:
+                        logger.debug("邮件去重跳过: %s", subject)
+                        continue
+                if self._sent_before(dedup_key, 1440):
+                    logger.debug("邮件持久化去重跳过: %s", subject)
+                    continue
+            try:
+                ok = self._send_sync(subject, html, extra)
+            except Exception as exc:
+                logger.error("邮件发送线程异常 %s: %s", subject, exc)
+                ok = False
+            if ok and dedup_key:
+                with self._lock:
+                    self._dedup_cache[dedup_key] = time.time()
                 self._record_sent(dedup_key, ok)
 
-    async def _worker_send(self, subject, html, extra, dedup_key):
-        ok = await asyncio.to_thread(self._send_sync, subject, html, extra)
-        if dedup_key:
-            self._record_sent(dedup_key, ok)
+    def _enqueue(self, subject, html, extra, dedup_key):
+        try:
+            self._queue.put((subject, html, extra, dedup_key), timeout=1.0)
+        except Exception as exc:
+            # 队列满/线程异常: 降级为同步发送, 保证通知不丢
+            logger.warning("邮件入队失败, 转为同步发送: %s", exc)
+            try:
+                ok = self._send_sync(subject, html, extra)
+            except Exception:
+                ok = False
+            if dedup_key:
+                self._record_sent(dedup_key, ok)
 
 
 _sender: Optional[EmailSender] = None

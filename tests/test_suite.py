@@ -6,11 +6,17 @@
 覆盖: 技术指标 / 撮合 / T+1 / 风控五层 / 回测指标 / 数据质量 / 工作流冒烟
 """
 import asyncio
+import os
 import sys
 import unittest
 from datetime import date, datetime, timedelta
 
 sys.path.insert(0, ".")
+
+# 修复: 测试套件会真实下单/撮合成交, 成交后订单层会发"模拟成交确认"邮件
+# (用户手机收到过 N 封"BUY 510300 1000份"的邮件, 全是跑测试触发的)。
+# 测试必须静默: 禁用邮件 + 跳过 PA-TEST 账户的通知。
+os.environ["EMAIL_ENABLED"] = "false"
 
 from core.logging import setup_logging
 
@@ -45,7 +51,9 @@ class TestTechnicalIndicators(unittest.TestCase):
         self.assertGreater(f["ma20"], 0)
         self.assertIn("rsi", f)
         self.assertIn("momentum_20d", f)
-        self.assertTrue(0 <= f["momentum_20d"] or f["momentum_20d"] < 1)
+        # 修复: 原断言 `0 <= x or x < 1` 恒为真, 动量计算错误无法被发现。
+        # 测试数据为单调上涨序列(120天, 每日+0.01), 20日动量应显著为正。
+        self.assertGreater(f["momentum_20d"], 0.05)
 
     def test_market_summary(self):
         from features.technical_indicators import compute_technical_features
@@ -149,7 +157,10 @@ class TestRiskEngine(unittest.TestCase):
 
     def test_reject_high_vol(self):
         from risk.risk_engine import get_risk_engine
-        features = {"volatility_20d": 0.10}
+        # 修复: 波动率阈值已从写死的 3.5% 改为与策略一致的年化 max_vol(50%,
+        # 见 risk_limits.yaml max_volatility / rotation_executor max_vol)。
+        # 原测试用 10% 期望被拒, 但 10% < 50% 不再属于高波动 —— 改为超过阈值。
+        features = {"volatility_20d": 0.60}
         r = get_risk_engine().check_plan(self._plan(), self._account(), features)
         self.assertEqual(r.result, "REJECT")
         self.assertIn("波动率", r.blocked_reason)

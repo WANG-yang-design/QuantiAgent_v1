@@ -135,20 +135,50 @@ def cmd_backtest(args):
 
 def cmd_serve(args):
     from web.api.main import start_web
-    start_web(port=args.port)
+    # 默认开启热重载(本地工具, 改代码自动生效); 需要关闭时用 --no-reload
+    start_web(port=args.port, reload=not args.no_reload)
 
 
 def cmd_scheduler(args):
     from scheduler.apscheduler_app import QuantScheduler
-    sched = QuantScheduler()
-    sched.start()
-    print("调度器运行中(Ctrl+C 退出)...")
-    import time
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        sched.shutdown()
+        # 防自动睡眠(电脑休眠会冻结整个系统, 调度器停摆)
+        try:
+            from core.power_guard import prevent_sleep
+            prevent_sleep()
+        except Exception:
+            pass
+        sched = QuantScheduler()
+        started = sched.start()
+        if not started:
+            # 已有实例(web内嵌或其他窗口)在运行, 本窗口直接退出
+            print("[INFO] 已有调度器实例在运行(data/scheduler.pid), 本窗口退出。")
+            print("       Web 服务已默认内嵌调度器; 如需独立运行请先停掉其他实例。")
+            return
+    except Exception as exc:
+        # 修复: 原实现 sched.start() 抛错时裸 traceback 直接退出, 无任何可读提示
+        logger.error("调度器启动失败: %s", exc, exc_info=True)
+        print(f"[ERROR] 调度器启动失败: {exc}\n"
+              f"       请检查 config/agent_schedule.yaml 任务配置(如 interval_seconds 非法值)")
+        sys.exit(1)
+    print("调度器运行中(Ctrl+C 或直接关闭本窗口退出)...")
+    import signal
+    import time
+
+    def _shutdown(*_):
+        logger.info("收到退出信号, 正在关闭调度器...")
+        try:
+            sched.shutdown()
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+    # 窗口点 X 关闭时 Windows 发送 CTRL_CLOSE → SIGBREAK: 同样干净退出, 不留孤儿进程
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _shutdown)
+    while True:
+        time.sleep(1)
 
 
 def cmd_review(args):
@@ -225,37 +255,63 @@ def cmd_init_portfolio(args):
     acc = repo.get_account(acc_id)
     if acc is None:
         acc = Account(account_id=acc_id, account_type="paper", init_cash=0)
-    acc.init_cash = float(data["initial_cash"])
     acc.cash = float(data["cash"])
     acc.frozen_cash = 0.0
-    acc.total_pnl = 0.0
-    acc.day_pnl = 0.0
     acc.total_fee = 0.0
     repo.save_account(acc)
 
-    # 3. 写入持仓(T+1: 全部可卖)
+    # 3. 写入持仓(T+1: 全部可卖; 峰值价=成本价, 移动止盈以此为起点)
     total_mv = 0.0
+    total_cost = 0.0
     for p in data.get("positions", []):
+        cost = float(p["cost_price"])
+        last = float(p["latest_price"])
+        qty = int(p["total_qty"])
+        total_mv += qty * last
+        total_cost += qty * cost
         pos = Position(
             position_id=f"POS-{acc_id}-{p['symbol']}",
             account_id=acc_id, symbol=p["symbol"], name=p.get("name", ""),
-            total_qty=int(p["total_qty"]), available_qty=int(p["available_qty"]),
+            total_qty=qty, available_qty=int(p["available_qty"]),
             frozen_qty=0, today_buy_qty=0,
-            cost_price=float(p["cost_price"]), latest_price=float(p["latest_price"]),
-            market_value=float(p["total_qty"]) * float(p["latest_price"]),
-            pnl=float(p.get("pnl", 0)), pnl_pct=float(p.get("pnl_pct", 0)),
+            cost_price=cost, latest_price=last,
+            market_value=round(qty * last, 2),
+            pnl=round(qty * last - qty * cost, 2),
+            pnl_pct=round((last / cost - 1) if cost else 0, 4),
+            peak_price=cost if cost else last,
         )
         repo.save_position(pos)
-        total_mv += pos.market_value
 
-    # 4. 刷新账户市值/总资产
+    # 4. 刷新账户市值/总资产/盈亏
+    # 修复: 原实现把 init_cash 置为"现金+持仓成本"(20347), 而用户真实投入是
+    # 文件里的 initial_cash(20000, 现金+持仓市值) —— 成本高于市值时累计盈亏
+    # 被系统性虚增(导入当日就少算亏损)。正确口径: 初始资金 = 用户真实投入。
     acc = repo.get_account(acc_id)
-    acc.market_value = total_mv
-    acc.total_asset = acc.cash + acc.market_value
+    init_cash = float(data.get("initial_cash", 0) or 0)
+    if init_cash <= 0:
+        init_cash = round(float(data["cash"]) + total_mv, 2)
+    acc.init_cash = round(init_cash, 2)
+    acc.market_value = round(total_mv, 2)
+    acc.total_asset = round(acc.cash + acc.market_value, 2)
+    acc.total_pnl = round(acc.total_asset - acc.init_cash, 2)
+    acc.day_pnl = 0.0
     repo.save_account(acc)
     print(f"[OK] 模拟盘持仓初始化完成: 账户 {acc_id}")
     print(f"     总资产 ¥{acc.total_asset:,.2f} = 现金 ¥{acc.cash:,.2f} + 市值 ¥{total_mv:,.2f}")
+    print(f"     初始资金(现金+持仓成本) ¥{acc.init_cash:,.2f} · 当前盈亏 ¥{acc.total_pnl:,.2f}")
     print(f"     持仓 {len(data.get('positions', []))} 只")
+
+
+def cmd_rotate(args):
+    """手动执行一轮 ETF 动量轮动(与回测共用信号函数, 落单到模拟盘)。"""
+    from strategies.live_rotation import run_live_rotation
+    result = run_live_rotation(notify=False)
+    orders = result.get("orders") or []
+    print(f"轮动信号 {len(result.get('signals', {}))} 个, 下单 {len(orders)} 笔")
+    for o in orders:
+        print(f"  {o['side']} {o['symbol']} {o['qty']}份 @ {o['price']:.3f} — {o['reason']}")
+    for s in result.get("skipped", []):
+        print(f"  (跳过) {s}")
 
 
 def cmd_rag(args):
@@ -304,6 +360,8 @@ def main():
 
     p = sub.add_parser("serve")
     p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--no-reload", action="store_true",
+                   help="关闭热重载(默认开启: 修改 .py 代码自动重启)")
     p.set_defaults(fn=cmd_serve)
 
     sub.add_parser("scheduler").set_defaults(fn=cmd_scheduler)
@@ -325,6 +383,9 @@ def main():
     p = sub.add_parser("init-portfolio", help="导入初始模拟盘持仓(data/portfolio_init.json)")
     p.add_argument("--file", default="data/portfolio_init.json")
     p.set_defaults(fn=cmd_init_portfolio)
+
+    p = sub.add_parser("rotate", help="手动执行一轮ETF动量轮动(回测策略实盘落地)")
+    p.set_defaults(fn=cmd_rotate)
 
     p = sub.add_parser("rag")
     p.add_argument("query")

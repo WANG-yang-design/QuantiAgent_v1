@@ -66,6 +66,7 @@ class WorkflowGraph:
         self.nodes: Dict[str, NodeFn] = {}
         self.edges: List[tuple] = []
         self.conditions: Dict[str, Callable[[WorkflowState], bool]] = {}
+        self.progress_cb = None   # 节点进度回调(on_node(name, status, cost))
 
     def add_node(self, name: str, fn: NodeFn):
         self.nodes[name] = fn
@@ -83,7 +84,8 @@ class WorkflowGraph:
         logger.info("[%s] 工作流 %s 启动: symbol=%s", state.trace_id, self.name, state.symbol)
         # 拓扑排序执行(简单 Kahn)
         order = self._topo_sort()
-        for node in order:
+        total = len(order)
+        for idx, node in enumerate(order):
             if state.is_interrupted():
                 logger.info("[%s] 工作流被中断: %s", state.trace_id, state.interrupted)
                 break
@@ -96,17 +98,33 @@ class WorkflowGraph:
             fn = self.nodes.get(node)
             if fn is None:
                 continue
+            if self.progress_cb:
+                try:
+                    self.progress_cb(node, "running", idx, total)
+                except Exception:
+                    pass
             try:
-                t0 = asyncio.get_event_loop().time()
+                loop = asyncio.get_running_loop()
+                t0 = loop.time()
                 result = await fn(state)
-                cost = asyncio.get_event_loop().time() - t0
+                cost = loop.time() - t0
                 if isinstance(result, dict):
                     for k, v in result.items():
                         state.set(k, v)
+                if self.progress_cb:
+                    try:
+                        self.progress_cb(node, "done", idx, total, cost)
+                    except Exception:
+                        pass
                 logger.info("[%s] 节点 %s 完成 (%.2fs)", state.trace_id, node, cost)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] 节点 %s 异常: %s", state.trace_id, node, exc,
                              exc_info=True)
+                if self.progress_cb:
+                    try:
+                        self.progress_cb(node, "failed", idx, total, 0.0, str(exc))
+                    except Exception:
+                        pass
                 state.interrupt(f"节点 {node} 异常: {exc}")
                 break
         logger.info("[%s] 工作流 %s 结束", state.trace_id, self.name)
@@ -130,8 +148,10 @@ class WorkflowGraph:
                 if indeg[m] == 0:
                     q.append(m)
         if len(order) != len(self.nodes):
-            logger.warning("工作流 %s 存在环, 按注册顺序执行", self.name)
-            order = list(self.nodes.keys())
+            # 修复: 环/悬空边不再静默按注册顺序执行(依赖错乱难发现), 直接抛错
+            raise RuntimeError(
+                f"工作流 {self.name} 存在环或悬空边, 无法拓扑排序: "
+                f"nodes={list(self.nodes)}, edges={self.edges}")
         return order
 
     # ------------------------------------------------------------------

@@ -14,7 +14,7 @@
 时, 数据管理员 Agent 必须中止交易计划生成或进入人工确认。
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 from core.config import get_settings
@@ -73,6 +73,17 @@ class DataQualityChecker:
         if not bars:
             rep.block("日K数据为空(MISSING)")
             return rep
+        # 单日振幅上限: 按标的涨跌幅动态计算(跌停→涨停的极限振幅 2L/(1-L))
+        # 修复: 固定 21% 阈值会把 ±20% 品种(588xxx/159915等)的合法行情误标 SUSPICIOUS
+        limit = 0.10
+        try:
+            from core.symbol_utils import price_limit_pct
+            # 修复: 原实现硬编码 "etf", 创业板/科创板股票(±20%)被误判
+            asset = "stock" if symbol[:1] in ("0", "3", "6") else "etf"
+            limit = price_limit_pct(symbol, asset)
+        except Exception:
+            pass
+        amp_threshold = 2 * limit / (1 - limit) + 0.02
         # 异常价格检查
         for b in bars:
             if b["close"] <= 0 or b["open"] <= 0:
@@ -83,8 +94,9 @@ class DataQualityChecker:
                 rep.add_warning("SUSPICIOUS", f"日期{b['trade_date']} OHLC 矛盾")
                 rep.status = QUALITY_SUSPICIOUS
                 break
-            if b["high"] > b["low"] * 1.21:      # 单日振幅>20%(股票/ETF几乎不可能)
-                rep.add_warning("SUSPICIOUS", f"日期{b['trade_date']} 振幅异常 {b['high']/b['low']-1:.1%}")
+            if b["high"] > b["low"] * (1 + amp_threshold):
+                rep.add_warning("SUSPICIOUS", f"日期{b['trade_date']} 振幅异常 "
+                                               f"{b['high']/b['low']-1:.1%}(阈值{amp_threshold:.1%})")
                 rep.status = QUALITY_SUSPICIOUS
         # 最新交易日缺失(收盘后更新检查)
         if expect_trade_date is not None:
@@ -100,12 +112,18 @@ class DataQualityChecker:
             rep.block("分钟K数据为空(MISSING)")
             return rep
         # 时间连续性: 检查相邻K线间隔
+        # 修复: 排除午休(11:30-13:00)与跨日(隔夜)的正常间隙 —— 原实现把正常
+        # 行情误判为 DELAYED, 导致分钟K永不落库、盘中数据持续被阻断
         expect = {"1m": 1, "5m": 5, "15m": 15}.get(freq, 5)
         prev = None
         gaps = 0
         for b in bars:
             if prev and (b["bar_time"] - prev).total_seconds() > expect * 60 * 3:
-                gaps += 1
+                prev_t, cur_t = prev.time(), b["bar_time"].time()
+                cross_lunch = prev_t <= time(11, 30) and cur_t >= time(13, 0)
+                cross_night = b["bar_time"].date() != prev.date()
+                if not (cross_lunch or cross_night):
+                    gaps += 1
             prev = b["bar_time"]
         if gaps > 5:
             rep.add_warning("DELAYED", f"分钟K存在{gaps}处时间缺口")
@@ -120,6 +138,12 @@ class DataQualityChecker:
         now = now or datetime.now()
         stale_seconds = int(self.freshness.get("realtime_quote", 60))
         qtime = quote.get("quote_time")
+        # 修复: quote_time 可能为字符串(其他源/DB回读), 直接相减抛 TypeError
+        if isinstance(qtime, str):
+            try:
+                qtime = datetime.fromisoformat(qtime.replace("Z", "+00:00"))
+            except Exception:
+                qtime = None
         if qtime and (now - qtime).total_seconds() > stale_seconds:
             rep.add_warning("DELAYED", f"行情时间 {qtime} 已超过 {stale_seconds}s")
             rep.status = QUALITY_DELAYED

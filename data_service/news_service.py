@@ -31,7 +31,7 @@ class NewsService:
 
     # ---------------- 新闻 ----------------
     def fetch_and_store_news(self, symbols: List[str]) -> int:
-        """拉取并入库新闻, 返回新增条数。"""
+        """拉取并入库新闻, 返回实际新增条数(修复: 原把去重跳过的也计入)。"""
         added = 0
         for symbol in symbols:
             try:
@@ -41,9 +41,10 @@ class NewsService:
                 continue
             for n in news:
                 n["sentiment_score"] = self.rule_sentiment(n["title"] + n["content"])
-            before = repo.get_news(symbol=symbol, limit=1)
-            repo.upsert_news(news)
-            added += len(news)
+            try:
+                added += repo.upsert_news(news)
+            except Exception as exc:
+                logger.warning("新闻入库失败 %s: %s", symbol, exc)
         return added
 
     @staticmethod
@@ -74,8 +75,10 @@ class NewsService:
             for a in anns:
                 a["event_type"] = self._classify_event(a["title"])
                 a["risk_level"] = self._risk_level(a["title"])
-            repo.upsert_announcements(anns)
-            added += len(anns)
+            try:
+                added += repo.upsert_announcements(anns)
+            except Exception as exc:
+                logger.warning("公告入库失败 %s: %s", symbol, exc)
         return added
 
     def get_recent_announcements(self, symbol: str, days: int = 7, limit: int = 30) -> List[dict]:

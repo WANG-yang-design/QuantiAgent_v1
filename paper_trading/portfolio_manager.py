@@ -27,12 +27,30 @@ class PortfolioManager:
         """
         根据目标权重生成调仓订单意图(整数100股单位)。
         返回: [{symbol, side, qty, price, reason}]
+        修复: ①目标组合外的持仓 → 清仓(原实现只遍历 target_weights, 被剔除的持仓永远不卖);
+              ②BUY 总量受可用现金约束(防超买)。
         """
         total = self.total_asset()
         positions = {p["symbol"]: p for p in self.account.get_positions()}
         name_map = name_map or {}
         orders: List[dict] = []
+        available_cash = self.account.get_available_cash()
 
+        # 目标外持仓清仓(轮动/减仓场景: 从目标组合移除的标的必须能卖出)
+        for symbol, cur in positions.items():
+            if symbol not in target_weights and cur["total_qty"] > 0:
+                avail = cur["available_qty"]
+                if avail >= 100:
+                    price = prices.get(symbol) or cur.get("latest_price") or 0
+                    if price > 0:
+                        orders.append({
+                            "symbol": symbol, "side": "SELL", "qty": avail,
+                            "price": price,
+                            "reason": "目标组合外持仓, 清仓",
+                            "name": cur.get("name", "") or name_map.get(symbol, ""),
+                        })
+
+        # 目标组合内调仓
         for symbol, weight in target_weights.items():
             price = prices.get(symbol, 0)
             if price <= 0:
@@ -43,6 +61,13 @@ class PortfolioManager:
             cur_qty = cur["total_qty"] if cur else 0
             diff = target_qty - cur_qty
             if diff >= 100:
+                # 现金校验: 累计买入金额不能超过可用现金
+                amount = diff * price
+                if amount > available_cash:
+                    diff = int(available_cash / price // 100 * 100)
+                    if diff < 100:
+                        continue
+                available_cash -= diff * price
                 orders.append({
                     "symbol": symbol, "side": "BUY", "qty": diff,
                     "price": price, "reason": f"调仓至目标权重{weight:.0%}",

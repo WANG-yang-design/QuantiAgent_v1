@@ -59,7 +59,9 @@ class RagService:
             return None
 
         with get_session() as s:
-            dup = s.query(RagDocument).filter_by(title=title[:200], source=source).first()
+            # 修复: 原实现用 title[:200] 截断去重 —— 长前缀相同(如"XX公司:关于…")
+            # 的不同文档被误判重复, 新内容永远不进向量库。改为完整标题精确匹配。
+            dup = s.query(RagDocument).filter_by(title=title, source=source).first()
             if dup:
                 return dup.document_id
             doc_id = gen_id("DOC")
@@ -111,12 +113,14 @@ class RagService:
         sql = """
             SELECT c.chunk_id, c.document_id, c.content, c.chunk_index,
                    d.title, d.doc_type, d.source, d.symbol, d.publish_time,
-                   1 - (c.embedding <=> :qv) AS vector_score
+                   1 - (c.embedding <=> CAST(:qv AS vector)) AS vector_score
             FROM rag_chunks c
             JOIN rag_documents d ON d.document_id = c.document_id
             WHERE 1=1
         """
-        params: Dict[str, Any] = {"qv": str(q_vec)}
+        # 修复: 之前传 str(list) 文本, pgvector 的 <=> 运算符无 text→vector 隐式
+        # 转换导致 SQL 报错被 except 吞掉, RAG 检索恒返回空。显式 CAST 确保可用。
+        params: Dict[str, Any] = {"qv": q_vec}
         if doc_types:
             sql += " AND d.doc_type = ANY(:types)"
             params["types"] = doc_types
