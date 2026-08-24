@@ -23,10 +23,10 @@ os.environ.setdefault("no_proxy", "*")
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT_DIR / "config"
 
-# 加载 .env (存在则覆盖系统环境)
+# 加载 .env。真实环境变量优先，便于部署与测试安全覆盖本地配置。
 _env_file = ROOT_DIR / ".env"
 if _env_file.exists():
-    load_dotenv(_env_file, override=True)
+    load_dotenv(_env_file, override=False)
 
 
 class Settings:
@@ -83,6 +83,8 @@ class Settings:
             "EMAIL_SENDER_PASS": ("email", "sender_pass"),
             "EMAIL_RECEIVER": ("email", "receiver"),
             "TUSHARE_TOKEN": ("tushare", "token"),
+            "WEB_ADMIN_TOKEN": ("web", "admin_token"),
+            "WEB_CONFIRM_SECRET": ("web", "confirm_secret"),
         }
         for env_key, (section, field) in env_map.items():
             val = os.getenv(env_key, "")
@@ -115,11 +117,11 @@ class Settings:
         if cfg.get("url"):
             return cfg["url"]
         from urllib.parse import quote
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "5432")
-        name = os.getenv("DB_NAME", "quantiagent")
-        user = os.getenv("DB_USER", "quantiagent")
-        pwd = os.getenv("DB_PASSWORD", "quantiagent")
+        host = str(cfg.get("host", "localhost"))
+        port = str(cfg.get("port", "5432"))
+        name = str(cfg.get("name", "quantiagent"))
+        user = str(cfg.get("user", "quantiagent"))
+        pwd = str(cfg.get("password", "quantiagent"))
         return (f"postgresql+psycopg://{quote(user, safe='')}:"
                 f"{quote(pwd, safe='')}@{host}:{port}/{name}")
 

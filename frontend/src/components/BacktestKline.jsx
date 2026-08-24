@@ -23,9 +23,8 @@ export default function BacktestKline({ candles, marks = [], roundTrips = [], he
     const vols = candles.map((c) => ({ value: c.volume, itemStyle: { color: c.close >= c.open ? "#e03131" : "#2f9e44" } }));
     const mk = (key, color) => candles.map((c) => ({ value: c[key], itemStyle: { color } }));
 
-    // 修复: 回测买卖点/包络带的日期可能落在K线范围外(回测区间与K线区间不一致),
-    // echarts 在 category 轴上找不到该日期 → "Cannot read properties of undefined
-    // (reading 'coord')" 白屏。先按K线日期过滤再画。
+    // 新回测由后端保证K线与买卖点来自同一冻结快照。这里仍做防御过滤，
+    // 只用于兼容异常/旧数据；页面会另外显示缺失标记警告，不能再静默隐藏。
     const validMarks = marks.filter((m) => dateSet.has(m.date));
     const validTrips = roundTrips.filter(
       (rt) => dateSet.has(rt.buy_date) && (rt.sell_date == null || dateSet.has(rt.sell_date)));

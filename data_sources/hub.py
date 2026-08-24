@@ -102,12 +102,12 @@ class DataSourceHub:
                         continue
                     result = fn(*args, **kwargs)
                     if result is None or (
-                        isinstance(result, (list, tuple)) and not empty_ok
+                        isinstance(result, (list, tuple)) and category not in empty_ok
                         and len(result) == 0
                     ):
                         raise RuntimeError(
                             f"{source_name} 返回空结果({category})")
-                    if isinstance(result, dict) and not empty_ok and not result:
+                    if isinstance(result, dict) and category not in empty_ok and not result:
                         raise RuntimeError(
                             f"{source_name} 返回空结果({category})")
                     key = (category, source_name)

@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,7 @@ from core.logging import setup_logging
 from database import repository as repo
 from database.db_session import db_health
 from notification.notification_service import get_notification_service
+from memory.audit_log import AuditLogger
 from paper_trading.paper_broker import PaperBroker
 from risk.circuit_breaker import CircuitBreaker
 
@@ -38,9 +40,7 @@ app = FastAPI(title="多Agent量化交易系统 V1", version="1.0.0")
 # CORS: 白名单可配置(config.yaml web.cors_origins), 收紧默认范围(安全)
 _web_cfg = get_settings().section("web")
 _cors_origins = [str(o) for o in (_web_cfg.get("cors_origins") or [])
-                 if str(o).strip()] or ["*"]
-if _cors_origins == ["*"]:
-    logger.warning("CORS 允许所有来源(未配置 web.cors_origins), 生产环境应配置白名单")
+                 if str(o).strip() and str(o).strip() != "*"]
 app.add_middleware(CORSMiddleware,
                    allow_origins=_cors_origins,
                    allow_methods=["*"], allow_headers=["*"])
@@ -60,9 +60,10 @@ async def _global_exception_handler(request: Request, exc: Exception):
     logger.error("未捕获异常 %s %s: %s\n%s",
                  request.method, request.url.path, exc,
                  traceback.format_exc())
+    request_id = uuid.uuid4().hex[:12]
+    logger.error("请求编号: %s", request_id)
     return JSONResponse(status_code=500, content={
-        "detail": f"服务器内部错误: {exc}",
-        "path": request.url.path,
+        "detail": "服务器内部错误", "request_id": request_id,
     })
 
 _cb = CircuitBreaker.instance()
@@ -72,6 +73,8 @@ _broker_lock = threading.Lock()
 # 持仓现价读取前刷新(节流10秒): 修复持仓页/账户页长年停在买入价
 _pos_refresh_lock = threading.Lock()
 _last_pos_refresh_ts = 0.0
+_market_heartbeat_stop = threading.Event()
+_embedded_scheduler: Any = None
 
 
 def _refresh_positions_prices(broker: Any):
@@ -83,22 +86,51 @@ def _refresh_positions_prices(broker: Any):
     with _pos_refresh_lock:
         if now - _last_pos_refresh_ts < 10.0:
             return
-        _last_pos_refresh_ts = now
     try:
         positions = broker.get_positions()
         syms = [p.get("symbol", "") for p in positions
                 if int(p.get("total_qty", 0) or 0) > 0]
         if not syms:
             return
-        from data_sources.tencent_client import TencentClient
-        live = TencentClient().get_realtime_quotes_batch(syms)
+        from data_service.live_quote_service import get_live_quote_service
+        live = get_live_quote_service().get_quotes(syms, max_age=2.0)
         prices = {sym: float(q["latest_price"])
                   for sym, q in live.items()
                   if float(q.get("latest_price", 0) or 0) > 0}
         if prices:
             broker.mark_to_market(prices)
+            _last_pos_refresh_ts = now
     except Exception as exc:
         logger.debug("持仓现价刷新失败(继续显示缓存价): %s", exc)
+
+
+def _market_data_heartbeat():
+    """Keep enabled watch symbols and account valuation live without page visits."""
+    from data_service.live_quote_service import get_live_quote_service
+    from data_sources.tencent_client import _in_trading_hours
+
+    service = get_live_quote_service()
+    while not _market_heartbeat_stop.is_set():
+        try:
+            broker = _get_broker()
+            positions = broker.get_positions()
+            symbols = [p.get("symbol", "") for p in positions]
+            symbols.extend(w.get("symbol", "") for w in repo.get_watchlist(enabled_only=True))
+            symbols = list(dict.fromkeys(s for s in symbols if s))
+            if symbols:
+                quotes = service.get_quotes(symbols, max_age=2.0)
+                prices = {s: float(q.get("latest_price", 0) or 0)
+                          for s, q in quotes.items()
+                          if float(q.get("latest_price", 0) or 0) > 0}
+                changed = any(abs(prices.get(p.get("symbol", ""), float(p.get("latest_price", 0) or 0))
+                                  - float(p.get("latest_price", 0) or 0)) > 1e-9
+                              for p in positions)
+                if prices and positions and changed:
+                    broker.mark_to_market(prices)
+        except Exception as exc:
+            logger.warning("全局行情心跳失败(稍后自动重试): %s", exc)
+        interval = 3.0 if _in_trading_hours() else 30.0
+        _market_heartbeat_stop.wait(interval)
 
 
 def _get_broker():
@@ -144,6 +176,7 @@ def _warmup():
 
 @app.on_event("startup")
 def _startup():
+    global _embedded_scheduler
     # 修复: uvicorn reload 模式下 worker 是独立进程, 不会执行 start_web 里的
     # setup_logging —— 应用日志(数据源失败/调度任务)全部丢进隐藏控制台,
     # 日志文件里只剩 reloader 的条目。worker 启动时重新挂载文件日志。
@@ -153,13 +186,16 @@ def _startup():
     except Exception:
         pass
     # 安全提示: 默认令牌在任何拿到网络访问权的人手里都能操作账户(暂停/撤单/批准)
-    token = get_settings().get("web.admin_token", "quantiagent-admin")
-    if not token or token == "quantiagent-admin":
-        logger.warning(
-            "Web 使用默认管理令牌 'quantiagent-admin' —— 任何能访问该端口的人 "
-            "都可暂停/恢复/撤单/批准交易。生产环境请在 config/config.yaml "
-            "web.admin_token 中配置随机令牌。")
+    token = str(get_settings().get("web.admin_token", "") or "")
+    secret = str(get_settings().get("web.confirm_secret", "") or "")
+    if len(token) < 32:
+        raise RuntimeError("必须通过 WEB_ADMIN_TOKEN 配置至少 32 字符的管理令牌")
+    if len(secret) < 32 or secret == token:
+        raise RuntimeError("必须通过 WEB_CONFIRM_SECRET 配置独立的至少 32 字符确认密钥")
     threading.Thread(target=_warmup, daemon=True, name="web-warmup").start()
+    _market_heartbeat_stop.clear()
+    threading.Thread(target=_market_data_heartbeat, daemon=True,
+                     name="market-data-heartbeat").start()
     # 防自动睡眠(修复: 电脑休眠会把整个系统冻结, 调度器/Web 全停)
     try:
         from core.power_guard import prevent_sleep
@@ -170,10 +206,12 @@ def _startup():
     # 决策链"。web 启动时内嵌拉起调度器(单例锁保证全系统只有一个实例)。
     if get_settings().get("web.embed_scheduler", True):
         def _embed_scheduler():
+            global _embedded_scheduler
             try:
-                from scheduler.apscheduler_app import QuantScheduler
-                sched = QuantScheduler()
+                from scheduler.apscheduler_app import get_scheduler
+                sched = get_scheduler()
                 if sched.start():
+                    _embedded_scheduler = sched
                     logger.info("Web 已内嵌启动调度器(单例锁 data/scheduler.pid)")
             except Exception as exc:
                 logger.warning("内嵌调度器启动失败: %s", exc, exc_info=True)
@@ -183,8 +221,15 @@ def _startup():
 
 @app.on_event("shutdown")
 def _shutdown():
-    # 若调度器锁是本进程持有, 由进程退出自然释放; 心跳文件保留供查状态
-    pass
+    global _embedded_scheduler
+    _market_heartbeat_stop.set()
+    if _embedded_scheduler is not None:
+        try:
+            _embedded_scheduler.shutdown()
+        except Exception as exc:
+            logger.warning("内嵌调度器关闭失败: %s", exc)
+        finally:
+            _embedded_scheduler = None
 
 
 # ---------------------------------------------------------------
@@ -192,7 +237,9 @@ def _shutdown():
 # ---------------------------------------------------------------
 def _check_token(authorization: Optional[str] = Header(None)):
     import hmac
-    token = get_settings().get("web.admin_token", "quantiagent-admin")
+    token = str(get_settings().get("web.admin_token", "") or "")
+    if len(token) < 32:
+        raise HTTPException(status_code=503, detail="Web 管理令牌未配置")
     if not authorization or not hmac.compare_digest(authorization, f"Bearer {token}"):
         raise HTTPException(status_code=401, detail="无效令牌")
 
@@ -286,9 +333,77 @@ def pending_confirmations():
         {"confirm_id": c.confirm_id, "plan_id": c.plan_id, "symbol": c.symbol,
          "name": resolve_symbol_name(c.symbol),
          "action": c.action, "amount": c.amount, "risk_level": c.risk_level,
-         "reason": c.reason, "created_at": str(c.created_at)}
+         "reason": c.reason, "created_at": str(c.created_at),
+         "trace_id": c.trace_id, "expires_at": str(c.expires_at or ""),
+         "timeout_action": c.timeout_action,
+         "context": c.context_json or {}}
         for c in repo.list_pending_confirmations()
     ]
+
+
+@app.get("/api/confirmations/history", dependencies=[Depends(require_auth)])
+def confirmation_history(limit: int = 100):
+    """确认单完整历史及其后续订单/成交，用于回答谁在何时做了什么。"""
+    from core.symbol_names import resolve_symbol_name
+    rows = repo.list_confirmations(limit)
+    orders = {o.plan_id: o for o in repo.get_orders_recent(limit=500) if o.plan_id}
+    trades = {t.order_id: t for t in repo.get_trades(limit=500,
+                                                      account_id="PA-001")}
+    out = []
+    for c in rows:
+        order = orders.get(c.plan_id)
+        trade = trades.get(order.order_id) if order else None
+        out.append({
+            "confirm_id": c.confirm_id, "plan_id": c.plan_id,
+            "trace_id": c.trace_id, "symbol": c.symbol,
+            "name": resolve_symbol_name(c.symbol), "action": c.action,
+            "amount": c.amount, "risk_level": c.risk_level,
+            "reason": c.reason, "status": c.status,
+            "created_at": str(c.created_at), "expires_at": str(c.expires_at or ""),
+            "timeout_action": c.timeout_action, "decided_at": str(c.decided_at or ""),
+            "decided_by": c.decided_by, "decision_note": c.decision_note,
+            "context": c.context_json or {},
+            "order": ({"order_id": order.order_id, "status": order.status,
+                       "price": order.price, "qty": order.qty,
+                       "submit_time": str(order.submit_time or ""),
+                       "source": order.source} if order else None),
+            "trade": ({"trade_id": trade.trade_id, "price": trade.price,
+                       "qty": trade.qty, "trade_time": str(trade.trade_time)}
+                      if trade else None),
+        })
+    return {"items": out, "total": len(out)}
+
+
+class ConfirmationSettingsBody(BaseModel):
+    timeout_action: str
+    timeout_seconds: int
+
+
+@app.get("/api/confirmations/settings", dependencies=[Depends(require_auth)])
+def get_confirmation_settings():
+    from workflows.trading_workflow import confirmation_policy
+    return confirmation_policy()
+
+
+@app.get("/api/email/status", dependencies=[Depends(require_auth)])
+def email_status():
+    return get_notification_service().mail.status_summary()
+
+
+@app.put("/api/confirmations/settings", dependencies=[Depends(require_auth)])
+def update_confirmation_settings(body: ConfirmationSettingsBody):
+    if body.timeout_action not in ("execute", "cancel"):
+        raise HTTPException(status_code=400, detail="timeout_action 只能是 execute/cancel")
+    if body.timeout_seconds < 60 or body.timeout_seconds > 86400:
+        raise HTTPException(status_code=400, detail="超时时间必须在60秒到24小时之间")
+    repo.update_system_state("confirmation_policy", lambda state: state.update({
+        "timeout_action": body.timeout_action,
+        "timeout_seconds": int(body.timeout_seconds),
+    }))
+    AuditLogger.instance().log("confirmation_policy_changed", "web", {
+        "timeout_action": body.timeout_action, "timeout_seconds": body.timeout_seconds})
+    return {"ok": True, "timeout_action": body.timeout_action,
+            "timeout_seconds": body.timeout_seconds}
 
 
 @app.post("/api/confirmations/{confirm_id}/decide", dependencies=[Depends(require_auth)])
@@ -297,34 +412,60 @@ async def decide_confirmation(confirm_id: str, body: ConfirmBody):
     幂等: 确认单已处理时直接返回, 不重复下单。"""
     from workflows.intraday_monitor_workflow import get_broker
     from workflows.trading_workflow import resume_confirmed_plan
-    result = await resume_confirmed_plan(confirm_id, body.approved, get_broker(), by="web")
+    result = await resume_confirmed_plan(confirm_id, body.approved, get_broker(),
+                                         by="web", note=body.note)
     logger.info("人工确认 %s → %s: %s", confirm_id, result.get("status"),
                 result.get("reason"))
     return {"status": result.get("status"), "reason": result.get("reason")}
 
 
 @app.get("/api/confirmations/{confirm_id}/email", include_in_schema=False)
-async def email_decide_confirmation(confirm_id: str, decision: str = "", sig: str = ""):
-    """邮件一键确认(修复: 邮件里点"批准/拒绝"按钮直接处理, 无需登录网页)。
-    链接带 HMAC 签名(web.admin_token 派生), 防止伪造。"""
+async def email_decide_confirmation(confirm_id: str, decision: str = "", sig: str = "",
+                                    expires: int = 0):
+    """邮件确认审阅页。GET 永不改变交易状态，防止安全扫描器误触发。"""
+    from fastapi.responses import HTMLResponse
+    error = _verify_email_confirmation(confirm_id, decision, sig, expires)
+    if error:
+        return HTMLResponse(_email_result_html(error[0], error[1]), status_code=400)
+    c = repo.get_confirmation(confirm_id)
+    if c is None:
+        return HTMLResponse(_email_result_html("确认单不存在", "请到网页端查看"), status_code=404)
+    return HTMLResponse(_email_review_html(c, decision, sig, expires))
+
+
+def _verify_email_confirmation(confirm_id: str, decision: str, sig: str,
+                               expires: int):
     import hashlib
     import hmac as _hmac
-    from fastapi.responses import HTMLResponse
-    token = get_settings().get("web.admin_token", "quantiagent-admin")
+    secret = str(get_settings().get("web.confirm_secret", "") or "")
     if decision not in ("approve", "reject"):
-        return HTMLResponse(_email_result_html("参数错误", "链接缺少 decision 参数"), status_code=400)
-    expected = _hmac.new(token.encode(), f"{confirm_id}:{decision}".encode(),
-                         hashlib.sha256).hexdigest()[:16]
+        return ("参数错误", "链接缺少 decision 参数")
+    if not expires or expires < int(time.time()):
+        return ("链接已过期", "请到网页端处理")
+    expected = _hmac.new(secret.encode(), f"{confirm_id}:{decision}:{expires}".encode(),
+                         hashlib.sha256).hexdigest()[:32]
     if not _hmac.compare_digest(expected, sig or ""):
-        return HTMLResponse(_email_result_html("签名无效", "链接可能已被篡改, 请到网页端处理"), status_code=400)
+        return ("签名无效", "链接可能已被篡改，请到网页端处理")
+    return None
+
+
+@app.post("/api/confirmations/{confirm_id}/email", include_in_schema=False)
+async def email_submit_confirmation(confirm_id: str, decision: str = "", sig: str = "",
+                                    expires: int = 0):
+    """审阅页显式 POST 后才决定确认单；签名和过期时间再次校验。"""
+    from fastapi.responses import HTMLResponse
+    error = _verify_email_confirmation(confirm_id, decision, sig, expires)
+    if error:
+        return HTMLResponse(_email_result_html(error[0], error[1]), status_code=400)
     from workflows.intraday_monitor_workflow import get_broker
     from workflows.trading_workflow import resume_confirmed_plan
     try:
         result = await resume_confirmed_plan(confirm_id, decision == "approve",
-                                             get_broker(), by="email")
+                                             get_broker(), by="email",
+                                             note="邮件链接批准" if decision == "approve" else "邮件链接拒绝")
     except Exception as exc:
         logger.error("邮件确认失败 %s: %s", confirm_id, exc)
-        return HTMLResponse(_email_result_html("处理失败", str(exc)), status_code=500)
+        return HTMLResponse(_email_result_html("处理失败", "服务器内部错误，请到网页端查看"), status_code=500)
     status = result.get("status", "")
     ok = status in ("ORDERED", "APPROVED", "REJECTED", "SKIPPED")
     label = {
@@ -337,7 +478,29 @@ async def email_decide_confirmation(confirm_id: str, decision: str = "", sig: st
     return HTMLResponse(_email_result_html(label, reason), status_code=200 if ok else 400)
 
 
+def _email_review_html(c, decision: str, sig: str, expires: int) -> str:
+    from html import escape
+    is_approve = decision == "approve"
+    action = "批准并提交模拟盘订单" if is_approve else "拒绝并撤销交易计划"
+    color = "#1c7a3e" if is_approve else "#c0392b"
+    status = escape(str(c.status))
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>审阅人工确认</title></head>
+<body style="font-family:sans-serif;background:#f2f2f7;padding:24px">
+<div style="max-width:460px;margin:auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 2px 8px rgba(0,0,0,.1)">
+  <h2 style="margin:0 0 16px">请再次确认</h2>
+  <p><b>{escape(str(c.symbol))}</b> · {escape(str(c.action))} · ¥{float(c.amount or 0):,.0f}</p>
+  <p style="white-space:pre-wrap;color:#555;font-size:13px">{escape(str(c.reason or ''))}</p>
+  <p style="color:#888;font-size:12px">当前状态：{status}。此页尚未执行任何操作。</p>
+  <form method="post" action="/api/confirmations/{escape(str(c.confirm_id))}/email?decision={decision}&amp;expires={int(expires)}&amp;sig={escape(sig)}">
+    <button type="submit" style="width:100%;border:0;border-radius:8px;padding:12px;background:{color};color:#fff;font-weight:700;font-size:15px">{action}</button>
+  </form>
+  <p style="color:#aaa;font-size:11px;margin-top:14px">若不确定，请关闭本页并到系统“模拟盘/实盘”查看完整链路。</p>
+</div></body></html>"""
+
+
 def _email_result_html(title: str, detail: str) -> str:
+    from html import escape
+    title, detail = escape(str(title)), escape(str(detail))
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>人工确认结果</title></head>
 <body style="font-family:sans-serif;background:#f2f2f7;padding:40px">
 <div style="max-width:420px;margin:auto;background:#fff;border-radius:12px;padding:24px;text-align:center;
@@ -515,22 +678,13 @@ def settings_info():
             for cat, v in sources.items()
         },
         "initial_cash": s.get("paper_account.initial_cash", 100000),
-        "admin_token_default": (s.get("web.admin_token", "") or "") in ("", "quantiagent-admin"),
+        "admin_token_default": len(str(s.get("web.admin_token", "") or "")) < 32,
     }
 
 
-@app.get("/api/reports/{filename}")
-def download_report(filename: str, token: Optional[str] = None,
-                    authorization: Optional[str] = Header(None)):
-    """下载报告。修复: 前端 <a href target=_blank> 新标签页不会携带
-    Authorization 头 → 下载报"无效令牌"。改为 header 或 ?token= 二选一。"""
-    import hmac as _hmac
-    expect = get_settings().get("web.admin_token", "quantiagent-admin")
-    ok_header = authorization and _hmac.compare_digest(
-        authorization, f"Bearer {expect}")
-    ok_query = token and _hmac.compare_digest(token, expect)
-    if not (ok_header or ok_query):
-        raise HTTPException(status_code=401, detail="无效令牌")
+@app.get("/api/reports/{filename}", dependencies=[Depends(require_auth)])
+def download_report(filename: str):
+    """下载报告；仅接受 Authorization 头，避免令牌进入日志和浏览器历史。"""
     from fastapi.responses import FileResponse
     from pathlib import Path as _Path
     # 防路径穿越: 只允许文件名(不含路径分隔符)
@@ -573,14 +727,15 @@ def universe_top(limit: int = 20):
     spot = get_market_service().get_etf_spot()
     top = sorted(spot, key=lambda x: x.get("amount", 0) or 0, reverse=True)[:limit]
     try:
-        from data_sources.tencent_client import TencentClient
-        live = TencentClient().get_realtime_quotes_batch(
+        from data_service.live_quote_service import get_live_quote_service
+        live = get_live_quote_service().get_quotes(
             [s["symbol"] for s in top if s.get("symbol")])
         for s in top:
             q = live.get(s.get("symbol"))
             if q and q.get("latest_price"):
                 s["latest_price"] = q.get("latest_price")
                 s["change_pct"] = q.get("change_pct", s.get("change_pct", 0))
+                s["amount"] = q.get("amount", s.get("amount", 0))
     except Exception as exc:
         logger.debug("热门标的价格刷新失败(沿用现货): %s", exc)
     return [{"symbol": s["symbol"], "name": s.get("name", ""),

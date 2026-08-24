@@ -1,34 +1,37 @@
 @echo off
-rem ============================================================
-rem  QuantiAgent V1 - Stop (kill Web + Scheduler processes)
-rem  Usage: double-click stop.bat
-rem  Purpose: closing windows (X) or Ctrl+C may leave orphan
-rem  processes (occupying port 8080 / duplicate scheduling).
-rem  This script matches by command line and executable path to
-rem  precisely clean up this project's python processes.
-rem  ASCII only. Do NOT add Chinese characters here.
-rem ============================================================
-chcp 65001 >nul 2>&1
+setlocal
 cd /d "%~dp0"
+set "APP_PORT=8080"
 
-echo.
-echo  [QuantiAgent V1] stopping all services...
-powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*main.py*' -or $_.CommandLine -like '*uvicorn*' -or $_.CommandLine -like '*spawn_main*' -or $_.CommandLine -like '*multiprocessing-fork*' -or $_.ExecutablePath -like '*QuantiAgent*' } | ForEach-Object { Write-Host ('  stopped PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-
-timeout /t 2 /nobreak >nul
-
-rem ---- fallback: force release port 8080 (leftover listeners) ----
-powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $pid2 = $_.OwningProcess; Write-Host ('  port 8080 held by PID ' + $pid2 + ', killing'); Stop-Process -Id $pid2 -Force -ErrorAction SilentlyContinue }"
-
-rem ---- clean scheduler lock file ----
-if exist "data\scheduler.pid" del /q "data\scheduler.pid" >nul 2>&1
-
-set /a LEFT=0
-for /f "delims=" %%i in ('powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*main.py*' -or $_.CommandLine -like '*uvicorn*' -or $_.CommandLine -like '*spawn_main*' -or $_.CommandLine -like '*multiprocessing-fork*' -or $_.ExecutablePath -like '*QuantiAgent*' } | Measure-Object).Count"') do set LEFT=%%i
-if "%LEFT%"=="0" (
-    echo  [OK] All QuantiAgent processes stopped, port 8080 released.
-) else (
-    echo  [WARN] %LEFT% process(es) still running, check Task Manager.
+if /i not "%~1"=="quiet" (
+    echo.
+    echo [QuantiAgent] Stopping...
 )
-echo.
-pause
+
+set "STOP_RESULT=0"
+if exist "data\web.pid" (
+    for /f "usebackq delims=" %%P in ("data\web.pid") do (
+        taskkill /PID %%P /T /F >nul 2>&1
+        if errorlevel 1 (
+            tasklist /FI "PID eq %%P" 2>nul | find "%%P" >nul
+            if not errorlevel 1 set "STOP_RESULT=1"
+        ) else (
+            if /i not "%~1"=="quiet" echo [OK] Stopped PID %%P and its child processes.
+        )
+    )
+)
+
+del /q "data\web.pid" >nul 2>&1
+del /q "data\scheduler.pid" >nul 2>&1
+
+powershell -NoProfile -Command "if (Get-NetTCPConnection -LocalPort %APP_PORT% -State Listen -ErrorAction SilentlyContinue) { exit 1 } else { exit 0 }"
+if errorlevel 1 set "STOP_RESULT=1"
+
+if "%STOP_RESULT%"=="0" (
+    if /i not "%~1"=="quiet" echo [OK] All QuantiAgent processes were stopped.
+) else (
+    echo [ERROR] One or more QuantiAgent processes are still running.
+)
+
+if /i not "%~1"=="quiet" pause
+exit /b %STOP_RESULT%

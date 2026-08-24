@@ -19,7 +19,7 @@ from core.config import get_settings
 from core.logging import get_logger, setup_logging
 from database.db_session import get_engine, get_session
 from database.models import (
-    Account, Base, PromptVersion, RagChunk, Symbol, ToolPermission,
+    Account, Base, PromptVersion, RagChunk, Symbol, SystemState, ToolPermission,
 )
 from core.ids import gen_id
 
@@ -35,9 +35,52 @@ def _ensure_columns():
         "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl FLOAT",
         # 修复: 订单幂等键超长(INTENT-DEC...+重报后缀超过32字符)导致下单失败
         "ALTER TABLE orders ALTER COLUMN order_intent_id TYPE VARCHAR(64)",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS frozen_amount FLOAT DEFAULT 0",
+        "ALTER TABLE accounts ALTER COLUMN account_id TYPE VARCHAR(64)",
+        "ALTER TABLE positions ALTER COLUMN account_id TYPE VARCHAR(64)",
+        "ALTER TABLE positions ALTER COLUMN position_id TYPE VARCHAR(96)",
+        "ALTER TABLE orders ALTER COLUMN account_id TYPE VARCHAR(64)",
+        "ALTER TABLE account_snapshots ALTER COLUMN account_id TYPE VARCHAR(64)",
+        "ALTER TABLE notification_records ALTER COLUMN dedup_key TYPE VARCHAR(256)",
+        "ALTER TABLE notification_records ALTER COLUMN status TYPE VARCHAR(12)",
+        "ALTER TABLE notification_records ADD COLUMN IF NOT EXISTS html_body TEXT DEFAULT ''",
+        "ALTER TABLE notification_records ADD COLUMN IF NOT EXISTS extra_receivers JSON DEFAULT '[]'::json",
+        "ALTER TABLE notification_records ADD COLUMN IF NOT EXISTS dedup_minutes INTEGER DEFAULT 30",
+        "ALTER TABLE notification_records ADD COLUMN IF NOT EXISTS attempt_count INTEGER DEFAULT 0",
+        "ALTER TABLE notification_records ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "ALTER TABLE watchlist ALTER COLUMN categories TYPE VARCHAR(128)",
+        # 旧热门ETF分类已由可审计动态池取代；只移除标签，不删除仍属于
+        # 主动监控/持仓/动态池的标的行。
+        "UPDATE watchlist SET categories = trim(both ',' from "
+        "regexp_replace(categories, '(^|,)hot(,|$)', '\\1', 'g')) "
+        "WHERE categories ~ '(^|,)hot(,|$)'",
+        # 先清理历史重复基本面行，再补唯一约束，保证并发 upsert 不插重复。
+        "DELETE FROM fundamental_records a USING fundamental_records b "
+        "WHERE a.id > b.id AND a.symbol=b.symbol AND a.report_date=b.report_date",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_fund_symbol_date "
+        "ON fundamental_records(symbol, report_date)",
         # LLM 真实用量统计(输出token是成本大头)
         "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER DEFAULT 0",
         "ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER DEFAULT 0",
+        # 人工确认：保存不可变的超时策略与决策事实快照，支持重启后继续处理及完整审计。
+        "ALTER TABLE human_confirmations ALTER COLUMN status TYPE VARCHAR(24)",
+        "ALTER TABLE human_confirmations ADD COLUMN IF NOT EXISTS trace_id VARCHAR(32) DEFAULT ''",
+        "ALTER TABLE human_confirmations ADD COLUMN IF NOT EXISTS timeout_action VARCHAR(16) DEFAULT 'cancel'",
+        "ALTER TABLE human_confirmations ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP",
+        "ALTER TABLE human_confirmations ADD COLUMN IF NOT EXISTS context_json JSON DEFAULT '{}'::json",
+        "ALTER TABLE human_confirmations ADD COLUMN IF NOT EXISTS decision_note TEXT DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS ix_confirm_trace ON human_confirmations(trace_id)",
+        # 旧版只有两分钟的方向隐式规则：SELL 自动批准、BUY 依策略信号批准/拒绝。
+        # 迁移为明确终态，避免历史页仍显示成普通人工处理。
+        "UPDATE human_confirmations SET status='AUTO_EXECUTED', decided_by='timeout-policy', "
+        "decision_note='旧版超时策略自动执行（迁移标注）' "
+        "WHERE decided_by='auto-timeout' AND status='APPROVED'",
+        "UPDATE human_confirmations SET status='AUTO_CANCELLED', decided_by='timeout-policy', "
+        "decision_note='旧版超时策略自动撤销（迁移标注）' "
+        "WHERE decided_by='auto-timeout' AND status='REJECTED'",
+        # Agent 影子评估：策略拥有交易权，Agent 观点只与真实策略信号配对留样。
+        "CREATE INDEX IF NOT EXISTS ix_shadow_signal_time ON agent_shadow_observations(signal_time)",
+        "CREATE INDEX IF NOT EXISTS ix_shadow_agreement ON agent_shadow_observations(strategy_action, agreement)",
     ]
     with get_engine().connect() as conn:
         for stmt in statements:
@@ -102,6 +145,11 @@ def seed_data():
                 init_cash=cash,
             ))
             logger.info("模拟账户 %s 初始化: %.0f 元", acc_id, cash)
+        if s.get(SystemState, "circuit_breaker") is None:
+            s.add(SystemState(key="circuit_breaker", value_json={
+                "manual_paused": False, "manual_reason": "",
+                "trip_reasons": {}, "fail_order_streak": 0,
+            }))
 
         # 默认工具权限(硬规则: 分析师不能下单, 交易员/风控才有对应工具)
         perms = [

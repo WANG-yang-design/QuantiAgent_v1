@@ -22,7 +22,10 @@ slippage:
 price_limit:
   stock_limit: 0.10              # 主板股票 ±10%
   stock_limit_st: 0.05           # ST ±5%
+  stock_growth_limit: 0.20       # 创业板/科创板股票
+  stock_bse_limit: 0.30          # 北交所股票
   etf_limit: 0.10                # ETF ±10%
+  etf_growth_limit: 0.20         # 创业板/科创板相关 ETF
   # 跌停/涨停不可买入/卖出
 
 # 交易单位

@@ -5,7 +5,7 @@ import {
   PiggyBank, Settings, ListChecks, Pause, Play, ShieldCheck, KeyRound, BarChart3,
   MoreHorizontal, X,
 } from "lucide-react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, setToken, getToken } from "./api/client";
 import Dashboard from "./pages/Dashboard";
 import Watchlist from "./pages/Watchlist";
@@ -17,13 +17,14 @@ import PaperLive from "./pages/PaperLive";
 import AccountAnalysis from "./pages/AccountAnalysis";
 import SettingsPage from "./pages/Settings";
 import { SystemBar } from "./components/Common";
+import { useLiveQuotes } from "./hooks/useLiveQuotes";
 
 const NAV = [
   { to: "/", label: "仪表盘", icon: LayoutDashboard },
   { to: "/watchlist", label: "实时盯盘", icon: Activity },
   { to: "/monitor", label: "监控标的", icon: ListChecks },
   { to: "/symbol", label: "标的搜索", icon: CandlestickChart },
-  { to: "/agents", label: "Agent决策", icon: Bot },
+  { to: "/agents", label: "Agent观察", icon: Bot },
   { to: "/backtest", label: "回测中心", icon: FlaskConical },
   { to: "/paper-live", label: "模拟盘/实盘", icon: PiggyBank },
   { to: "/analysis", label: "账户分析", icon: BarChart3 },
@@ -96,8 +97,8 @@ function TokenModal({ open, onClose }) {
       <div className="card w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
         <div className="card-title"><KeyRound size={15} />API 令牌设置</div>
         <p className="text-xs text-gray-500 mb-3">
-          鉴权失败(401)。请在 <code className="bg-gray-100 px-1 rounded">config/config.yaml</code>
-          的 <code className="bg-gray-100 px-1 rounded">web.admin_token</code> 配置并重启后端后,
+          鉴权失败(401)。请在 <code className="bg-gray-100 px-1 rounded">.env</code>
+          的 <code className="bg-gray-100 px-1 rounded">WEB_ADMIN_TOKEN</code> 配置并重启后端后,
           在这里填入相同的令牌。
         </p>
         <input className="input w-full" value={val} autoFocus
@@ -118,6 +119,7 @@ function TokenModal({ open, onClose }) {
 /** 顶部工具条: 系统状态 + 调度器状态 + 紧急暂停/恢复 */
 function TopBar({ onAuthError }) {
   const [showToken, setShowToken] = useState(false);
+  const [lastPendingCount, setLastPendingCount] = useState(null);
   useEffect(() => {
     const h = () => setShowToken(true);
     window.addEventListener("auth-error", h);
@@ -130,7 +132,7 @@ function TopBar({ onAuthError }) {
   const { data: mode } = useQuery({
     queryKey: ["sysmode"],
     queryFn: () => api.get("/api/system/mode"),
-    refetchInterval: 15000,
+    refetchInterval: 5000,
   });
   // 调度器存活状态(修复: 用户曾一整天没有决策链产出, 因为调度器窗口被关了)
   const { data: sched } = useQuery({
@@ -139,6 +141,18 @@ function TopBar({ onAuthError }) {
     refetchInterval: 30000,
   });
   const paused = mode?.circuit?.paused;
+  const pendingCount = (mode?.confirmations || []).length;
+  useEffect(() => {
+    if (lastPendingCount !== null && pendingCount > lastPendingCount) {
+      const newest = mode?.confirmations?.[mode.confirmations.length - 1];
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("有新的交易等待确认", {
+          body: `${newest?.symbol || ""} ${newest?.name || ""} ${newest?.action || ""}`,
+        });
+      }
+    }
+    setLastPendingCount(pendingCount);
+  }, [pendingCount]);
   const pause = useMutation({
     mutationFn: () => api.post(`/api/emergency/${paused ? "resume" : "pause"}`, null),
     onSuccess: () => window.location.reload(),
@@ -153,6 +167,12 @@ function TopBar({ onAuthError }) {
           <span className={sched?.running ? "text-gray-600" : "text-red-500"}>调度</span>
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {pendingCount > 0 && (
+            <button className="btn-danger text-xs animate-pulse" onClick={() => window.location.href = "/paper-live"}
+              title="有交易等待您的确认">
+              待确认 {pendingCount}
+            </button>
+          )}
           <button className="btn-ghost text-xs" title="设置访问令牌"
             onClick={() => setShowToken(true)}>
             <KeyRound size={13} className="inline mr-1" /><span className="hidden sm:inline">令牌</span>
@@ -175,6 +195,36 @@ function TopBar({ onAuthError }) {
   );
 }
 
+/** 全局行情心跳: 页面切换后仍持续刷新全部启用监控标的。 */
+function MarketDataHeartbeat() {
+  const qc = useQueryClient();
+  const { data: watch } = useQuery({
+    queryKey: ["watchlist"],
+    queryFn: () => api.get("/api/watchlist"),
+    refetchInterval: 30000,
+  });
+  const symbols = (watch?.items || []).filter((i) => i.enabled).map((i) => i.symbol);
+  useLiveQuotes(symbols);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") {
+        qc.refetchQueries({ queryKey: ["live-quotes"], type: "active" });
+        qc.refetchQueries({ queryKey: ["account"], type: "active" });
+        qc.refetchQueries({ queryKey: ["positions"], type: "active" });
+        qc.refetchQueries({ queryKey: ["indexes"], type: "active" });
+      }
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [qc]);
+  return null;
+}
+
 export default function App() {
   const [authErrorFlag, setAuthErrorFlag] = useState(0);
   useEffect(() => {
@@ -184,6 +234,7 @@ export default function App() {
   }, []);
   return (
     <div className="flex h-screen">
+      <MarketDataHeartbeat />
       {/* 桌面侧栏 */}
       <aside className="hidden md:flex w-52 shrink-0 bg-slate-900 text-gray-200 flex-col">
         <div className="px-4 py-5 border-b border-white/10">

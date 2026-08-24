@@ -44,7 +44,7 @@ order_level:
 model_level:
   require_structured_json: true
   min_confidence: 0.55            # 低于此置信度不得自动交易
-  conflict_to_confirm: true       # 模型结论冲突进入人工确认
+  conflict_to_confirm: false      # Agent影子模式：模型分歧不确认、不延迟策略订单
   min_agent_agreement: 0.6        # 多Agent 观点一致性阈值
   reject_invalid_fields: true
 
@@ -72,10 +72,10 @@ confirmation_policy:
     risk_level: medium
   block:
     risk_level: high
-  # 人工确认超时自动决定(修复: 需确认的单子2分钟内无人处理, 自动按策略执行)
-  # BUY: 策略给买入信号→自动批准; 策略未给→自动拒绝(跟随策略)
-  # SELL: 默认自动批准(持仓保护优先), 策略明确看多时拒绝
-  auto_decide_timeout_seconds: 120
+  # 人工确认超时策略（设置页可调整，运行时即时生效）。
+  # cancel=自动撤销（默认、保守）；execute=重新取实时行情并复检风控后自动执行。
+  timeout_action: cancel
+  timeout_seconds: 600
 
 # =========================================================
 # 持仓风控巡检 (硬性止损/移动止盈, 不依赖Agent及时性)

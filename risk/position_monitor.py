@@ -20,6 +20,7 @@ from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from core.config import get_settings
+from core.timeutil import now as business_now, today as business_today
 from database import repository as repo
 from memory.audit_log import AuditLogger
 from notification.notification_service import get_notification_service
@@ -35,7 +36,7 @@ class PositionMonitor:
     def __init__(self):
         self.cfg = get_settings().get("risk.position_monitor", {}) or {}
         self._today_stop_orders = 0
-        self._today = date.today()
+        self._today = business_today()
         self._executed_today: set = set()   # 当日已执行 (symbol, type), 防重复卖出
 
     # ------------------------------------------------------------------
@@ -63,12 +64,12 @@ class PositionMonitor:
         if not self.enabled():
             result["skipped"].append("巡检未启用(position_monitor.enabled=false)")
             return result
-        if circuit.is_paused():
+        if circuit.is_paused() and not circuit.exits_allowed():
             result["skipped"].append(f"系统熔断中: {circuit.paused_reason()}")
             return result
 
         # 每日止损单计数(重置)
-        today = date.today()
+        today = business_today()
         if today != self._today:
             self._today = today
             self._today_stop_orders = 0
@@ -80,7 +81,8 @@ class PositionMonitor:
         positions = broker.get_positions()
         # 当日已在途的止损/止盈单(幂等: 同一标的同一类型当日只报一次, 防重复下单)
         active = {o["symbol"] for o in broker.get_orders()
-                  if o.get("status") in ("SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED")}
+                  if o.get("side") == "SELL" and
+                  o.get("status") in ("SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED")}
         for p in positions:
             symbol = p.get("symbol", "")
             qty = int(p.get("total_qty", 0) or 0)
@@ -127,12 +129,7 @@ class PositionMonitor:
             if symbol in active:
                 result["skipped"].append(f"{symbol}: 已有在途止损单, 跳过")
                 continue
-            # 修复: 同一天同一标的同一类型只执行一次(即使止损单已成交/已撤,
-            # 也不得再次报单 —— 原实现凭"当日无在途单"就重复卖, 配合降仓
-            # 一轮轮把持仓卖光)
-            if (symbol, stop_type) in getattr(self, "_executed_today", set()):
-                result["skipped"].append(f"{symbol}: 当日已执行过{stop_type}, 不再重复")
-                continue
+            # 只有仍有在途卖单时跳过；止损单若超时撤销，下一轮必须能够重报。
             result["triggered"].append({"symbol": symbol, "type": stop_type,
                                         "qty": sell_qty, "price": price,
                                         "pnl_pct": round(pnl_pct, 4),
@@ -180,12 +177,12 @@ class PositionMonitor:
         # 修复: 原实现引用未定义变量 available_qty → 止损单永远无法提交,
         # 且 NameError 中断整轮巡检(硬性止损层完全失效)
         if available is None:
-            try:
-                available = int(account.get("positions", {}).get(symbol, {}).get("available_qty", 0) or 0)
-            except Exception:
-                available = int(account.get("available_quantities", {}).get(symbol, 0) or 0)
+            positions = account.get("positions", []) or []
+            found = next((p for p in positions
+                          if str(p.get("symbol", "")) == symbol), {})
+            available = int(found.get("available_qty", 0) or 0)
         plan = {
-            "plan_id": f"PLAN-PM-{datetime.now():%Y%m%d%H%M%S%f}",
+            "plan_id": f"PLAN-PM-{business_now():%Y%m%d%H%M%S%f}",
             "decision_id": "PM-DECISION",
             "symbol": symbol, "name": name,
             "action": "SELL",
@@ -224,7 +221,7 @@ class PositionMonitor:
                 "order_type": "LIMIT", "price": round(price * 0.995, 4),
                 "plan_id": plan["plan_id"],
                 # 幂等键: 同一标的同一类型当日只能报一次单
-                "order_intent_id": f"INTENT-PM-{symbol}-{stop_type}-{date.today():%Y%m%d}",
+                "order_intent_id": f"INTENT-PM-{symbol}-{stop_type}-{business_today():%Y%m%d}",
                 "name": name,
                 # 订单来源标记(修复: 前端最近订单可区分"风控巡检单"与"Agent决策单",
                 # 用户不再疑惑为什么持仓突然被自动卖出)

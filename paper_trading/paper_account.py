@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from database import repository as repo
 from database.models import Account, Position
+from core.timeutil import today as business_today
 
 logger = logging.getLogger("paper.account")
 
@@ -60,9 +61,9 @@ class PaperAccount:
     # 表现为"最近成交有变化, 但持仓明细/账户数字不动"。
     # 每次读取前节流地从 DB 重载, DB 是唯一事实来源。
     # ------------------------------------------------------------------
-    def _sync_from_db(self):
+    def _sync_from_db(self, force: bool = False):
         now = time.time()
-        if now - getattr(self, "_last_sync_ts", 0.0) < 2.0:
+        if not force and now - getattr(self, "_last_sync_ts", 0.0) < 2.0:
             return
         self._last_sync_ts = now
         try:
@@ -108,6 +109,7 @@ class PaperAccount:
     def get_positions_locked(self) -> List[Dict[str, Any]]:
         """调用方必须已持有 self._lock。"""
         self._ensure_t1_unlock()
+        _, day_pnl_by_symbol = self._compute_day_pnl_breakdown()
         out = []
         for p in self._positions.values():
             out.append({
@@ -118,9 +120,11 @@ class PaperAccount:
                 "today_buy_qty": p.today_buy_qty,
                 "cost_price": round(p.cost_price, 4),
                 "latest_price": round(p.latest_price, 4),
+                "peak_price": round(float(p.peak_price or 0), 4),
                 "market_value": round(p.market_value, 2),
                 "pnl": round(p.pnl, 2),
                 "pnl_pct": round(p.pnl_pct, 4),
+                "day_pnl": round(day_pnl_by_symbol.get(p.symbol, 0.0), 2),
                 "buy_date": str(p.buy_date) if p.buy_date else "",
             })
         return out
@@ -132,18 +136,22 @@ class PaperAccount:
             p = self._positions.get(symbol)
             if p is None:
                 return None
+            _, day_pnl_by_symbol = self._compute_day_pnl_breakdown()
             return {
                 "symbol": p.symbol, "name": p.name,
                 "total_qty": p.total_qty, "available_qty": p.available_qty,
                 "frozen_qty": p.frozen_qty, "today_buy_qty": p.today_buy_qty,
                 "cost_price": round(p.cost_price, 4),
                 "latest_price": round(p.latest_price, 4),
+                "peak_price": round(float(p.peak_price or 0), 4),
                 "market_value": round(p.market_value, 2),
                 "pnl": round(p.pnl, 2), "pnl_pct": round(p.pnl_pct, 4),
+                "day_pnl": round(day_pnl_by_symbol.get(p.symbol, 0.0), 2),
             }
 
     def get_available_cash(self) -> float:
         with self._lock:
+            self._sync_from_db()
             return self._account.cash
 
     def get_available_qty(self, symbol: str) -> int:
@@ -163,9 +171,15 @@ class PaperAccount:
     # ------------------------------------------------------------------
     # 内部资金/持仓变更(由 OrderManager 撮合后调用)
     # ------------------------------------------------------------------
-    def _compute_day_pnl(self) -> float:
+    def _compute_day_pnl_breakdown(self) -> tuple[float, Dict[str, float]]:
         """
-        当日盈亏(券商口径, 修复): = 当前持仓市值 + 今日已实现现金净流入 - 日初持仓市值(昨收)
+        当日盈亏(券商口径): 当前持仓市值 + 今日现金净流入 - 日初持仓市值。
+
+        同时返回逐标的贡献，供持仓页显示。今日买入标的的日初数量为零，
+        因此其当日盈亏自然等于当前市值减去今日买入成本和手续费；部分卖出
+        标的则包含当日卖出现金流。完全清仓标的仍计入账户合计，但不会出现在
+        当前持仓明细中。
+
             其中:
               今日现金净流入 = Σ今日SELL(价×量-费) - Σ今日BUY(价×量+费)
               日初持仓量     = 当前持仓量 + 今日卖出 - 今日买入
@@ -174,46 +188,43 @@ class PaperAccount:
         不定, 基准漂移, 当日盈亏严重失真(卖出后基准已含卖出, 数字对不上)。
         新口径与券商一致, 不依赖内存状态, 重启后依然正确。
         """
-        today = date.today()
-        if getattr(self, "_day_parts_key", None) != today:
-            start_dt = datetime.combine(today, datetime.min.time())
-            try:
-                trades = repo.get_trades(start=start_dt,
-                                         account_id=self.account_id)
-            except Exception:
-                trades = []
-            sold: Dict[str, int] = defaultdict(int)
-            bought: Dict[str, int] = defaultdict(int)
-            cash_flow = 0.0
-            for t in trades:
-                if t.side == "SELL":
-                    sold[t.symbol] += int(t.qty or 0)
-                    cash_flow += float(t.price or 0) * (t.qty or 0) - (t.fee or 0)
-                else:
-                    bought[t.symbol] += int(t.qty or 0)
-                    cash_flow -= float(t.price or 0) * (t.qty or 0) + (t.fee or 0)
-            prev: Dict[str, float] = {}
-            for sym in set(self._positions.keys()) | set(sold) | set(bought):
-                prev[sym] = self._prev_close(sym, today)
-            self._day_parts_key = today
-            self._day_cash_flow = cash_flow
-            self._day_sold = sold
-            self._day_bought = bought
-            self._day_prev = prev
-        # 日初市值 = Σ (当前量 + 今日卖 - 今日买) × 昨收
-        # 注意: 完全清仓的标的已不在当前持仓中, 必须按"今日卖出量"单独补回
-        day_start_mv = 0.0
-        syms = set(self._positions.keys()) | set(self._day_sold) | set(self._day_bought)
+        today = business_today()
+        start_dt = datetime.combine(today, datetime.min.time())
+        try:
+            trades = repo.get_trades(start=start_dt, account_id=self.account_id)
+        except Exception:
+            trades = []
+        sold: Dict[str, int] = defaultdict(int)
+        bought: Dict[str, int] = defaultdict(int)
+        cash_flow: Dict[str, float] = defaultdict(float)
+        for t in trades:
+            if t.side == "SELL":
+                sold[t.symbol] += int(t.qty or 0)
+                cash_flow[t.symbol] += (
+                    float(t.price or 0) * (t.qty or 0) - (t.fee or 0))
+            else:
+                bought[t.symbol] += int(t.qty or 0)
+                cash_flow[t.symbol] -= (
+                    float(t.price or 0) * (t.qty or 0) + (t.fee or 0))
+        prev: Dict[str, float] = {}
+        for sym in set(self._positions.keys()) | set(sold) | set(bought):
+            prev[sym] = self._prev_close(sym, today)
+        by_symbol: Dict[str, float] = {}
+        syms = set(self._positions.keys()) | set(sold) | set(bought)
         for sym in syms:
             cur = self._positions.get(sym)
             qty = (int(cur.total_qty or 0) if cur else 0) \
-                + self._day_sold.get(sym, 0) - self._day_bought.get(sym, 0)
-            if qty > 0:
-                px = self._day_prev.get(sym, 0) or 0
-                day_start_mv += qty * px
-        day_pnl = float(self._account.market_value or 0) \
-            + self._day_cash_flow - day_start_mv
-        return round(day_pnl, 4)
+                + sold.get(sym, 0) - bought.get(sym, 0)
+            day_start_mv = max(qty, 0) * float(prev.get(sym, 0) or 0)
+            current_mv = (int(cur.total_qty or 0) * float(cur.latest_price or 0)
+                          if cur else 0.0)
+            by_symbol[sym] = round(
+                current_mv + cash_flow.get(sym, 0.0) - day_start_mv, 4)
+        return round(sum(by_symbol.values()), 4), by_symbol
+
+    def _compute_day_pnl(self) -> float:
+        total, _ = self._compute_day_pnl_breakdown()
+        return total
 
     def _prev_close(self, symbol: str, day: date) -> float:
         """最近一个交易日的收盘价(当日盈亏昨收基准)。无K线时回退成本价/现价。"""
@@ -259,19 +270,8 @@ class PaperAccount:
         调用方(Web读取刷新/调度器快照/风控巡检)均已限流, 此处每次直接落库,
         避免 _sync_from_db(2s) 用旧DB值覆盖内存新价。"""
         with self._lock:
-            for symbol, price in prices.items():
-                p = self._positions.get(symbol)
-                if p and price > 0:
-                    p.latest_price = price
-                    if price > (p.peak_price or 0):
-                        p.peak_price = price
-            self._refresh_market_value()
-            self._persist()
-            for p in self._positions.values():
-                try:
-                    repo.save_position(p)
-                except Exception as exc:
-                    logger.warning("持仓价格落库失败 %s: %s", p.symbol, exc)
+            repo.refresh_account_prices(self.account_id, prices)
+            self._sync_from_db(force=True)
 
     def _ensure_t1_unlock(self, today: Optional[date] = None):
         """
@@ -279,15 +279,9 @@ class PaperAccount:
         判断依据是 buy_date(最近买入日): buy_date < today 则整个 today_buy 均为
         历史买入 → 解锁。幂等且无需持久化状态, 重启后依然正确。
         """
-        today = today or date.today()
-        for p in self._positions.values():
-            if (p.today_buy_qty or 0) > 0 and (p.buy_date is None or p.buy_date < today):
-                # 修复: buy_date 为 NULL 的持仓(导入数据)永不执行 T+1 解锁,
-                # 持仓永远不可卖 —— NULL 按历史持仓直接解锁
-                unlock = p.today_buy_qty
-                p.today_buy_qty = 0
-                p.available_qty += unlock
-                repo.save_position(p)
+        today = today or business_today()
+        if repo.unlock_t1_positions(self.account_id, today):
+            self._sync_from_db(force=True)
 
     def apply_trade(self, symbol: str, name: str, side: str, price: float,
                     qty: int, fee: float, trade_time: datetime):

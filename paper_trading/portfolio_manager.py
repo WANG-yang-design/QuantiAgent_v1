@@ -35,6 +35,7 @@ class PortfolioManager:
         name_map = name_map or {}
         orders: List[dict] = []
         available_cash = self.account.get_available_cash()
+        fee_buffer = 1.001
 
         # 目标外持仓清仓(轮动/减仓场景: 从目标组合移除的标的必须能卖出)
         for symbol, cur in positions.items():
@@ -62,12 +63,12 @@ class PortfolioManager:
             diff = target_qty - cur_qty
             if diff >= 100:
                 # 现金校验: 累计买入金额不能超过可用现金
-                amount = diff * price
+                amount = diff * price * fee_buffer
                 if amount > available_cash:
-                    diff = int(available_cash / price // 100 * 100)
+                    diff = int(available_cash / (price * fee_buffer) // 100 * 100)
                     if diff < 100:
                         continue
-                available_cash -= diff * price
+                available_cash -= diff * price * fee_buffer
                 orders.append({
                     "symbol": symbol, "side": "BUY", "qty": diff,
                     "price": price, "reason": f"调仓至目标权重{weight:.0%}",

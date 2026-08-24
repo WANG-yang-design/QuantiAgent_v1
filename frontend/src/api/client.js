@@ -3,7 +3,7 @@ import axios from "axios";
 const TOKEN_KEY = "quantiagent_token";
 
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY) || "quantiagent-admin";
+  return localStorage.getItem(TOKEN_KEY) || "";
 }
 export function setToken(t) {
   localStorage.setItem(TOKEN_KEY, t);
@@ -20,7 +20,7 @@ client.interceptors.response.use(
   (res) => res.data,
   (err) => {
     if (err.response?.status === 401) {
-      console.error("鉴权失败, 检查 /api 令牌(web.admin_token)");
+      console.error("鉴权失败, 检查 WEB_ADMIN_TOKEN");
       // 用户可见提示(本地单用户工具: 提示去配置修改)
       if (typeof window !== "undefined") {
         window.dispatchEvent(new CustomEvent("auth-error"));
@@ -37,6 +37,19 @@ export const api = {
   patch: (url, body) => client.patch(url, body).then((d) => d),
   delete: (url) => client.delete(url).then((d) => d),
 };
+
+export async function downloadReport(filename) {
+  const response = await client.get(`/api/reports/${encodeURIComponent(filename)}`, {
+    responseType: "blob",
+  });
+  const blob = response instanceof Blob ? response : new Blob([response]);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 /** 轮询工具: 每 interval ms 轮询直到 status 非 RUNNING/PENDING。
  * 网络错误(服务重启等)做有限次指数退避重试, 避免整体失败。 */

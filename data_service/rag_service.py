@@ -88,8 +88,12 @@ class RagService:
                 out.extend(await get_llm().embed(texts[i:i + self.embed_batch]))
             return out
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+            try:
+                asyncio.get_running_loop()
+                running = True
+            except RuntimeError:
+                running = False
+            if running:
                 # 已在事件循环中: 用新线程执行, 避免嵌套循环冲突
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(1) as ex:
@@ -150,7 +154,22 @@ class RagService:
                 "symbol": r["symbol"] or "",
                 "publish_time": str(r["publish_time"]) if r["publish_time"] else "",
             })
-        return results[:top_k]
+        # RRF 融合向量与关键词结果；向量不可用时自然退化为关键词检索。
+        keywords = self.search_keyword(query, top_k=max(top_k * 2, 5))
+        by_id: Dict[str, Dict[str, Any]] = {}
+        rrf: Dict[str, float] = {}
+        for rank, item in enumerate(results):
+            cid = item["chunk_id"]
+            by_id[cid] = item
+            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (60 + rank + 1)
+        for rank, item in enumerate(keywords):
+            cid = item["chunk_id"]
+            by_id.setdefault(cid, item)
+            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (60 + rank + 1)
+        merged = sorted(by_id.values(), key=lambda x: rrf[x["chunk_id"]], reverse=True)
+        for item in merged:
+            item["score"] = round(rrf[item["chunk_id"]], 6)
+        return merged[:top_k]
 
     def search_keyword(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """关键词检索(tsvector 简化版: ILIKE)。"""

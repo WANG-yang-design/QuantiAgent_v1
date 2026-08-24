@@ -31,7 +31,8 @@ def _disk_save(df):
     try:
         import pandas as pd
         if isinstance(df, pd.DataFrame):
-            df.to_json(_SPOT_FILE, orient="split", force_ascii=False)
+            df.to_json(_SPOT_FILE, orient="split", force_ascii=False,
+                       date_format="iso")
     except Exception as exc:
         logger.debug("ETF spot 磁盘缓存写入失败: %s", exc)
 
@@ -42,7 +43,7 @@ def _disk_load():
         if _SPOT_FILE.exists() and time.time() - _SPOT_FILE.stat().st_mtime < _SPOT_FILE_TTL:
             df = pd.read_json(_SPOT_FILE, orient="split")
             if not df.empty:
-                return df
+                return df, _SPOT_FILE.stat().st_mtime
     except Exception as exc:
         logger.debug("ETF spot 磁盘缓存读取失败: %s", exc)
     return None
@@ -195,11 +196,12 @@ class AkShareClient(BaseDataSource):
             if _spot_cache["df"] is not None and time.time() - _spot_cache["ts"] < _SPOT_TTL:
                 return _spot_cache["df"], _spot_cache["ts"]
         # 磁盘缓存(陈旧可先用, 后台刷新)
-        disk = _disk_load()
+        disk_entry = _disk_load()
+        disk, disk_ts = disk_entry if disk_entry is not None else (None, 0.0)
         if disk is not None:
             with _spot_lock:
                 _spot_cache["df"] = disk
-                _spot_cache["ts"] = time.time()
+                _spot_cache["ts"] = disk_ts
             if not _spot_refreshing:
                 _spot_refreshing = True
                 threading.Thread(target=self._refresh_spot_background, daemon=True).start()
@@ -308,7 +310,8 @@ class AkShareClient(BaseDataSource):
         s = str(v).strip()
         if not s:
             return None
-        year = year or datetime.now().year
+        now = datetime.now()
+        year = year or now.year
         formats = (
             "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S",
             "%Y/%m/%d %H:%M", "%Y-%m-%d", "%Y/%m/%d",
@@ -321,11 +324,21 @@ class AkShareClient(BaseDataSource):
         # 无年份: MM-DD HH:MM / MM-DD / HH:MM
         try:
             if ":" in s and "-" in s and len(s) <= 12:
-                return datetime.strptime(f"{year}-{s}", "%Y-%m-%d %H:%M")
+                parsed = datetime.strptime(f"{year}-{s}", "%Y-%m-%d %H:%M")
+                if parsed > now + timedelta(days=183):
+                    parsed = parsed.replace(year=parsed.year - 1)
+                elif parsed < now - timedelta(days=183):
+                    parsed = parsed.replace(year=parsed.year + 1)
+                return parsed
             if "-" in s and len(s) <= 5:
-                return datetime.strptime(f"{year}-{s}", "%Y-%m-%d")
+                parsed = datetime.strptime(f"{year}-{s}", "%Y-%m-%d")
+                if parsed > now + timedelta(days=183):
+                    parsed = parsed.replace(year=parsed.year - 1)
+                elif parsed < now - timedelta(days=183):
+                    parsed = parsed.replace(year=parsed.year + 1)
+                return parsed
             if ":" in s and len(s) <= 5:
-                return datetime.strptime(f"{year}-01-01 {s}", "%Y-%m-%d %H:%M")
+                return datetime.strptime(f"{now:%Y-%m-%d} {s}", "%Y-%m-%d %H:%M")
         except ValueError:
             pass
         logger.debug("无法解析发布时间: %r", s)

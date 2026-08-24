@@ -20,7 +20,6 @@ from memory.audit_log import AuditLogger
 from paper_trading.paper_broker import PaperBroker
 from workflows.graph import WorkflowState
 from workflows.research_workflow import build_research_graph
-from workflows.trading_workflow import run_trading_workflow
 
 logger = logging.getLogger("workflow.intraday")
 
@@ -74,6 +73,17 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
     单个标的的完整盘中分析 → 交易闭环。
     force=True 时忽略分析频率限制(紧急触发/手动触发)。
     """
+    from core.agent_switch import agent_system_enabled
+    if not agent_system_enabled():
+        reason = "Agent总开关已关闭，未执行分析且未调用LLM"
+        logger.info("跳过Agent扫描 %s: %s", symbol, reason)
+        return {
+            "trace_id": gen_trace_id(), "symbol": symbol,
+            "interrupted": reason, "reason": reason, "mode": "AGENT_DISABLED",
+            "chief": None, "plan": None, "risk": None,
+            "analyst_outputs": None,
+            "execution": {"status": "SKIPPED", "reason": reason},
+        }
     audit = AuditLogger.instance()
     broker = get_broker()
     account_snapshot = broker.get_account()
@@ -88,7 +98,8 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
     state.set("system_paused", broker.account.get_snapshot().get("status") != "normal")
 
     audit.log("intraday_scan_start", "workflow",
-              {"symbol": symbol, "name": name, "force": force})
+              {"symbol": symbol, "name": name, "force": force},
+              trace_id=state.trace_id)
 
     # 阶段1: 投研(数据闸门→特征→分析师→辩论→首席)
     # 注意: 不再手动调用 node_collect_data —— 原实现先手动采集(结果丢弃),
@@ -96,6 +107,11 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
     research_graph = build_research_graph()
     research_graph.progress_cb = get_scan_progress_cb()
     state = await research_graph.run(state)
+    audit.log("decision_data_snapshot", "market_data", {
+        "symbol": symbol, "name": name,
+        "data_snapshot": state.get("data_snapshot") or {},
+        "quality_reports": state.get("quality_reports") or [],
+    }, trace_id=state.trace_id)
 
     result: Dict[str, Any] = {
         "trace_id": state.trace_id,
@@ -111,22 +127,32 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
     # 数据闸门 BLOCKED → 不进入交易阶段
     if state.is_interrupted():
         audit.log("intraday_scan_blocked", "workflow",
-                  {"symbol": symbol, "reason": state.interrupted})
+                  {"symbol": symbol, "reason": state.interrupted,
+                   "data_snapshot": state.get("data_snapshot") or {}},
+                  trace_id=state.trace_id)
         result["reason"] = state.interrupted
         return result
 
-    # 阶段2: 交易(仅当首席结论不是 EXCLUDE/HOLD 时进入交易员, 减少无效调用)
+    # Agent 影子模式：研究结论只留档，不生成交易计划、不触发确认、不提交订单。
+    # 正常买卖唯一来自正式轮动策略；硬风控/合规继续在策略与 Broker 层生效。
     chief = state.get("chief") or {}
-    if chief.get("research_decision") in ("BUY_CANDIDATE", "SELL_CANDIDATE"):
-        state = await run_trading_workflow(state, account_snapshot, broker,
-                                           progress_cb=get_scan_progress_cb())
-        result["plan"] = state.get("plan")
-        result["risk"] = state.get("risk")
-        result["execution"] = state.get("execution")
+    result["mode"] = "SHADOW_ONLY"
+    result["execution"] = {
+        "status": "OBSERVED_ONLY",
+        "reason": "Agent处于影子评估模式，不拥有交易权；正式策略独立执行买卖",
+    }
+    audit.log("agent_shadow_observation", "agent_research", {
+        "symbol": symbol, "chief": chief.get("research_decision"),
+        "confidence": chief.get("confidence"),
+        "data_snapshot": state.get("data_snapshot") or {},
+        "execution_policy": "OBSERVE_ONLY",
+    }, trace_id=state.trace_id)
 
     audit.log("intraday_scan_end", "workflow",
               {"symbol": symbol, "chief": chief.get("research_decision"),
-               "execution": (result.get("execution") or {}).get("status")})
+               "execution": (result.get("execution") or {}).get("status"),
+               "data_snapshot": state.get("data_snapshot") or {}},
+              trace_id=state.trace_id)
     logger.info("[%s] 盘中扫描完成 %s: 研究=%s 执行=%s",
                 state.trace_id, symbol, chief.get("research_decision"),
                 (result.get("execution") or {}).get("status"))
@@ -134,15 +160,20 @@ async def run_intraday_scan(symbol: str, name: str = "", asset_type: str = "etf"
 
 
 async def run_pool_scan(symbols: List[str], name_map: Optional[Dict[str, str]] = None,
-                        max_concurrent: int = 5) -> List[Dict[str, Any]]:
+                        max_concurrent: int = 5,
+                        asset_type_map: Optional[Dict[str, str]] = None
+                        ) -> List[Dict[str, Any]]:
     """标的池扫描: 并发分析多个标的(受 max_concurrent 限制)。"""
     name_map = name_map or {}
+    asset_type_map = asset_type_map or {}
     sem = asyncio.Semaphore(max_concurrent)
 
     async def one(symbol: str) -> Dict[str, Any]:
         async with sem:
             try:
-                return await run_intraday_scan(symbol, name_map.get(symbol, ""))
+                return await run_intraday_scan(
+                    symbol, name_map.get(symbol, ""),
+                    asset_type_map.get(symbol, "etf"))
             except Exception as exc:
                 logger.error("扫描 %s 异常: %s", symbol, exc)
                 return {"symbol": symbol, "interrupted": f"异常: {exc}"}

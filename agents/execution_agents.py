@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from agents.base_agent import AgentInput, BaseAgent
 from pydantic import BaseModel, Field
 from risk.risk_engine import get_risk_engine
+from core.timeutil import now as business_now
 
 
 # ================================================================
@@ -128,10 +129,9 @@ class ComplianceAgent(BaseAgent):
         #    错判 —— 与调度器一致统一 Asia/Shanghai)
         try:
             from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo("Asia/Shanghai"))
-            now = now.replace(tzinfo=None)
+            now = business_now()
         except Exception:
-            now = datetime.now()
+            now = business_now()
         if ctx.get("enforce_trading_hours", True) and not self._in_trading_hours(now):
             return {"compliance_status": "BLOCKED",
                     "reason": f"非交易时段({now:%H:%M}), 禁止下单",
@@ -139,7 +139,8 @@ class ComplianceAgent(BaseAgent):
 
         # 2. 重复下单: 同 symbol+side+qty+price 的活跃订单
         from database import repository as repo
-        open_orders = repo.get_open_orders()
+        account_id = str(ctx.get("account_id") or "PA-001")
+        open_orders = repo.get_open_orders(account_id)
         limit_price = float(plan.get("limit_price", 0) or 0)
         for o in open_orders:
             if o.symbol == plan.get("symbol") and o.side == plan.get("action"):
@@ -149,8 +150,8 @@ class ComplianceAgent(BaseAgent):
 
         # 3. 每日次数/金额(修复: 只统计非终态的当日订单 —— 原实现把
         #    CANCELLED/REJECTED 也计入, 多次撤单后当日被锁死)
-        today = date.today()
-        orders_today = [o for o in repo.get_orders_today(today)
+        today = now.date()
+        orders_today = [o for o in repo.get_orders_today(today, account_id)
                         if o.status not in ("CANCELLED", "REJECTED", "FAILED")]
         daily_count = len(orders_today)
         daily_amount = sum(o.price * o.qty for o in orders_today if o.qty and o.price)
@@ -246,7 +247,20 @@ class ExecutionSupervisorAgent(BaseAgent):
         # SUBMITTED/ACCEPTED: 超时检查
         submit_time = order.get("submit_time")
         if submit_time:
-            elapsed = (datetime.now() - submit_time).total_seconds()
+            if isinstance(submit_time, str):
+                try:
+                    submit_time = datetime.fromisoformat(submit_time.replace("Z", "+00:00"))
+                    if submit_time.tzinfo is not None:
+                        submit_time = submit_time.astimezone().replace(tzinfo=None)
+                except ValueError:
+                    return {"order_status": status, "fill_status": "UNKNOWN",
+                            "action": "QUERY", "reason": "订单提交时间格式异常",
+                            "warnings": ["无法可靠计算超时，请主动查询订单"]}
+            if not isinstance(submit_time, datetime):
+                return {"order_status": status, "fill_status": "UNKNOWN",
+                        "action": "QUERY", "reason": "订单提交时间类型异常",
+                        "warnings": ["无法可靠计算超时"]}
+            elapsed = (business_now() - submit_time).total_seconds()
             if elapsed > timeout:
                 return {"order_status": status, "fill_status": "NONE",
                         "action": "CANCEL",

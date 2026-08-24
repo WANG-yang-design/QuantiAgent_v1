@@ -4,7 +4,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend, AreaChart, Area,
 } from "recharts";
 import { FileText, Download } from "lucide-react";
-import { api, getToken } from "../api/client";
+import { api, downloadReport } from "../api/client";
 import { SystemBar, fmt, Empty, Spin } from "../components/Common";
 
 const PERIODS = [
@@ -192,9 +192,9 @@ export default function AccountAnalysis() {
                     </span>
                     <span className="text-sm text-gray-600 truncate flex-1">{r.title}</span>
                     <span className="text-[10px] text-gray-400 shrink-0">{r.created_at}</span>
-                    <a className="btn-ghost text-xs shrink-0" href={`/api/reports/${r.file_name}?token=${getToken()}`} target="_blank" rel="noreferrer">
+                    <button className="btn-ghost text-xs shrink-0" onClick={() => downloadReport(r.file_name)}>
                       <Download size={12} className="inline mr-0.5" />下载
-                    </a>
+                    </button>
                   </div>
                 )) : <Empty text="暂无报告(日报17:00自动生成, 或点击上方按钮生成)" />}
               </div>

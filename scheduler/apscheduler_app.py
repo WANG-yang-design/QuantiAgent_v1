@@ -15,20 +15,46 @@ APScheduler 调度器
 """
 import asyncio
 import logging
+import math
 import os
+import threading
 from datetime import date, datetime, time
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from core.config import get_settings, ROOT_DIR
+from core.timeutil import now as business_now, today as business_today
 from data_service.market_data_service import get_market_service
 
 logger = logging.getLogger("scheduler")
 
 _LOCK_FILE = ROOT_DIR / "data" / "scheduler.pid"
+
+
+def _routine_analysis_crons(interval_minutes: int) -> List[str]:
+    """生成仅包含真实交易时段的常规 Agent cron 列表。"""
+    interval = int(interval_minutes)
+    if interval == 60:
+        return ["0 10,11,13,14,15 * * mon-fri"]
+    if interval == 30:
+        # 需要两条表达式才能同时排除09:00、午休和15:30。
+        return ["30 9,10,11,13,14 * * mon-fri",
+                "0 10,11,13,14,15 * * mon-fri"]
+    raise ValueError("agent_routine_analysis.interval_minutes 仅支持 30 或 60")
+
+
+def _tier2_batch_size(total: int, coverage_rounds: int,
+                      max_per_round: int) -> int:
+    """计算在指定轮数内覆盖 Tier2 所需的有界单轮数量。"""
+    if total <= 0:
+        return 0
+    rounds = max(int(coverage_rounds), 1)
+    cap = max(int(max_per_round), 1)
+    return min(max(math.ceil(total / rounds), 1), cap)
 
 
 def _process_alive(pid: int) -> bool:
@@ -63,17 +89,48 @@ def _process_alive(pid: int) -> bool:
 
 def acquire_scheduler_lock() -> bool:
     """获取调度器单例锁(pid 文件)。已有存活实例返回 False。"""
-    try:
+    for _ in range(2):
+      try:
         if _LOCK_FILE.exists():
             old = int(_LOCK_FILE.read_text(encoding="utf-8").strip() or "0")
             if _process_alive(old):
                 return False
             logger.warning("发现失效调度器pid %s, 接管锁", old)
-        _LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+            _LOCK_FILE.unlink(missing_ok=True)
+        fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, str(os.getpid()).encode("ascii"))
+        finally:
+            os.close(fd)
         return True
-    except Exception as exc:
-        logger.warning("调度器锁写入失败: %s(继续启动)", exc)
-        return True
+      except FileExistsError:
+        continue
+      except Exception as exc:
+        logger.error("调度器锁获取失败: %s", exc)
+        return False
+    return False
+
+
+def _is_trade_day(day: date) -> bool:
+    """优先读取每日更新的交易日历。
+
+    当日或附近日期不在缓存覆盖区间时 fail closed，防止日历更新
+    失败后在法定节假日意外下单。
+    """
+    import json
+    path = ROOT_DIR / "data" / "trade_calendar.json"
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+        days = {str(v)[:10] for v in values}
+        if not days:
+            return False
+        if min(days) <= str(day) <= max(days):
+            return str(day) in days
+        logger.error("交易日历未覆盖 %s，为安全跳过交易", day)
+        return False
+    except Exception:
+        logger.error("交易日历不可用，为安全跳过交易")
+        return False
 
 
 def release_scheduler_lock():
@@ -95,7 +152,7 @@ def _in_trading_hours(now: Optional[datetime] = None) -> bool:
     except Exception:
         tz = None
     now = now or (datetime.now(tz) if tz else datetime.now())
-    if now.weekday() >= 5:
+    if now.weekday() >= 5 or not _is_trade_day(now.date()):
         return False
     t = now.time()
     return (time(9, 30) <= t <= time(11, 30)) or (time(13, 0) <= t <= time(15, 0))
@@ -109,6 +166,14 @@ class QuantScheduler:
         self.cfg = self.settings.section("agent_schedule")
         self.sched = BackgroundScheduler(timezone=self.cfg.get("timezone", "Asia/Shanghai"))
         self._jobs: Dict[str, Any] = {}
+        self._job_status: Dict[str, Dict[str, Any]] = {}
+        self._status_lock = threading.Lock()
+
+    def _set_job_status(self, job_name: str, **values):
+        with self._status_lock:
+            current = dict(self._job_status.get(job_name) or {})
+            current.update(values)
+            self._job_status[job_name] = current
 
     # ------------------------------------------------------------------
     def start(self) -> bool:
@@ -131,15 +196,16 @@ class QuantScheduler:
             elif job_name == "agent_routine_analysis" and jc.get("interval_minutes"):
                 # 例行分析: 与时钟对齐(修复: 原用 IntervalTrigger 相对启动时间计时,
                 # 9:47 启动就 10:17 才扫; 且程序重启后重新计时)。
-                # 现转成绝对时刻 cron: */N 9-15(交易时段) —— 每天 9:30 开盘后
-                # 整点对齐: N=30 → 9:30/10:00/10:30/.../15:00, 重启不影响时间表。
-                # 非交易时段(9:00/12:00/15:30)的触发由 only_trading_hours 过滤。
-                n = max(int(jc["interval_minutes"]), 5)
-                cron_expr = f"*/{n} 9-15 * * 1-5"
-                trigger = CronTrigger.from_crontab(
-                    cron_expr, timezone=self.cfg.get("timezone", "Asia/Shanghai"))
+                # 显式列出交易时段，心跳不再显示随后会被过滤掉的09:00/午休。
+                n = int(jc["interval_minutes"])
+                cron_exprs = _routine_analysis_crons(n)
+                cron_triggers = [CronTrigger.from_crontab(
+                    expr, timezone=self.cfg.get("timezone", "Asia/Shanghai"))
+                    for expr in cron_exprs]
+                trigger = (cron_triggers[0] if len(cron_triggers) == 1
+                           else OrTrigger(cron_triggers))
                 logger.info("例行分析任务改为时钟对齐: %s (interval_minutes=%d)",
-                            cron_expr, n)
+                            cron_exprs, n)
             else:
                 seconds = int(jc.get("interval_seconds", 60) or 0)
                 if jc.get("interval_minutes"):
@@ -154,25 +220,41 @@ class QuantScheduler:
                     seconds = 60
                 trigger = IntervalTrigger(seconds=seconds)
             only_trading = jc.get("only_trading_hours", False)
-            # 修复: 电脑休眠/进程卡顿错过的时间窗口, coalesce 补跑一次
-            # (misfire_grace_time 1小时, 避免醒来后 30 分钟分析整日缺失)
-            is_interval = not jc.get("cron")
-
-            def wrap(fn, trading_only: bool):
+            def wrap(name: str, fn, trading_only: bool):
                 def runner():
                     if trading_only and not _in_trading_hours():
                         logger.debug("非交易时段, 跳过 %s", getattr(fn, "__name__", "task"))
+                        self._set_job_status(
+                            name, status="SKIPPED", last_finished=str(business_now()),
+                            error="非交易日或非交易时段")
                         return
+                    started = business_now()
+                    self._set_job_status(
+                        name, status="RUNNING", last_started=str(started), error="")
                     try:
                         fn()
                     except Exception as exc:
-                        logger.error("调度任务异常 %s: %s", getattr(fn, "__name__", "task"), exc)
+                        finished = business_now()
+                        self._set_job_status(
+                            name, status="FAILED", last_finished=str(finished),
+                            duration_seconds=round((finished - started).total_seconds(), 3),
+                            error=str(exc)[:500])
+                        logger.error("调度任务异常 %s: %s",
+                                     getattr(fn, "__name__", "task"), exc,
+                                     exc_info=True)
+                        raise
+                    finished = business_now()
+                    self._set_job_status(
+                        name, status="OK", last_finished=str(finished),
+                        duration_seconds=round((finished - started).total_seconds(), 3),
+                        error="")
                 return runner
 
             self._jobs[job_name] = self.sched.add_job(
-                wrap(handler, only_trading), trigger,
+                wrap(job_name, handler, only_trading), trigger,
                 id=job_name, name=job_name, misfire_grace_time=3600,
-                coalesce=is_interval)
+                coalesce=True)
+            self._set_job_status(job_name, status="PENDING", error="")
             registered += 1
         # 心跳: 每分钟落盘, 供 Web 显示调度器存活状态
         self.sched.add_job(self.job_heartbeat, "interval", seconds=60,
@@ -182,6 +264,7 @@ class QuantScheduler:
         logger.info("调度器启动, 已注册 %d 个任务", registered)
         for name, job in self._jobs.items():
             logger.info("  任务 %s: next_run=%s", name, job.next_run_time)
+        self.job_heartbeat()
         return True
 
     def shutdown(self):
@@ -197,13 +280,21 @@ class QuantScheduler:
             path = ROOT_DIR / "data" / "scheduler_heartbeat.json"
             jobs = []
             for name, job in self._jobs.items():
-                jobs.append({"name": name,
-                             "next_run": str(job.next_run_time) if job.next_run_time else ""})
-            path.write_text(json.dumps({
+                with self._status_lock:
+                    status = dict(self._job_status.get(name) or {})
+                jobs.append({
+                    "name": name,
+                    "next_run": str(job.next_run_time) if job.next_run_time else "",
+                    **status,
+                })
+            payload = json.dumps({
                 "pid": os.getpid(),
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts": business_now().strftime("%Y-%m-%d %H:%M:%S"),
                 "jobs": jobs,
-            }, ensure_ascii=False), encoding="utf-8")
+            }, ensure_ascii=False)
+            tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
         except Exception as exc:
             logger.warning("心跳落盘失败: %s", exc)
 
@@ -218,21 +309,21 @@ class QuantScheduler:
         import json
         from core.config import ROOT_DIR
         svc = get_market_service()
-        today = date.today()
+        today = business_today()
         dates = svc.get_trade_calendar(today - timedelta(days=30), today + timedelta(days=90))
         if not dates:
-            logger.warning("交易日历更新: 数据源返回空, 保留旧缓存")
-            return
+            raise RuntimeError("交易日历数据源返回空结果")
         try:
             path = ROOT_DIR / "data" / "trade_calendar.json"
-            path.write_text(json.dumps([str(d) for d in dates]),
-                            encoding="utf-8")
+            tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps([str(d) for d in dates]), encoding="utf-8")
+            os.replace(tmp, path)
             logger.info("交易日历更新: %d 个交易日 → %s", len(dates), path)
         except Exception as exc:
-            logger.warning("交易日历落盘失败: %s", exc)
+            raise RuntimeError(f"交易日历落盘失败: {exc}") from exc
 
     def job_update_symbols(self):
-        """ETF/股票基础信息(每日08:10) + 热门ETF自动加入监控池。"""
+        """ETF/股票基础信息(每日08:10)；交易候选由动态ETF池维护。"""
         from database import repository as repo
         svc = get_market_service()
         spot = svc.get_etf_spot()
@@ -244,14 +335,19 @@ class QuantScheduler:
                 "asset_type": "etf", "exchange": exchange, "status": "active",
             }])
             symbols.append(s["symbol"])
-        # 热门ETF自动加入监控池(成交额Top20, 分类=hot)
-        min_amount = float(self.settings.get("universe.min_etf_amount", 5e7))
-        hot = sorted([s for s in spot if s.get("amount", 0) >= min_amount],
-                     key=lambda x: x.get("amount", 0), reverse=True)[:20]
-        for s in hot:
-            repo.upsert_watch_item(s["symbol"], s["name"], "etf",
-                                   categories=["hot"], enabled=True, priority=10)
-        logger.info("ETF池更新: %d 只, 热门监控加入 %d 只", len(symbols), len(hot))
+        logger.info("ETF基础池更新: %d 只；不再维护旧热门ETF监控分类", len(symbols))
+
+    def job_dynamic_etf_universe(self):
+        """Build the auditable paper ETF pool before the session."""
+        from strategies.dynamic_etf_universe import build_current_paper_snapshot
+        try:
+            snapshot = build_current_paper_snapshot(business_today())
+            logger.info("动态ETF池已更新: %s，%d只，asof=%s",
+                        snapshot.get("snapshot_id"), snapshot.get("candidate_count", 0),
+                        snapshot.get("asof_date"))
+        except Exception as exc:
+            logger.error("动态ETF池更新失败: %s", exc, exc_info=True)
+            raise
 
     def job_premarket_news(self):
         """盘前新闻公告扫描(08:30)。"""
@@ -262,68 +358,153 @@ class QuantScheduler:
         logger.info("盘前新闻公告: 新增 %d 条", added)
 
     def _current_universe(self, limit: int = 20) -> List[dict]:
-        """当前标的池(按成交额取前N)。"""
+        """Current collection pool: audited dynamic members, then spot leaders."""
         svc = get_market_service()
         spot = svc.get_etf_spot()
+        if not spot:
+            raise RuntimeError("ETF基础信息数据源返回空结果")
         min_amount = float(self.settings.get("universe.min_etf_amount", 5e7))
         top = sorted([s for s in spot if s.get("amount", 0) >= min_amount],
                      key=lambda x: x.get("amount", 0), reverse=True)
-        return top[:limit]
+        try:
+            from strategies.dynamic_etf_universe import latest_paper_universe
+            snapshot = latest_paper_universe(business_today()) or {}
+            spot_map = {str(x.get("symbol")): x for x in spot}
+            selected = []
+            seen = set()
+            for member in snapshot.get("members", []):
+                symbol = str(member["symbol"])
+                selected.append({**member, **spot_map.get(symbol, {}), "symbol": symbol})
+                seen.add(symbol)
+            selected.extend(x for x in top if str(x.get("symbol")) not in seen)
+            return selected[:limit]
+        except Exception as exc:
+            logger.warning("动态ETF池读取失败, 回退成交额候选: %s", exc)
+            return top[:limit]
+
+    def job_dynamic_etf_history_backfill(self):
+        """Gradually build a historical master for all currently known ETFs."""
+        from datetime import timedelta
+        from database import repository as repo
+        cfg = self.settings.get("universe.dynamic_etf_pool", {}) or {}
+        batch_size = max(1, int(cfg.get("history_backfill_batch_size", 30)))
+        history_days = max(180, int(cfg.get("history_backfill_days", 900)))
+        target_bars = max(60, int(cfg.get("history_target_bars", 250)))
+        today = business_today()
+        coverage = repo.get_etf_bar_coverage(today)
+        master = sorted(s.symbol for s in repo.get_universe("etf"))
+        pending = [s for s in master if coverage.get(s, {}).get("count", 0) < target_bars]
+        state = repo.get_system_state("dynamic_etf_backfill") or {}
+        cursor = int(state.get("cursor", 0) or 0) % max(len(pending), 1)
+        batch = (pending[cursor:] + pending[:cursor])[:batch_size]
+        ok = 0
+        for symbol in batch:
+            try:
+                bars, _ = get_market_service().get_daily_bars(
+                    symbol, today - timedelta(days=history_days), today,
+                    "etf", use_cache=False)
+                if bars:
+                    ok += 1
+            except Exception as exc:
+                logger.warning("ETF历史补库失败 %s: %s", symbol, exc)
+        next_cursor = (cursor + len(batch)) % max(len(pending), 1)
+        repo.update_system_state("dynamic_etf_backfill", lambda x: x.update({
+            "cursor": next_cursor, "last_date": str(today), "last_ok": ok,
+            "last_batch": len(batch), "pending": len(pending),
+        }))
+        logger.info("ETF历史分批补库: %d/%d成功，待补%d只", ok, len(batch), len(pending))
 
     def job_collect_realtime_quote(self):
         """实时行情采集(交易时段每10秒, 池内标的)。"""
         from data_service.market_data_service import get_market_service
         svc = get_market_service()
         uni = self._current_universe(20)
+        succeeded = 0
         for s in uni[:5]:   # 限流: 每轮5只
             try:
                 svc.get_realtime_quote(s["symbol"], "etf")
+                succeeded += 1
             except Exception as exc:
                 logger.warning("实时行情采集失败 %s: %s", s["symbol"], exc)
+        if uni and succeeded == 0:
+            raise RuntimeError("本轮实时行情采集全部失败")
 
     def job_collect_order_book(self):
         """盘口快照(每60秒落库)。"""
         svc = get_market_service()
-        for s in self._current_universe(10):
+        uni = self._current_universe(10)
+        succeeded = 0
+        for s in uni:
             try:
                 svc.get_order_book(s["symbol"], "etf")
+                succeeded += 1
             except Exception as exc:
                 logger.warning("盘口采集失败 %s: %s", s["symbol"], exc)
+        if uni and succeeded == 0:
+            raise RuntimeError("本轮盘口采集全部失败")
 
     def job_collect_money_flow(self):
         """资金流采集(每5分钟)。"""
         svc = get_market_service()
-        for s in self._current_universe(5):
+        uni = self._current_universe(5)
+        succeeded = 0
+        for s in uni:
             try:
                 svc.get_money_flow(s["symbol"], "etf")
-            except Exception:
-                pass
+                succeeded += 1
+            except Exception as exc:
+                logger.warning("资金流采集失败 %s: %s", s["symbol"], exc)
+        if uni and succeeded == 0:
+            raise RuntimeError("本轮资金流采集全部失败")
 
     def job_scan_news(self):
         """舆情新闻扫描(每10分钟)。"""
         from data_service.news_service import get_news_service
         ns = get_news_service()
         uni = self._current_universe(10)
-        ns.fetch_and_store_news([s["symbol"] for s in uni])
-        ns.fetch_and_store_sentiment([s["symbol"] for s in uni])
+        symbols = [s["symbol"] for s in uni]
+        news_count = ns.fetch_and_store_news(symbols)
+        sentiment_count = ns.fetch_and_store_sentiment(symbols)
+        logger.info("新闻舆情扫描完成: 新闻%d条, 舆情%d条",
+                    news_count, sentiment_count)
 
     def job_agent_routine_analysis(self):
-        """Agent 常规分析(默认30分钟): 扫描监控池(enabled标的, 按优先级/顺序限流)。
+        """Agent 常规分析(默认60分钟): 扫描监控池(enabled标的, 按优先级/顺序限流)。
         修复: 原实现每轮把监控池全部标的全量分析(20标的×11 Agent=220次LLM调用/轮,
         token 成本高)。smart_scan=true 时分层:
           Tier1(每轮必扫): 当前持仓 + 近3日轮动策略交易过的标的(买入的需持续跟踪)
-          Tier2(轮询):     其余监控标的, 每 tier2_interval_rounds 轮覆盖一遍
+          Tier2(轮询):     其余监控标的, 目标在 tier2_interval_rounds 轮覆盖一遍
         """
+        from core.agent_switch import agent_system_enabled
+        if not agent_system_enabled():
+            logger.info("Agent总开关已关闭，跳过常规分析")
+            return
         from workflows.intraday_monitor_workflow import run_pool_scan
         from database import repository as repo
-        from core.agent_switch import agent_enabled  # noqa: F401  (确保配置加载)
         # 修复: 原实现读 config.yaml 的 intraday.analysis_interval_min 只用于日志,
         # 实际间隔由 yaml 固定 30 分钟, 改配置无效 —— 改为读调度配置本身。
         interval = int(self.cfg.get("jobs", {}).get(
-            "agent_routine_analysis", {}).get("interval_minutes", 30))
+            "agent_routine_analysis", {}).get("interval_minutes", 60))
         watch = repo.get_watchlist(enabled_only=True)
         max_syms = int(self.settings.get("universe.max_symbols_per_scan", 20))
-        targets = [w for w in watch if w["enabled"]][:max_syms]
+        # 影子评估必须观察真实策略可选池，而不是旧固定自选池。
+        # 动态快照优先；用户主动监控项仅作为补充观察对象。
+        target_map = {}
+        try:
+            from strategies.dynamic_etf_universe import latest_paper_universe
+            snapshot = latest_paper_universe(business_today()) or {}
+            for member in snapshot.get("members", []):
+                target_map[str(member["symbol"])] = {
+                    "symbol": str(member["symbol"]),
+                    "name": str(member.get("name") or ""),
+                    "asset_type": "etf", "enabled": True, "priority": 10,
+                }
+        except Exception as exc:
+            logger.warning("Agent影子扫描读取动态ETF池失败: %s", exc)
+        for item in watch:
+            if item.get("enabled"):
+                target_map.setdefault(item["symbol"], item)
+        targets = list(target_map.values())
         if not targets:
             logger.info("监控池为空, 跳过常规分析")
             return
@@ -348,11 +529,14 @@ class QuantScheduler:
                 if tier2:
                     round_no = getattr(self, "_scan_round", 0) + 1
                     self._scan_round = round_no
-                    per_round = max(int(self.settings.get(
-                        "universe.tier2_max_per_round", 8)), 1)
                     n2 = len(tier2)
+                    coverage_rounds = max(int(self.settings.get(
+                        "universe.tier2_interval_rounds", 4)), 1)
+                    per_round = _tier2_batch_size(
+                        n2, coverage_rounds, int(self.settings.get(
+                            "universe.tier2_max_per_round", 8)))
                     cursor = getattr(self, "_tier2_cursor", 0) % max(n2, 1)
-                    picked = tier2[cursor:cursor + per_round]
+                    picked = [tier2[(cursor + i) % n2] for i in range(per_round)]
                     self._tier2_cursor = (cursor + per_round) % max(n2, 1)
                     scan += picked
                     logger.info("智能扫描: 持仓/轮动%d只 + 轮询%d只(第%d轮)",
@@ -365,14 +549,54 @@ class QuantScheduler:
 
         symbols = [w["symbol"] for w in targets]
         name_map = {w["symbol"]: w["name"] for w in targets}
+        asset_type_map = {
+            w["symbol"]: str(w.get("asset_type") or "etf") for w in targets
+        }
         import asyncio
         try:
-            results = asyncio.run(run_pool_scan(symbols, name_map, max_concurrent=3))
+            results = asyncio.run(run_pool_scan(
+                symbols, name_map, max_concurrent=3,
+                asset_type_map=asset_type_map))
             done = sum(1 for r in results if r.get("chief"))
             logger.info("常规分析完成: 扫描%d只, 产生研究结论%d个(间隔%d分钟)",
                         len(symbols), done, interval)
+            if symbols and done == 0:
+                raise RuntimeError(f"扫描{len(symbols)}只但未产生任何研究结论")
         except Exception as exc:
-            logger.error("常规分析失败: %s", exc)
+            logger.error("常规分析失败: %s", exc, exc_info=True)
+            raise
+
+    def job_agent_strategy_candidate_analysis(self):
+        """14:30 对 14:40 正式轮动候选做一次只读 Agent 定向分析。"""
+        from core.agent_switch import agent_system_enabled
+        if not agent_system_enabled():
+            logger.info("Agent总开关已关闭，跳过14:30候选定向分析")
+            return
+        from strategies.live_rotation import run_live_rotation
+        from workflows.intraday_monitor_workflow import run_pool_scan
+
+        try:
+            preview = run_live_rotation(notify=False, dry_run=True) or {}
+            symbols = list(dict.fromkeys(preview.get("candidate_symbols") or []))
+            if not symbols:
+                reason = "; ".join(preview.get("skipped") or preview.get("errors") or [])
+                logger.info("14:30候选定向分析跳过: %s", reason or "本轮无策略候选及持仓")
+                return
+            results = asyncio.run(run_pool_scan(
+                symbols, preview.get("names") or {}, max_concurrent=3,
+                asset_type_map=preview.get("asset_types") or {}))
+            done = sum(1 for result in results if result.get("chief"))
+            logger.info("14:30候选定向分析完成: 候选/持仓%d只, 研究结论%d个",
+                        len(symbols), done)
+        except Exception as exc:
+            logger.error("14:30候选定向分析失败: %s", exc, exc_info=True)
+            raise
+
+    def job_agent_shadow_evaluation(self):
+        """更新策略信号后 1/3/5/10 个交易日收益，不触发网络抓取或交易。"""
+        from analytics.agent_shadow import evaluate_pending
+        result = evaluate_pending()
+        logger.info("Agent影子归因更新: %s", result)
 
     def job_eod_data_update(self):
         """收盘数据更新(15:10): 日K落库。
@@ -393,7 +617,10 @@ class QuantScheduler:
                     logger.warning("收盘数据更新失败 %s: %s", s["symbol"], rep.status)
             except Exception as exc:
                 logger.warning("收盘数据更新异常 %s: %s", s["symbol"], exc)
-        logger.info("收盘数据更新完成: %d/%d 只成功", ok, min(len(self._current_universe(50)), 50))
+        total = min(len(self._current_universe(50)), 50)
+        logger.info("收盘数据更新完成: %d/%d 只成功", ok, total)
+        if total and ok == 0:
+            raise RuntimeError("收盘数据更新全部失败")
 
     def job_daily_report(self):
         """日终报告(17:00)。"""
@@ -431,6 +658,7 @@ class QuantScheduler:
                         len(acc.get("positions") or []))
         except Exception as exc:
             logger.warning("账户快照失败: %s", exc)
+            raise
 
     def job_market_diagnosis(self):
         """市场牛熊诊断(交易时段每小时, 落库)。
@@ -439,7 +667,10 @@ class QuantScheduler:
         from core.config import get_settings as _gs
         web = _gs().section("web")
         base = f"http://127.0.0.1:{int(web.get('port', 8080))}"
-        token = _gs().get("web.admin_token", "quantiagent-admin")
+        token = str(_gs().get("web.admin_token", "") or "")
+        if len(token) < 32:
+            logger.warning("市场诊断任务跳过: WEB_ADMIN_TOKEN 未配置")
+            return
         try:
             resp = httpx.post(f"{base}/api/market/diagnosis?refresh=1",
                               headers={"Authorization": f"Bearer {token}"},
@@ -448,9 +679,10 @@ class QuantScheduler:
                 d = resp.json()
                 logger.info("市场诊断更新: %s (%s)", d.get("label"), d.get("state"))
             else:
-                logger.warning("市场诊断任务返回 %s", resp.status_code)
+                raise RuntimeError(f"市场诊断接口返回 HTTP {resp.status_code}")
         except Exception as exc:
             logger.warning("市场诊断任务失败: %s", exc)
+            raise
 
     def job_position_monitor(self):
         """持仓风控巡检(交易时段, 间隔见 risk_limits.yaml)。
@@ -469,6 +701,15 @@ class QuantScheduler:
                             len(r["triggered"]), r.get("skipped")[:3])
         except Exception as exc:
             logger.error("持仓巡检异常: %s", exc, exc_info=True)
+            raise
+
+    def job_confirmation_timeout(self):
+        """处理已到期人工确认单；状态和到期时间均在数据库，不依赖临时线程。"""
+        from workflows.intraday_monitor_workflow import get_broker
+        from workflows.trading_workflow import process_expired_confirmations
+        results = process_expired_confirmations(get_broker())
+        if results:
+            logger.warning("人工确认超时处理 %d 笔: %s", len(results), results)
 
     def job_match_pending_orders(self):
         """盘中订单撮合+超时撤单: 对未成交订单用最新行情撮合。
@@ -499,12 +740,14 @@ class QuantScheduler:
                     # —— 曾出现午休/收盘后用缓存价"撮合"限价单, 订单被瞬间成交
                     qtime = (quote or {}).get("quote_time")
                     if isinstance(qtime, datetime):
-                        if (datetime.now() - qtime).total_seconds() > 120:
+                        check_now = datetime.now(qtime.tzinfo) if qtime.tzinfo else datetime.now()
+                        if (check_now - qtime).total_seconds() > 120:
                             continue
                     elif isinstance(qtime, str):
                         try:
                             qt = datetime.fromisoformat(qtime.replace("Z", "+00:00"))
-                            if (datetime.now() - qt).total_seconds() > 120:
+                            check_now = datetime.now(qt.tzinfo) if qt.tzinfo else datetime.now()
+                            if (check_now - qt).total_seconds() > 120:
                                 continue
                         except Exception:
                             pass
@@ -542,6 +785,7 @@ class QuantScheduler:
                 logger.warning("日亏损熔断检查异常: %s", exc)
         except Exception as exc:
             logger.error("订单撮合任务异常: %s", exc, exc_info=True)
+            raise
 
     def job_weekly_report(self):
         """周报(周五18:00)。"""
@@ -553,6 +797,9 @@ class QuantScheduler:
         """ETF动量轮动实盘执行(收盘前, 修复: 回测策略此前从未应用于实盘)。
         与回测共用同一信号函数(rotation_executor), 按信号提交订单,
         受熔断保护; 是否启用见 config.yaml strategies.live_rotation。"""
+        if not _in_trading_hours():
+            logger.info("非交易日/非交易时段，跳过轮动")
+            return
         from strategies.live_rotation import run_live_rotation
         try:
             result = run_live_rotation()
@@ -561,11 +808,12 @@ class QuantScheduler:
                         n, result.get("skipped", [])[:3])
         except Exception as exc:
             logger.error("轮动执行异常: %s", exc, exc_info=True)
+            raise
 
     def job_monthly_report(self):
         """月报(每月1日18:00, 生成上月)。"""
         from reports.report_generator import get_report_generator
-        today = date.today()
+        today = business_today()
         prev = (today.replace(day=1) - timedelta(days=1))
         path = get_report_generator().generate_monthly_report(
             prev.year, prev.month)
@@ -574,7 +822,7 @@ class QuantScheduler:
     def job_annual_report(self):
         """年报(每年1月2日18:00, 生成上一年)。"""
         from reports.report_generator import get_report_generator
-        today = date.today()
+        today = business_today()
         path = get_report_generator().generate_annual_report(today.year - 1)
         logger.info("年报生成: %s", path)
 

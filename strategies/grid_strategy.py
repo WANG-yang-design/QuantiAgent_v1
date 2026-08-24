@@ -27,7 +27,7 @@ class GridStrategy(BaseStrategy):
             close = float(f.get("close", 0) or 0)
             support = float(f.get("support_20d", 0) or 0)
             resistance = float(f.get("resistance_20d", 0) or 0)
-            if close and support and (close - support) / support <= self.ratio:
+            if close and support and abs(close - support) / support <= self.ratio:
                 signals.append({
                     "strategy_id": self.strategy_id,
                     "symbol": item["symbol"],

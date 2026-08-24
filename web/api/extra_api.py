@@ -8,10 +8,11 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 
 from core.config import get_settings
 from database import repository as repo
@@ -23,6 +24,12 @@ from features.technical_indicators import compute_technical_features, to_frame
 logger = logging.getLogger("web.v2")
 
 router = APIRouter(prefix="/api")
+
+# 标的详情上游请求共享有界线程池，避免每个 HTTP 请求创建/销毁
+# 6 个线程，高并发时将数据源和服务器一同压垮。
+_SYMBOL_EXECUTOR = ThreadPoolExecutor(max_workers=12,
+                                      thread_name_prefix="symbol-detail")
+_SYMBOL_FETCH_SLOTS = threading.BoundedSemaphore(4)
 
 # ---------------------------------------------------------------
 # JSON 安全清洗: 数据源异常(单根K线/字段缺失)会让技术指标算出 NaN/Inf,
@@ -56,7 +63,9 @@ def _clean(payload):
 # ---------------------------------------------------------------
 def _check_token(authorization: Optional[str] = Header(None)):
     import hmac
-    token = get_settings().get("web.admin_token", "quantiagent-admin")
+    token = str(get_settings().get("web.admin_token", "") or "")
+    if len(token) < 32:
+        raise HTTPException(status_code=503, detail="Web 管理令牌未配置")
     if not authorization or not hmac.compare_digest(authorization, f"Bearer {token}"):
         raise HTTPException(status_code=401, detail="无效令牌")
 
@@ -69,14 +78,15 @@ def require_auth(authorization: Optional[str] = Header(None)):
 # 1. 批量实时行情(盯盘轮询, 用全市场spot缓存过滤, 避免逐只请求)
 # ================================================================
 @router.get("/quotes", dependencies=[Depends(require_auth)])
-def get_quotes(symbols: str = "", limit: int = 100):
+def get_quotes(response: Response, symbols: str = "", limit: int = 100):
     """批量行情: /api/quotes?symbols=510300,159915 或 不传symbols返回成交额Top。
     修复: 原实现只过滤 ETF 现货缓存 —— 自选池里的股票(6/0/3开头)永远查不到
     行情和中文名, 且现货列表(akshare)在服务器上被东财限流后长期冻结, 盯盘/
     监控页永远显示旧价。显式请求的标的改为走腾讯批量实时行情(与详情页同源),
     现货缓存只作为兜底/名称补充。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     svc = get_market_service()
-    spot = svc.get_etf_spot()
     want = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else []
     if want:
         # 实时行情优先(修复: 现货缓存可能冻结/缺失, 列表不再用旧价)
@@ -85,10 +95,12 @@ def get_quotes(symbols: str = "", limit: int = 100):
         etf_want = [s for s in want if s not in _INDEX_CODES]
         try:
             from data_sources.tencent_client import TencentClient
-            live = TencentClient().get_realtime_quotes_batch(etf_want) if etf_want else {}
+            from data_service.live_quote_service import get_live_quote_service
+            live = get_live_quote_service().get_quotes(etf_want, max_age=2.0) if etf_want else {}
+            tx_client = TencentClient()
             for sym in idx_want:
                 try:
-                    q = TencentClient().get_realtime_quote(
+                    q = tx_client.get_realtime_quote(
                         sym, "etf", tx_code=_INDEX_TX[sym])
                     if q and q.get("latest_price"):
                         live[sym] = q
@@ -97,7 +109,16 @@ def get_quotes(symbols: str = "", limit: int = 100):
         except Exception as exc:
             logger.warning("批量实时行情获取失败, 回退现货缓存: %s", exc)
             live = {}
-        spot_map = {s.get("symbol"): s for s in spot}
+        # Only load the slow/full-market cache when live data actually missed a
+        # symbol. Explicit quote requests must never block on an hourly snapshot.
+        missing = [s for s in want if s not in live]
+        spot_map = {}
+        if missing:
+            try:
+                spot_map = {s.get("symbol"): s for s in svc.get_etf_spot()
+                            if s.get("symbol") in missing}
+            except Exception as exc:
+                logger.debug("行情兜底现货加载失败: %s", exc)
         rows = []
         for sym in want:
             q = live.get(sym)
@@ -116,11 +137,12 @@ def get_quotes(symbols: str = "", limit: int = 100):
                     logger.debug("行情回退获取失败 %s: %s", sym, exc)
         rows = rows[:limit]
     else:
+        spot = svc.get_etf_spot()
         rows = sorted(spot, key=lambda x: x.get("amount", 0) or 0, reverse=True)[:limit]
         # 成交额Top也刷新为实时行情(修复: 现货缓存冻结时 Top 列表同样旧价)
         try:
-            from data_sources.tencent_client import TencentClient
-            live = TencentClient().get_realtime_quotes_batch(
+            from data_service.live_quote_service import get_live_quote_service
+            live = get_live_quote_service().get_quotes(
                 [r.get("symbol", "") for r in rows if r.get("symbol")])
             for r in rows:
                 q = live.get(r.get("symbol"))
@@ -128,10 +150,17 @@ def get_quotes(symbols: str = "", limit: int = 100):
                     r["latest_price"] = q.get("latest_price")
                     r["change_pct"] = q.get("change_pct", r.get("change_pct", 0))
                     r["volume"] = q.get("volume", r.get("volume", 0) or 0)
+                    r["amount"] = q.get("amount", r.get("amount", 0) or 0)
+                    r["quote_time"] = q.get("quote_time")
+                    r["source"] = q.get("source", "tencent")
         except Exception as exc:
             logger.debug("Top列表实时行情刷新失败(沿用现货): %s", exc)
     from core.symbol_names import resolve_symbol_name, INDEX_CODES as _IDX
+    from data_sources.tencent_client import _in_trading_hours
+    now = datetime.now()
+    market_open = _in_trading_hours(now)
     out = []
+    quote_times = []
     for s in rows:
         chg = float(s.get("change_pct", 0) or 0)
         name = s.get("name", "") or resolve_symbol_name(s.get("symbol", ""))
@@ -142,6 +171,16 @@ def get_quotes(symbols: str = "", limit: int = 100):
             atype = "stock"
         else:
             atype = "etf"
+        qt = s.get("quote_time")
+        if isinstance(qt, str):
+            try:
+                qt = datetime.fromisoformat(qt)
+            except ValueError:
+                qt = None
+        age_seconds = max(0, int((now - qt).total_seconds())) if isinstance(qt, datetime) else None
+        item_status = "stale" if market_open and (age_seconds is None or age_seconds > 15) else ("live" if market_open else "closed")
+        if isinstance(qt, datetime):
+            quote_times.append(qt)
         out.append({
             "symbol": sym,
             "name": name,
@@ -153,9 +192,21 @@ def get_quotes(symbols: str = "", limit: int = 100):
             "premium_rate": s.get("premium_rate", 0) or 0,
             "iopv": s.get("iopv", 0) or 0,
             "color": "up" if chg > 0.05 else ("down" if chg < -0.05 else "flat"),
-            "quote_time": datetime.now().strftime("%H:%M:%S"),
+            "quote_time": qt.isoformat(sep=" ", timespec="seconds") if isinstance(qt, datetime) else None,
+            "age_seconds": age_seconds,
+            "status": item_status,
+            "source": s.get("source", "fallback"),
+            "selected_source": s.get("selected_source", ""),
+            "verified_sources": s.get("verified_sources", 0),
+            "price_spread_pct": s.get("price_spread_pct", 0),
         })
-    return {"quotes": out, "total": len(out), "time": datetime.now().strftime("%H:%M:%S")}
+    status = "stale" if any(q["status"] == "stale" for q in out) else ("live" if market_open else "closed")
+    latest_qt = max(quote_times) if quote_times else None
+    return {"quotes": out, "total": len(out), "status": status,
+            "market_open": market_open,
+            "quote_time": latest_qt.strftime("%H:%M:%S") if latest_qt else None,
+            "server_time": now.isoformat(sep=" ", timespec="seconds"),
+            "time": now.strftime("%H:%M:%S")}
 
 
 # ================================================================
@@ -166,6 +217,7 @@ _INDEX_CODES = {"000001", "000300", "000905", "399006"}
 
 @router.get("/kline/{symbol}", dependencies=[Depends(require_auth)])
 def get_kline(symbol: str, days: int = 250):
+    days = max(1, min(int(days), 2000))
     end = date.today()
     start = end - timedelta(days=int(days * 1.6))
     if symbol in _INDEX_CODES:
@@ -453,6 +505,7 @@ def _build_day_points(rows):
 # ================================================================
 _symbol_cache: Dict[str, tuple] = {}   # symbol -> (expire_ts, data)
 _SYMBOL_CACHE_TTL = 20.0               # 详情整体缓存20秒(东财限流时避免接口超时)
+_SYMBOL_CACHE_MAX = 512
 
 
 _INDEX_TX = {"000001": "sh000001", "000300": "sh000300", "000905": "sh000905",
@@ -463,7 +516,25 @@ _INDEX_BS = {"000001": "sh.000001", "000300": "sh.000300", "000905": "sh.000905"
 
 @router.get("/symbol/{symbol}", dependencies=[Depends(require_auth)])
 def get_symbol_detail(symbol: str):
+    if not _SYMBOL_FETCH_SLOTS.acquire(timeout=1.0):
+        raise HTTPException(status_code=429, detail="标的详情请求过多，请稍后重试")
+    try:
+        return _get_symbol_detail(symbol)
+    finally:
+        _SYMBOL_FETCH_SLOTS.release()
+
+
+def _get_symbol_detail(symbol: str):
     now = time.time()
+    if len(_symbol_cache) > _SYMBOL_CACHE_MAX:
+        expired = [key for key, (expires, _) in _symbol_cache.items()
+                   if expires <= now]
+        for key in expired:
+            _symbol_cache.pop(key, None)
+        if len(_symbol_cache) > _SYMBOL_CACHE_MAX:
+            for key, _ in sorted(_symbol_cache.items(), key=lambda item: item[1][0])[
+                    :len(_symbol_cache) - _SYMBOL_CACHE_MAX]:
+                _symbol_cache.pop(key, None)
     hit = _symbol_cache.get(symbol)
     if hit and hit[0] > now:
         return hit[1]
@@ -500,36 +571,35 @@ def get_symbol_detail(symbol: str):
         return data
     # 修复: 原实现串行调用 6+ 个上游接口, 冷缓存时首屏可达 10-60s。
     # 改为并行拉取(各接口含超时保护, 单个失败不影响整体)。
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        fut_q = ex.submit(svc.get_realtime_quote, symbol, "etf")
-        fut_ob = ex.submit(svc.get_order_book, symbol, "etf")
-        fut_etf = ex.submit(svc.get_etf_info, symbol)
-        fut_bars = ex.submit(svc.get_daily_bars, symbol,
-                             date.today() - timedelta(days=400),
-                             date.today(), "etf")
-        fut_news = ex.submit(get_news_service().get_recent_news,
-                             symbol, 72, 15)
-        fut_anns = ex.submit(get_news_service().get_recent_announcements,
-                             symbol, 7, 10)
+    fut_q = _SYMBOL_EXECUTOR.submit(svc.get_realtime_quote, symbol, "etf")
+    fut_ob = _SYMBOL_EXECUTOR.submit(svc.get_order_book, symbol, "etf")
+    fut_etf = _SYMBOL_EXECUTOR.submit(svc.get_etf_info, symbol)
+    fut_bars = _SYMBOL_EXECUTOR.submit(
+        svc.get_daily_bars, symbol, date.today() - timedelta(days=400),
+        date.today(), "etf")
+    fut_news = _SYMBOL_EXECUTOR.submit(
+        get_news_service().get_recent_news, symbol, 72, 15)
+    fut_anns = _SYMBOL_EXECUTOR.submit(
+        get_news_service().get_recent_announcements, symbol, 7, 10)
 
-        def _safe(fut, default):
-            try:
-                return fut.result(timeout=30)
-            except Exception as exc:
-                logger.warning("标的详情并行获取失败 %s: %s", symbol, exc)
-                return default
+    def _safe(fut, default):
+        try:
+            return fut.result(timeout=30)
+        except Exception as exc:
+            fut.cancel()
+            logger.warning("标的详情并行获取失败 %s: %s", symbol, exc)
+            return default
 
-        quote, qrep = _safe(fut_q, ({}, None)) or ({}, None)
-        if qrep is None:
-            qrep = svc._failed_report(symbol, "realtime_quote", "并行获取失败")
-        ob, obrep = _safe(fut_ob, ({}, None)) or ({}, None)
-        if obrep is None:
-            obrep = svc._failed_report(symbol, "order_book", "并行获取失败")
-        etf_info = _safe(fut_etf, {"symbol": symbol}) or {"symbol": symbol}
-        bars, _ = _safe(fut_bars, ([], None)) or ([], None)
-        news = _safe(fut_news, []) or []
-        anns = _safe(fut_anns, []) or []
+    quote, qrep = _safe(fut_q, ({}, None)) or ({}, None)
+    if qrep is None:
+        qrep = svc._failed_report(symbol, "realtime_quote", "并行获取失败")
+    ob, obrep = _safe(fut_ob, ({}, None)) or ({}, None)
+    if obrep is None:
+        obrep = svc._failed_report(symbol, "order_book", "并行获取失败")
+    etf_info = _safe(fut_etf, {"symbol": symbol}) or {"symbol": symbol}
+    bars, _ = _safe(fut_bars, ([], None)) or ([], None)
+    news = _safe(fut_news, []) or []
+    anns = _safe(fut_anns, []) or []
     tech = compute_technical_features(bars) if bars else {}
     name = quote.get("name") or etf_info.get("name") or ""
     data = {
@@ -600,7 +670,15 @@ def get_backtest_kline(run_id: str, symbol: str):
     except (ValueError, TypeError):
         end = date.today()
         start = end - timedelta(days=int(250 * 1.6))
-    bars, _ = get_market_service().get_daily_bars(symbol, start, end, "etf")
+    # 必须使用回测完成时冻结并持久化的行情快照。重新向外部数据源拉历史K线
+    # 会因供应商、复权或覆盖区间变化而与当时的买卖点不一致。
+    snapshot = metrics.get("market_snapshot") or {}
+    bars = snapshot.get(symbol) or []
+    if not bars:
+        # 仅兼容修复前的历史回测；新回测没有快照视为不可复现，不再静默联网重画。
+        raise HTTPException(
+            status_code=409,
+            detail="该历史回测未保存行情快照，无法保证K线与回测一致；请重新运行回测")
     df = to_frame(bars)
     if df.empty:
         raise HTTPException(status_code=404, detail=f"无 {symbol} K线数据")
@@ -672,9 +750,11 @@ def get_backtest_kline(run_id: str, symbol: str):
                 name_map[w.symbol] = w.name
     except Exception:
         pass
+    coverage = (metrics.get("data_coverage") or {}).get(symbol) or {}
     return _clean({"symbol": symbol, "name": name_map.get(symbol, ""),
                    "candles": candles, "marks": marks, "round_trips": round_trips,
-                   "trade_count": len(trades)})
+                   "trade_count": len(trades), "coverage": coverage,
+                   "snapshot_hash": metrics.get("data_snapshot_hash", "")})
 
 
 # ================================================================
@@ -724,11 +804,15 @@ def get_system_mode():
     try:
         from core.symbol_names import resolve_symbol_name
         confirms = [
-            {"confirm_id": c.confirm_id, "symbol": c.symbol,
+            {"confirm_id": c.confirm_id, "plan_id": c.plan_id,
+             "trace_id": c.trace_id, "symbol": c.symbol,
              "name": resolve_symbol_name(c.symbol),
              "action": c.action, "amount": c.amount,
              "risk_level": c.risk_level, "reason": c.reason,
-             "created_at": str(c.created_at)[:16]}
+             "created_at": str(c.created_at)[:19],
+             "expires_at": str(c.expires_at or "")[:19],
+             "timeout_action": c.timeout_action,
+             "context": c.context_json or {}}
             for c in repo.list_pending_confirmations()
         ]
     except Exception as exc:
@@ -783,26 +867,77 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
     """后台线程执行回测(不阻塞HTTP)。"""
     from backtest.engine import BacktestEngine
     from backtest.data_replayer import DataReplayer
-    from strategies.rotation_executor import build_rotation_signal_fn
+    from strategies.rotation_executor import build_rotation_signal_fn, resolve_rotation_params
     from database import repository as _repo
 
-    params = body.get("params") or {}
-    signal_fn = build_rotation_signal_fn(
-        initial_cash=float(body.get("initial_cash", 100000)),
-        params=params)
+    params = resolve_rotation_params(body.get("params") or {}, use_live_preset=False)
 
     # 标的名称映射(交易明细显示中文名)
     name_map: Dict[str, str] = {}
     symbols = body.get("symbols") or []
+    universe_mode = str(body.get("universe_mode", "manual") or "manual")
+    universe_provider = None
+    try:
+        if universe_mode == "dynamic_etf":
+            if str(body.get("mode", "daily")) != "daily":
+                raise ValueError("动态ETF池当前仅支持日线回测")
+            from strategies.dynamic_etf_universe import (
+                DynamicEtfUniverseSelector, HistoricalUniverseProvider,
+                dynamic_pool_config,
+            )
+            dynamic_cfg = dynamic_pool_config(body.get("universe_config") or {})
+            symbols = _repo.get_etf_history_symbols(
+                date.fromisoformat(body["end"]),
+                min_bars=max(20, dynamic_cfg["liquidity_window"]),
+            )
+            if len(symbols) < dynamic_cfg["min_candidates"]:
+                raise ValueError(
+                    f"数据库仅有 {len(symbols)} 只ETF具备可用历史行情，"
+                    f"不足动态池最低要求 {dynamic_cfg['min_candidates']}")
+            universe_provider = HistoricalUniverseProvider(
+                DynamicEtfUniverseSelector(dynamic_cfg),
+                source_mode="backtest", snapshot_salt=run_id)
+        signal_fn = build_rotation_signal_fn(
+            initial_cash=float(body.get("initial_cash", 100000)),
+            params=params, universe_provider=universe_provider)
+    except Exception as exc:
+        with _backtest_lock:
+            task = _backtest_tasks.get(run_id)
+            if task:
+                task["status"] = "FAILED"
+                task["progress"] = f"失败: {exc}"
+        _repo.update_backtest_run(run_id, "FAILED")
+        return
+    requested_asset_type = str(body.get("asset_type", "auto") or "auto").lower()
+    if requested_asset_type not in ("auto", "stock", "etf"):
+        requested_asset_type = "auto"
+    asset_types: Dict[str, str] = {}
     try:
         for w in _repo.get_watchlist():
             name_map[w["symbol"]] = w["name"]
+            if w.get("asset_type") in ("stock", "etf"):
+                asset_types[w["symbol"]] = w["asset_type"]
         from database.models import Symbol as _Sym
         with get_session() as s:
             for sy in s.query(_Sym).all():
                 name_map.setdefault(sy.symbol, sy.name)
+                if sy.asset_type in ("stock", "etf"):
+                    asset_types.setdefault(sy.symbol, sy.asset_type)
     except Exception:
         pass
+    # Dynamic mode discovers the mother universe above, so build the complete
+    # name map after that discovery.  Otherwise trades outside the watchlist
+    # are persisted with a code only even though Symbol already has the name.
+    metadata = _repo.get_symbol_metadata(list(symbols))
+    for symbol, meta in metadata.items():
+        name_map[symbol] = str(meta.get("name") or name_map.get(symbol) or "")
+        if meta.get("asset_type") in ("stock", "etf"):
+            asset_types[symbol] = str(meta["asset_type"])
+    # 未登记标的按代码规则推断。显式 asset_type 可覆盖自动识别。
+    from core.symbol_utils import infer_asset_type
+    for symbol in symbols:
+        asset_types[symbol] = (requested_asset_type if requested_asset_type != "auto"
+                               else asset_types.get(symbol) or infer_asset_type(symbol))
 
     def progress_cb(done: int, total: int):
         # 修复: total=0 时除零崩溃, 整次回测被误判 FAILED
@@ -824,12 +959,18 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
             use_agents=bool(body.get("use_agents", False)),
             name=body.get("name", ""),
             run_id=run_id,          # 复用提交时的 run_id(避免产生重复回测记录)
+            asset_type=requested_asset_type if requested_asset_type != "auto" else "etf",
+            asset_types=asset_types,
         )
         engine.progress_cb = progress_cb
         engine.params = params
+        engine.params["universe_mode"] = universe_mode
         engine.name_map = name_map
-        replayer = DataReplayer(symbols or
-                                ["510300", "159915", "588000", "512100", "159949"])
+        run_symbols = symbols or ["510300", "159915", "588000", "512100", "159949"]
+        replayer = DataReplayer(
+            run_symbols, asset_types=asset_types,
+            min_coverage=float(get_settings().get("backtest.minimum_coverage", 0.98)),
+            online_fill=(universe_mode != "dynamic_etf"))
         if body.get("mode") == "minute":
             metrics = engine.run_minute(replayer, signal_fn)
         else:
@@ -865,8 +1006,24 @@ def submit_backtest(body: dict):
         raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD, 资金应为数字")
     if start >= end:
         raise HTTPException(status_code=400, detail="开始日期必须早于结束日期")
+    if (end - start).days > 3650:
+        raise HTTPException(status_code=400, detail="回测区间不能超过10年")
     if initial_cash <= 0:
         raise HTTPException(status_code=400, detail="初始资金必须大于 0")
+    universe_mode = str(body.get("universe_mode", "manual") or "manual")
+    if universe_mode not in ("manual", "dynamic_etf"):
+        raise HTTPException(status_code=400, detail="universe_mode 应为 manual/dynamic_etf")
+    from core.symbol_names import INDEX_CODES
+    index_symbols = sorted(set(body.get("symbols") or []) & INDEX_CODES)
+    if index_symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"指数不能直接交易或参与轮动下单：{', '.join(index_symbols)}；请改选对应ETF")
+    mode = str(body.get("mode", "daily"))
+    if mode not in ("daily", "minute"):
+        raise HTTPException(status_code=400, detail="mode 应为 daily/minute")
+    if universe_mode == "dynamic_etf" and mode != "daily":
+        raise HTTPException(status_code=400, detail="动态ETF池当前仅支持日线回测")
     # 并发上限(防线程/资源耗尽)
     _cleanup_done_tasks(_backtest_tasks, _backtest_lock)
     if _count_active_tasks(_backtest_tasks) >= _BACKTEST_MAX_CONCURRENT:
@@ -895,14 +1052,53 @@ def submit_backtest(body: dict):
 def list_backtests(limit: int = 20):
     """注意: 必须定义在 /backtest/{run_id} 之前, 否则会被路径参数抢先匹配。
     只列出有结果的回测(排除历史上重复提交残留的 PENDING 空记录)。"""
-    from database.models import BacktestRun
+    from database.models import BacktestResult, BacktestRun
     with get_session() as s:
-        runs = s.query(BacktestRun).filter(
+        rows = s.query(BacktestRun, BacktestResult).outerjoin(
+            BacktestResult, BacktestResult.run_id == BacktestRun.run_id).filter(
             BacktestRun.status.in_(["DONE", "FAILED"])) \
             .order_by(BacktestRun.created_at.desc()).limit(limit).all()
         return [{"run_id": r.run_id, "name": r.name, "start": str(r.start_date),
                  "end": str(r.end_date), "mode": r.mode, "status": r.status,
-                 "created_at": str(r.created_at)[:16]} for r in runs]
+                 "created_at": str(r.created_at)[:19],
+                 "finished_at": str(r.finished_at)[:19] if r.finished_at else None,
+                 "duration_seconds": (round((r.finished_at - r.created_at).total_seconds(), 1)
+                                      if r.finished_at else None),
+                 "universe_mode": (
+                     (r.config_json or {}).get("universe_mode")
+                     or ((r.config_json or {}).get("params") or {}).get("universe_mode")
+                     or ("dynamic_etf" if result and
+                         (result.metrics_json or {}).get("universe_snapshots") else "manual")),
+                 "total_return": result.total_return if result else None,
+                 "max_drawdown": result.max_drawdown if result else None,
+                 "trade_count": ((result.metrics_json or {}).get("trade_count")
+                                 if result else None)}
+                for r, result in rows]
+
+
+def _annotate_backtest_snapshot_integrity(metrics: Optional[dict]) -> Optional[dict]:
+    """标记修复上线前已保存、但含混合复权口径的历史回测。"""
+    if not metrics or metrics.get("data_integrity_error"):
+        return metrics
+    if any(r.get("price_adjustments")
+           for r in (metrics.get("data_coverage") or {}).values()):
+        return metrics
+    from backtest.data_replayer import DataReplayer
+    bad_symbols = []
+    asset_types = (metrics.get("params") or {}).get("asset_types") or {}
+    for symbol, bars in (metrics.get("market_snapshot") or {}).items():
+        _, events = DataReplayer._normalize_price_regimes(
+            bars, asset_types.get(symbol, "etf"))
+        if events:
+            bad_symbols.append(f"{symbol}({len(events)}处)")
+    if not bad_symbols:
+        return metrics
+    return {
+        **metrics,
+        "data_integrity_error":
+        "历史回测快照存在复权口径断层：" + "、".join(bad_symbols) +
+        "；收益、回撤及买卖点均不可信，请重新运行回测。",
+    }
 
 
 @router.get("/backtest/{run_id}", dependencies=[Depends(require_auth)])
@@ -913,8 +1109,9 @@ def get_backtest_status(run_id: str):
         # 进程重启后从DB恢复状态
         result = repo.get_backtest_result(run_id)
         if result:
+            metrics = _annotate_backtest_snapshot_integrity(result.metrics_json)
             return {"run_id": run_id, "status": "DONE", "progress": "完成",
-                    "metrics": result.metrics_json}
+                    "metrics": metrics}
         from database.models import BacktestRun
         with get_session() as s:
             run = s.query(BacktestRun).filter_by(run_id=run_id).first()
@@ -929,7 +1126,8 @@ def get_backtest_status(run_id: str):
                     "progress": "任务已提交(服务重启后需重新执行)", "metrics": None}
         raise HTTPException(status_code=404, detail="回测任务不存在")
     return {"run_id": run_id, "status": task["status"],
-            "progress": task["progress"], "metrics": task.get("metrics")}
+            "progress": task["progress"],
+            "metrics": _annotate_backtest_snapshot_integrity(task.get("metrics"))}
 
 
 # ================================================================
@@ -1120,8 +1318,22 @@ def get_workflow_trace(trace_id: str):
             end_ts = events[-1].created_at
         if start_ts and end_ts:
             duration = round((end_ts - start_ts).total_seconds(), 1)
+        snapshot = {}
+        for e in events:
+            payload = e.payload_json or {}
+            if payload.get("data_snapshot"):
+                snapshot = payload["data_snapshot"]
+                break
+        if not snapshot:
+            snapshot_node = next((n for n in nodes
+                                  if ((n.get("output") or {}).get("data_snapshot"))), None)
+            snapshot = ((snapshot_node or {}).get("output") or {}).get("data_snapshot") or {}
         return {
             "trace_id": trace_id,
+            "symbol": symbol, "name": name,
+            "started_at": str(start_ts)[:19] if start_ts else "",
+            "finished_at": str(end_ts)[:19] if end_ts else "",
+            "data_snapshot": snapshot,
             "duration": duration,
             "nodes": nodes,
             "events": [{"event_type": e.event_type, "actor": e.actor,
@@ -1235,14 +1447,12 @@ def get_scan_status(task_id: str):
 @router.get("/watchlist", dependencies=[Depends(require_auth)])
 def get_watchlist():
     """监控列表(按分类聚合)。
-    修复: 1) 股票类标的名称字段常为空(添加时只查了ETF现货), 现统一用名称
-    解析器补全并写回; 2) 持仓类标的附上当前持仓信息(数量/成本/现价/盈亏),
-    前端"监控标的"页可直接看到持仓详情。"""
+    名称和 holding 分类只在响应中补全，并附上当前持仓信息；
+    GET 请求保持纯读，不会因前端轮询改写数据库。"""
     from core.symbol_names import resolve_symbol_name
     items = repo.get_watchlist()
-    # 同步持仓分类(持仓自动加入监控)。
-    # 修复: 原实现每次轮询都 upsert 全部持仓(读请求产生持续写放大),
-    # 改为仅当持仓集合发生变化时才写库。
+    # 持仓分类在响应中虚拟合并。GET 端点不再补名/改分类/写库，
+    # 以免前端轮询变成隐性持续写。
     from workflows.intraday_monitor_workflow import get_broker
     position_map = {}
     try:
@@ -1250,50 +1460,32 @@ def get_watchlist():
         position_map = {p["symbol"]: p for p in positions}
         holding_syms = set(position_map.keys())
         existing = {i["symbol"] for i in items}
-        missing = holding_syms - existing
-        if missing:
-            from database import repository as _repo
-            for p in positions:
-                if p["symbol"] in missing:
-                    _repo.upsert_watch_item(p["symbol"], p.get("name", ""), "etf",
-                                            categories=["holding"], enabled=True,
-                                            priority=100)
-            items = repo.get_watchlist()
+        for p in positions:
+            if p["symbol"] not in existing:
+                items.append({
+                    "symbol": p["symbol"], "name": p.get("name", ""),
+                    "asset_type": "etf", "categories": ["holding"],
+                    "enabled": True, "priority": 100,
+                })
     except Exception:
         pass
     # 修复: 已存在监控列表中的标的(如策略刚买入的)此前永远不会被加上
     # "holding"分类 —— 同步逻辑只给"新出现的持仓"建项, 已存在的标的
     # 买入后仍留在原分类, 监控标的页"持仓"分组看不到新买入的股票。
     # 现在: 有持仓但分类缺 holding 的 → 补上; 已清仓且含 holding 的 → 移除。
-    try:
-        from database import repository as _repo
-        changed = False
-        for i in items:
-            cats = list(i.get("categories") or [])
-            has_pos = i["symbol"] in position_map
-            if has_pos and "holding" not in cats:
-                cats = ["holding"] + [c for c in cats if c != "holding"]
-                _repo.set_watch_categories(i["symbol"], cats)
-                changed = True
-            elif not has_pos and "holding" in cats:
-                _repo.set_watch_categories(i["symbol"],
-                                           [c for c in cats if c != "holding"])
-                changed = True
-        if changed:
-            items = repo.get_watchlist()
-    except Exception:
-        pass
+    for i in items:
+        cats = list(i.get("categories") or [])
+        has_pos = i["symbol"] in position_map
+        if has_pos and "holding" not in cats:
+            i["categories"] = ["holding"] + cats
+        elif not has_pos and "holding" in cats:
+            i["categories"] = [c for c in cats if c != "holding"]
     # 名称补全(股票看不到中文名的根因) + 持仓信息附加
     for i in items:
         if not i.get("name"):
             name = resolve_symbol_name(i["symbol"])
             if name:
                 i["name"] = name
-                try:
-                    repo.upsert_watch_item(i["symbol"], name, i.get("asset_type", "etf"),
-                                           categories=i.get("categories"))
-                except Exception:
-                    pass
         pos = position_map.get(i["symbol"])
         i["position"] = {
             "total_qty": pos.get("total_qty", 0),
@@ -1305,6 +1497,44 @@ def get_watchlist():
             "pnl_pct": pos.get("pnl_pct", 0),
         } if pos else None
     return {"items": items, "total": len(items)}
+
+
+@router.get("/universe/etf/snapshots", dependencies=[Depends(require_auth)])
+def get_etf_universe_snapshots(limit: int = 20, source_mode: Optional[str] = None):
+    """Auditable point-in-time dynamic ETF pool snapshots."""
+    rows = repo.list_etf_universe_snapshots(limit=limit, source_mode=source_mode)
+    return {"items": rows, "latest": rows[0] if rows else None}
+
+
+@router.post("/universe/etf/refresh", dependencies=[Depends(require_auth)])
+def refresh_etf_universe():
+    from strategies.dynamic_etf_universe import build_current_paper_snapshot
+    try:
+        return {"ok": True, "snapshot": build_current_paper_snapshot(
+            date.today(), force=True)}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/universe/etf/override/{symbol}", dependencies=[Depends(require_auth)])
+def set_etf_universe_override(symbol: str, body: dict):
+    """Set pin/exclude/auto without deleting the user's watch item."""
+    mode = str(body.get("mode", "auto") or "auto")
+    if mode not in ("auto", "pin", "exclude"):
+        raise HTTPException(status_code=400, detail="mode 应为 auto/pin/exclude")
+    items = {x["symbol"]: x for x in repo.get_watchlist()}
+    item = items.get(symbol)
+    if item is None:
+        meta = repo.get_symbol_metadata([symbol]).get(symbol) or {}
+        if meta.get("asset_type") != "etf":
+            raise HTTPException(status_code=400, detail="动态池覆盖只支持ETF")
+        repo.upsert_watch_item(symbol, meta.get("name", ""), "etf",
+                               categories=["watched"], enabled=True)
+        item = {"categories": ["watched"]}
+    repo.set_watch_category_flag(symbol, "pool_pin", mode == "pin")
+    repo.set_watch_category_flag(symbol, "pool_exclude", mode == "exclude")
+    return {"ok": True, "symbol": symbol, "mode": mode,
+            "note": "覆盖将在下一次动态池快照生效；当前快照保持不可变"}
 
 
 @router.post("/watchlist", dependencies=[Depends(require_auth)])
@@ -1367,36 +1597,33 @@ _INDEX_MAP = {
 
 
 @router.get("/index/overview", dependencies=[Depends(require_auth)])
-def get_index_overview():
-    """大盘指数实时概览(新浪行情)。"""
-    import httpx
-    codes = list(_INDEX_MAP.keys())
+def get_index_overview(response: Response):
+    """大盘指数实时概览(共享腾讯实时快照，含交易所时间)。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    symbols = [code[2:] for code in _INDEX_MAP]
     try:
-        resp = httpx.get(f"https://hq.sinajs.cn/list={','.join(codes)}",
-                         headers={"Referer": "https://finance.sina.com.cn/"}, timeout=10)
-        text = resp.content.decode("gbk", errors="ignore")
+        from data_service.live_quote_service import get_live_quote_service
+        live = get_live_quote_service().get_quotes(symbols, max_age=2.0)
     except Exception as exc:
         logger.warning("指数行情获取失败: %s", exc)
         return {"indexes": [], "time": datetime.now().strftime("%H:%M:%S")}
     indexes = []
-    for line in text.strip().splitlines():
-        if '="' not in line:
+    for tx_code, name in _INDEX_MAP.items():
+        symbol = tx_code[2:]
+        quote = live.get(symbol)
+        if not quote:
             continue
-        key = line.split("=")[0].split("_")[-1]
-        parts = line.split('="')[1].rstrip('";').split(",")
-        if len(parts) < 32:
-            continue
-        name = _INDEX_MAP.get(key, parts[0])
-        try:
-            price = float(parts[3])
-            prev = float(parts[2])
-            chg = (price / prev - 1) * 100 if prev else 0.0
-        except (ValueError, IndexError):
-            continue
-        indexes.append({"code": key, "name": name, "price": round(price, 2),
+        price = float(quote.get("latest_price", 0) or 0)
+        chg = float(quote.get("change_pct", 0) or 0)
+        qt = quote.get("quote_time")
+        indexes.append({"code": tx_code, "name": name, "price": round(price, 2),
                         "change_pct": round(chg, 2),
+                        "quote_time": qt.isoformat(sep=" ", timespec="seconds") if isinstance(qt, datetime) else None,
+                        "source": quote.get("source", "tencent"),
                         "color": "up" if chg > 0.05 else ("down" if chg < -0.05 else "flat")})
-    return {"indexes": indexes, "time": datetime.now().strftime("%H:%M:%S")}
+    latest = max((i["quote_time"] for i in indexes if i.get("quote_time")), default=None)
+    return {"indexes": indexes, "quote_time": latest,
+            "time": datetime.now().strftime("%H:%M:%S")}
 
 
 @router.get("/market/diagnosis", dependencies=[Depends(require_auth)])
@@ -1476,9 +1703,22 @@ def get_stock_spot(limit: int = 100):
     import time as _t
     global _stock_spot_cache, _stock_spot_cache_ts
     now = _t.time()
+    limit = max(1, min(int(limit), 500))
     if _stock_spot_cache and now - _stock_spot_cache_ts < 3600:
-        return {"stocks": _stock_spot_cache[:limit],
-                "cached": True}
+        stocks = [dict(s) for s in _stock_spot_cache[:limit]]
+        try:
+            from data_service.live_quote_service import get_live_quote_service
+            live = get_live_quote_service().get_quotes(
+                [s["symbol"] for s in stocks if s.get("symbol")])
+            for stock in stocks:
+                quote = live.get(stock.get("symbol"))
+                if quote:
+                    for key in ("latest_price", "change_pct", "amount", "volume", "quote_time", "source"):
+                        if key in quote:
+                            stock[key] = quote[key]
+        except Exception as exc:
+            logger.debug("热门股票实时价刷新失败: %s", exc)
+        return _clean({"stocks": stocks, "cached": True})
     import akshare as ak
     try:
         df = ak.stock_zh_a_spot_em()
@@ -1493,7 +1733,7 @@ def get_stock_spot(limit: int = 100):
             for _, r in df.head(500).iterrows()]
         _stock_spot_cache = stocks
         _stock_spot_cache_ts = now
-        return {"stocks": stocks[:limit], "cached": False}
+        return _clean({"stocks": stocks[:limit], "cached": False})
     except Exception as exc:
         logger.warning("股票列表获取失败(回退baostock): %s", exc)
         # 兜底: baostock 全量代码+名称(无行情, 仅供搜索/看名称)
@@ -1501,8 +1741,8 @@ def get_stock_spot(limit: int = 100):
         if fallback:
             _stock_spot_cache = fallback
             _stock_spot_cache_ts = now
-        return {"stocks": fallback[:limit] if fallback else [],
-                "error": str(exc), "fallback": True}
+        return _clean({"stocks": fallback[:limit] if fallback else [],
+                       "error": "股票列表数据源暂不可用", "fallback": True})
 
 
 def _baostock_stock_names() -> List[Dict[str, Any]]:
@@ -1550,9 +1790,23 @@ def _baostock_stock_names() -> List[Dict[str, Any]]:
 # ================================================================
 @router.get("/agents/config", dependencies=[Depends(require_auth)])
 def get_agent_config():
-    """Agent 启用状态列表(必须启用的不可关闭)。"""
-    from core.agent_switch import all_agent_states
-    return {"agents": all_agent_states()}
+    """Agent 总开关及逐 Agent 启用状态。"""
+    from core.agent_switch import agent_system_enabled, all_agent_states
+    return {"master_enabled": agent_system_enabled(),
+            "agents": all_agent_states()}
+
+
+@router.post("/agents/config/master", dependencies=[Depends(require_auth)])
+def set_agent_master_config(body: dict):
+    """切换 Agent 系统总开关；关闭后不再执行自动或手动 Agent 扫描。"""
+    from core.agent_switch import (agent_system_enabled, all_agent_states,
+                                   set_agent_system_enabled)
+    raw = body.get("enabled")
+    if not isinstance(raw, bool):
+        raise HTTPException(status_code=400, detail="enabled(布尔) 必填")
+    set_agent_system_enabled(raw)
+    return {"ok": True, "master_enabled": agent_system_enabled(),
+            "agents": all_agent_states()}
 
 
 @router.post("/agents/config", dependencies=[Depends(require_auth)])
@@ -1687,6 +1941,21 @@ def get_agent_accuracy(days: int = 90, horizon_days: int = 5):
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
 
 
+@router.get("/agents/shadow-performance", dependencies=[Depends(require_auth)])
+def get_agent_shadow_performance(days: int = 365, refresh: bool = True):
+    """正式策略信号 vs 当时 Agent 观点的影子评估，不包含 Agent 主动交易。"""
+    from analytics.agent_shadow import evaluate_pending, shadow_summary
+    evaluation = evaluate_pending() if refresh else {}
+    return {**shadow_summary(days=days), "evaluation": evaluation,
+            "policy": {
+                "trade_authority": "STRATEGY_ONLY",
+                "agent_role": "SHADOW_OBSERVER",
+                "agent_can_block_orders": False,
+                "agent_can_create_orders": False,
+                "hard_risk_can_reject": True,
+            }}
+
+
 # ================================================================
 # 13. 账户手动快照(净值曲线)
 # ================================================================
@@ -1703,7 +1972,7 @@ def manual_snapshot():
 # ================================================================
 # 12.8 命名策略 (轮动参数保存/应用, 修复: 参数改完不想再被覆盖/丢失)
 # 存储: data/strategy_presets.json, 运行时生效(免重启)
-#   保存某次策略 → 一键应用到回测表单(前端加载) / 一键应用到实盘(active_live)
+#   保存某次策略 → 一键应用到回测表单 / 一键应用到模拟盘(active_paper)
 # ================================================================
 _STRATEGY_PRESET_FILE = None
 
@@ -1715,10 +1984,22 @@ def _preset_store() -> dict:
         _STRATEGY_PRESET_FILE = _ROOT / "data" / "strategy_presets.json"
     try:
         if _STRATEGY_PRESET_FILE.exists():
-            return json.loads(_STRATEGY_PRESET_FILE.read_text(encoding="utf-8")) or {}
+            store = json.loads(_STRATEGY_PRESET_FILE.read_text(encoding="utf-8")) or {}
+            # One-time compatibility for files created before the paper/live
+            # execution mode was made explicit.
+            if "active_paper" not in store and store.get("active_live"):
+                store["active_paper"] = store.get("active_live")
+            # 两阶段动态池上线前保存的固定池策略不可直接沿用到模拟盘。
+            for name, raw in list((store.get("presets") or {}).items()):
+                if isinstance(raw, dict) and "universe_mode" not in raw:
+                    raw["universe_mode"] = "legacy_manual"
+            active = store.get("active_paper", "")
+            if active and (store.get("presets", {}).get(active) or {}).get("universe_mode") != "dynamic_etf":
+                store["active_paper"] = ""
+            return store
     except Exception:
         pass
-    return {"presets": {}, "active_live": ""}
+    return {"presets": {}, "active_paper": ""}
 
 
 def _save_preset_store(store: dict):
@@ -1729,16 +2010,18 @@ def _save_preset_store(store: dict):
 
 @router.get("/strategies/presets", dependencies=[Depends(require_auth)])
 def list_strategy_presets():
-    """命名策略列表(含当前实盘生效的策略)。"""
+    """命名策略列表(含当前模拟盘生效的策略)。"""
     store = _preset_store()
-    active = store.get("active_live", "")
+    active = store.get("active_paper", "")
     presets = []
     for name, params in (store.get("presets") or {}).items():
         presets.append({
             "name": name, "params": params,
-            "active_live": (name == active),
+            "active_paper": (name == active),
+            "universe_mode": params.get("universe_mode", "legacy_manual"),
+            "compatible_dynamic": params.get("universe_mode") == "dynamic_etf",
         })
-    return {"presets": presets, "active_live": active}
+    return {"presets": presets, "active_paper": active}
 
 
 @router.post("/strategies/presets", dependencies=[Depends(require_auth)])
@@ -1750,10 +2033,17 @@ def save_strategy_preset(body: dict):
         raise HTTPException(status_code=400, detail="策略名称不能为空")
     if not isinstance(params, dict) or not params:
         raise HTTPException(status_code=400, detail="params 不能为空")
+    # Persist a complete validated snapshot. Named strategies must not inherit
+    # future config.yaml changes for parameters omitted by the current form.
+    from strategies.rotation_executor import resolve_rotation_params
+    universe_mode = str(body.get("universe_mode", "dynamic_etf") or "dynamic_etf")
+    params = resolve_rotation_params(params, use_live_preset=False)
+    params = {k: v for k, v in params.items() if not str(k).startswith("_")}
+    params["universe_mode"] = universe_mode
     store = _preset_store()
     store.setdefault("presets", {})[name] = params
     _save_preset_store(store)
-    return {"ok": True, "name": name, "active_live": store.get("active_live", "")}
+    return {"ok": True, "name": name, "active_paper": store.get("active_paper", "")}
 
 
 @router.delete("/strategies/presets/{name}", dependencies=[Depends(require_auth)])
@@ -1761,27 +2051,39 @@ def delete_strategy_preset(name: str):
     store = _preset_store()
     if name in (store.get("presets") or {}):
         del store["presets"][name]
-        if store.get("active_live") == name:
-            store["active_live"] = ""
+        if store.get("active_paper") == name:
+            store["active_paper"] = ""
         _save_preset_store(store)
     return {"ok": True}
 
 
-@router.post("/strategies/presets/{name}/apply_live", dependencies=[Depends(require_auth)])
-def apply_strategy_preset_live(name: str):
-    """一键应用到实盘: 实盘轮动立即使用该策略参数(运行时生效, 免重启)。
-    name="__default__" 时清除实盘覆盖, 恢复 config.yaml 默认参数。"""
+@router.post("/strategies/presets/{name}/apply_paper", dependencies=[Depends(require_auth)])
+def apply_strategy_preset_paper(name: str):
+    """一键应用到模拟盘自动轮动，运行时生效且无需重启。"""
     store = _preset_store()
     if name == "__default__":
-        store["active_live"] = ""
+        store["active_paper"] = ""
+        store.pop("active_live", None)
         _save_preset_store(store)
-        return {"ok": True, "active_live": "", "note": "已恢复 config.yaml 默认参数"}
+        return {"ok": True, "active_paper": "", "note": "已恢复 config.yaml 默认参数"}
     if name not in (store.get("presets") or {}):
         raise HTTPException(status_code=404, detail=f"策略 {name} 不存在")
-    store["active_live"] = name
+    if (store["presets"][name] or {}).get("universe_mode") != "dynamic_etf":
+        raise HTTPException(status_code=400,
+                            detail="该策略来自旧固定标的池，不能上动态ETF模拟盘；请先用动态ETF池重新回测并保存")
+    from strategies.rotation_executor import resolve_rotation_params
+    effective_params = resolve_rotation_params(
+        store["presets"][name], use_live_preset=False)
+    effective_params = {
+        k: v for k, v in effective_params.items() if not str(k).startswith("_")}
+    # Upgrade legacy partial presets to the immutable full-snapshot format.
+    store["presets"][name] = effective_params
+    store["active_paper"] = name
+    store.pop("active_live", None)
     _save_preset_store(store)
-    return {"ok": True, "active_live": name,
-            "note": "实盘轮动(strategy_rotation)与回测默认参数已切换, 回测表单仍可单独覆盖"}
+    return {"ok": True, "active_paper": name,
+            "effective_params": effective_params,
+            "note": "模拟盘自动轮动已切换；回测表单参数仍彼此独立"}
 
 
 # ================================================================
@@ -1791,8 +2093,8 @@ def apply_strategy_preset_live(name: str):
 def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
     """账户分析: period=day/week/month/year。
     返回区间净值曲线、沪深300基准、账户统计、单标的统计、成交明细。"""
-    from reports.report_generator import ReportGenerator
-    rg = ReportGenerator()
+    from reports.report_generator import get_report_generator
+    rg = get_report_generator()
     if period not in ("day", "week", "month", "year"):
         raise HTTPException(status_code=400, detail="period 应为 day/week/month/year")
     start, end = rg._period_bounds(period, date.today())

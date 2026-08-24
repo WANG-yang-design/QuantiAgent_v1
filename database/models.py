@@ -199,7 +199,10 @@ class SentimentRecord(Base):
 class FundamentalRecord(Base):
     """基本面数据表 (股票)"""
     __tablename__ = "fundamental_records"
-    __table_args__ = (Index("ix_fund_symbol_date", "symbol", "report_date"),)
+    __table_args__ = (
+        Index("ix_fund_symbol_date", "symbol", "report_date"),
+        UniqueConstraint("symbol", "report_date", name="uq_fund_symbol_date"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(12))
@@ -243,6 +246,27 @@ class EtfNavRecord(Base):
     source: Mapped[str] = mapped_column(String(16), default="eastmoney")
 
 
+class EtfUniverseSnapshot(Base):
+    """Point-in-time ETF candidate-pool snapshot used by backtest and paper."""
+    __tablename__ = "etf_universe_snapshots"
+    __table_args__ = (
+        Index("ix_etf_universe_effective", "source_mode", "effective_date"),
+        Index("ix_etf_universe_asof", "asof_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(String(40), unique=True)
+    selector_version: Mapped[str] = mapped_column(String(24), default="etf_pool_v1")
+    source_mode: Mapped[str] = mapped_column(String(16), default="paper")
+    asof_date: Mapped[Date] = mapped_column(Date)
+    effective_date: Mapped[Date] = mapped_column(Date)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0)
+    members_json: Mapped[list] = mapped_column(JSON, default=list)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 # ================================================================
 # 四、特征/信号/Agent
 # ================================================================
@@ -276,6 +300,48 @@ class StrategySignal(Base):
     signal: Mapped[str] = mapped_column(String(8))       # BUY/SELL/HOLD/RANK/EXCLUDE
     score: Mapped[float] = mapped_column(Float, default=0)
     reason: Mapped[str] = mapped_column(Text, default="")
+
+
+class AgentShadowObservation(Base):
+    """策略真实信号与当时 Agent 观点的不可变配对样本。
+
+    Agent 处于影子模式时不参与下单。本表只回答：如果当时采纳 Agent
+    的赞同/反对意见，策略信号之后的收益分布是否会改善。
+    """
+    __tablename__ = "agent_shadow_observations"
+    __table_args__ = (
+        UniqueConstraint("strategy_id", "symbol", "signal_date", "strategy_action",
+                         name="uq_shadow_strategy_signal"),
+        Index("ix_shadow_signal_time", "signal_time"),
+        Index("ix_shadow_agreement", "strategy_action", "agreement"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    shadow_id: Mapped[str] = mapped_column(String(32), unique=True)
+    strategy_id: Mapped[str] = mapped_column(String(64))
+    strategy_name: Mapped[str] = mapped_column(String(128), default="")
+    universe_snapshot_id: Mapped[str] = mapped_column(String(64), default="")
+    symbol: Mapped[str] = mapped_column(String(12))
+    name: Mapped[str] = mapped_column(String(64), default="")
+    signal_date: Mapped[Date] = mapped_column(Date)
+    signal_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    strategy_action: Mapped[str] = mapped_column(String(8))
+    strategy_reason: Mapped[str] = mapped_column(Text, default="")
+    signal_price: Mapped[float] = mapped_column(Float, default=0)
+    quantity: Mapped[int] = mapped_column(Integer, default=0)
+    order_id: Mapped[str] = mapped_column(String(32), default="")
+    execution_status: Mapped[str] = mapped_column(String(24), default="SIGNALLED")
+    agent_decision: Mapped[str] = mapped_column(String(16), default="NO_VIEW")
+    agent_confidence: Mapped[float] = mapped_column(Float, default=0)
+    agent_trace_id: Mapped[str] = mapped_column(String(32), default="")
+    agent_decision_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    agent_age_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)
+    agreement: Mapped[str] = mapped_column(String(16), default="NO_VIEW")
+    forward_returns: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluated_horizons: Mapped[dict] = mapped_column(JSON, default=list)
+    evaluation_status: Mapped[str] = mapped_column(String(16), default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class AgentRun(Base):
@@ -386,15 +452,21 @@ class HumanConfirmation(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     confirm_id: Mapped[str] = mapped_column(String(32), unique=True)
     plan_id: Mapped[str] = mapped_column(String(32), default="")
+    trace_id: Mapped[str] = mapped_column(String(32), default="", index=True)
     symbol: Mapped[str] = mapped_column(String(12), default="")
     action: Mapped[str] = mapped_column(String(8), default="")
     amount: Mapped[float] = mapped_column(Float, default=0)
     risk_level: Mapped[str] = mapped_column(String(8), default="MEDIUM")
     reason: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(12), default="PENDING")  # PENDING/APPROVED/REJECTED/EXPIRED
+    # PENDING/PROCESSING/APPROVED/REJECTED/AUTO_EXECUTED/AUTO_CANCELLED/FAILED
+    status: Mapped[str] = mapped_column(String(24), default="PENDING")
+    timeout_action: Mapped[str] = mapped_column(String(16), default="cancel")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    context_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     decided_by: Mapped[str] = mapped_column(String(32), default="")
+    decision_note: Mapped[str] = mapped_column(Text, default="")
 
 
 # ================================================================
@@ -405,7 +477,7 @@ class Account(Base):
     """账户表 (模拟盘/实盘预留)"""
     __tablename__ = "accounts"
 
-    account_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     account_type: Mapped[str] = mapped_column(String(8), default="paper")  # paper/live
     cash: Mapped[float] = mapped_column(Float, default=0)         # 可用资金
     frozen_cash: Mapped[float] = mapped_column(Float, default=0)  # 冻结资金
@@ -425,8 +497,8 @@ class Position(Base):
     __table_args__ = (UniqueConstraint("account_id", "symbol", name="uq_pos_account_symbol"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    position_id: Mapped[str] = mapped_column(String(32), unique=True)
-    account_id: Mapped[str] = mapped_column(String(16), index=True)
+    position_id: Mapped[str] = mapped_column(String(96), unique=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
     symbol: Mapped[str] = mapped_column(String(12))
     name: Mapped[str] = mapped_column(String(64), default="")
     total_qty: Mapped[int] = mapped_column(Integer, default=0)
@@ -455,7 +527,7 @@ class Order(Base):
     # 重报单/人工确认下单时 INSERT 直接 StringDataRightTruncation 报错, 订单永远下不去
     order_intent_id: Mapped[str] = mapped_column(String(64), unique=True)  # 幂等键
     plan_id: Mapped[str] = mapped_column(String(32), default="")
-    account_id: Mapped[str] = mapped_column(String(32), default="PA-001")
+    account_id: Mapped[str] = mapped_column(String(64), default="PA-001")
     symbol: Mapped[str] = mapped_column(String(12))
     name: Mapped[str] = mapped_column(String(64), default="")
     side: Mapped[str] = mapped_column(String(8))          # BUY/SELL
@@ -464,6 +536,8 @@ class Order(Base):
     qty: Mapped[int] = mapped_column(Integer, default=0)
     filled_qty: Mapped[int] = mapped_column(Integer, default=0)
     remaining_qty: Mapped[int] = mapped_column(Integer, default=0)
+    # 当前仍被冻结的金额。不能仅靠订单价格反推：部分成交、滑点和手续费都会改变它。
+    frozen_amount: Mapped[float] = mapped_column(Float, default=0)
     avg_fill_price: Mapped[float] = mapped_column(Float, default=0)
     status: Mapped[str] = mapped_column(String(16), default="CREATED")
     submit_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -500,7 +574,7 @@ class AccountSnapshot(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(String(32), unique=True)
-    account_id: Mapped[str] = mapped_column(String(16))
+    account_id: Mapped[str] = mapped_column(String(64))
     snapshot_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     cash: Mapped[float] = mapped_column(Float, default=0)
     market_value: Mapped[float] = mapped_column(Float, default=0)
@@ -605,6 +679,15 @@ class SystemLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class SystemState(Base):
+    """跨进程共享的小型运行状态（熔断、策略冷却等）。"""
+    __tablename__ = "system_states"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class ReportRecord(Base):
     """报告表"""
     __tablename__ = "reports"
@@ -672,21 +755,26 @@ class MemoryRecord(Base):
 
 
 class NotificationRecord(Base):
-    """邮件通知记录表 (去重/审计)"""
+    """邮件通知记录表 (持久化发送队列/去重/审计)"""
     __tablename__ = "notification_records"
     __table_args__ = (Index("ix_notif_dedup", "dedup_key"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    dedup_key: Mapped[str] = mapped_column(String(64), default="")
+    dedup_key: Mapped[str] = mapped_column(String(256), default="")
     subject: Mapped[str] = mapped_column(String(256), default="")
-    status: Mapped[str] = mapped_column(String(8), default="SENT")  # SENT/FAILED/SKIPPED
+    html_body: Mapped[str] = mapped_column(Text, default="")
+    extra_receivers: Mapped[list] = mapped_column(JSON, default=list)
+    dedup_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(12), default="PENDING")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class WatchItem(Base):
     """
     监控标的表(盘中/每日监控池)
-    分类: holding=持仓 / hot=热门自动加入 / watched=主动勾选监控 /
+    分类: holding=持仓 / watched=主动勾选监控 /
           stock=股票 / etf=ETF / default=默认池
     一个标的可属于多个分类(categories 逗号分隔)。
     """
@@ -696,7 +784,7 @@ class WatchItem(Base):
     symbol: Mapped[str] = mapped_column(String(12), unique=True)
     name: Mapped[str] = mapped_column(String(64), default="")
     asset_type: Mapped[str] = mapped_column(String(8), default="etf")   # etf/stock
-    categories: Mapped[str] = mapped_column(String(64), default="watched")  # holding,hot,watched,stock,etf,default
+    categories: Mapped[str] = mapped_column(String(128), default="watched")  # holding/watched/dynamic/pool_pin/pool_exclude
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)         # 是否参与监控扫描
     priority: Mapped[int] = mapped_column(Integer, default=0)            # 优先级(高者先扫)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

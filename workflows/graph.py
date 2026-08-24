@@ -78,6 +78,16 @@ class WorkflowGraph:
         """条件: cond(state)==True 才执行该节点。"""
         self.conditions[node] = cond
 
+    async def _progress(self, *args):
+        if not self.progress_cb:
+            return
+        try:
+            result = self.progress_cb(*args)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.debug("进度回调失败: %s", exc)
+
     # ------------------------------------------------------------------
     async def run(self, state: WorkflowState, stop_at: Optional[str] = None) -> WorkflowState:
         set_trace_id(state.trace_id)
@@ -98,11 +108,7 @@ class WorkflowGraph:
             fn = self.nodes.get(node)
             if fn is None:
                 continue
-            if self.progress_cb:
-                try:
-                    self.progress_cb(node, "running", idx, total)
-                except Exception:
-                    pass
+            await self._progress(node, "running", idx, total)
             try:
                 loop = asyncio.get_running_loop()
                 t0 = loop.time()
@@ -111,20 +117,12 @@ class WorkflowGraph:
                 if isinstance(result, dict):
                     for k, v in result.items():
                         state.set(k, v)
-                if self.progress_cb:
-                    try:
-                        self.progress_cb(node, "done", idx, total, cost)
-                    except Exception:
-                        pass
+                await self._progress(node, "done", idx, total, cost)
                 logger.info("[%s] 节点 %s 完成 (%.2fs)", state.trace_id, node, cost)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] 节点 %s 异常: %s", state.trace_id, node, exc,
                              exc_info=True)
-                if self.progress_cb:
-                    try:
-                        self.progress_cb(node, "failed", idx, total, 0.0, str(exc))
-                    except Exception:
-                        pass
+                await self._progress(node, "failed", idx, total, 0.0, str(exc))
                 state.interrupt(f"节点 {node} 异常: {exc}")
                 break
         logger.info("[%s] 工作流 %s 结束", state.trace_id, self.name)

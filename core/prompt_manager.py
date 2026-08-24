@@ -35,7 +35,10 @@ class PromptManager:
                 print(f"[prompt] 加载失败 {f}: {e}")
 
     def get(self, agent_name: str) -> str:
-        return self._prompts.get(agent_name, "")
+        prompt = self._prompts.get(agent_name, "")
+        if not prompt:
+            raise KeyError(f"Agent {agent_name!r} 缺少 Prompt 配置")
+        return prompt
 
     def all_prompts(self) -> Dict[str, str]:
         return dict(self._prompts)

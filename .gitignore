@@ -13,6 +13,9 @@ __pycache__/
 # ===== 日志/缓存/运行时数据 =====
 logs/
 data/
+reports/*.md
+build
+bug_list_*.md
 
 # ===== 前端构建产物 =====
 frontend/node_modules/

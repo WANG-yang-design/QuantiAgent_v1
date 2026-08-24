@@ -43,8 +43,23 @@ class CninfoClient(BaseDataSource):
                     "symbol": symbol,
                     "title": title,
                     "url": _safe_str(r.get("网址")),
-                    "publish_time": r.get("公告日期"),
+                    "publish_time": self._parse_pub_time(r.get("公告日期")),
                 })
         except Exception as exc:
             logger.warning("巨潮公告失败 %s: %s", symbol, exc)
         return rows
+
+    @staticmethod
+    def _parse_pub_time(value) -> datetime:
+        """巨潮列可能是 Timestamp/日期字符串；统一成可入库 datetime。"""
+        if isinstance(value, datetime):
+            return value
+        try:
+            import pandas as pd
+            parsed = pd.to_datetime(value, errors="coerce")
+            if not pd.isna(parsed):
+                return parsed.to_pydatetime()
+        except Exception:
+            pass
+        logger.warning("巨潮公告时间无法解析: %r，使用抓取时间", value)
+        return datetime.now()

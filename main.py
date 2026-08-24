@@ -109,21 +109,28 @@ def cmd_scan_pool(args):
 def cmd_backtest(args):
     from backtest.engine import BacktestEngine
     from backtest.data_replayer import DataReplayer
-    from strategies.rotation_executor import build_rotation_signal_fn
+    from strategies.rotation_executor import build_rotation_signal_fn, resolve_rotation_params
     from reports.report_generator import get_report_generator
     from notification.notification_service import get_notification_service
 
     symbols = args.symbols or ["510300", "159915", "512100", "159949", "588000"]
     extra_params = {"top_n": args.top_n} if args.top_n else None
-    signal_fn = build_rotation_signal_fn(initial_cash=100000, params=extra_params)
+    initial_cash = float(get_settings().get("paper_account.initial_cash", 100000))
+    resolved_params = resolve_rotation_params(extra_params, use_live_preset=False)
+    signal_fn = build_rotation_signal_fn(initial_cash=initial_cash, params=resolved_params)
     engine = BacktestEngine(date.fromisoformat(args.start),
                             date.fromisoformat(args.end),
+                            initial_cash=initial_cash,
                             name=args.name, use_agents=args.agents)
+    engine.params = resolved_params
     replayer = DataReplayer(symbols)
     if args.minute:
         metrics = engine.run_minute(replayer, signal_fn)
     else:
         metrics = engine.run_daily(replayer, signal_fn)
+    if metrics.get("error"):
+        print(f"[ERROR] 回测失败: {metrics['error']}")
+        return
     path = get_report_generator().generate_backtest_report(metrics)
     print(f"[OK] 回测完成: {path}")
     print(f"   总收益 {metrics['total_return']:+.2%}  年化 {metrics['annual_return']:+.2%}  "
@@ -217,10 +224,12 @@ def cmd_resume(args):
 
 
 def cmd_confirm(args):
-    from database import repository as repo
+    from workflows.intraday_monitor_workflow import get_broker
+    from workflows.trading_workflow import resume_confirmed_plan
     approved = args.decision == "approve"
-    repo.decide_confirmation(args.id, approved, by="cli")
-    print(f"[OK] 确认 {args.id} -> {'批准' if approved else '拒绝'}")
+    result = asyncio.run(resume_confirmed_plan(
+        args.id, approved, get_broker(), by="cli"))
+    print(f"[OK] 确认 {args.id} -> {result.get('status')}: {result.get('reason', '')}")
 
 
 def cmd_test_email(args):

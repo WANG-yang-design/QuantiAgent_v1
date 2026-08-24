@@ -20,15 +20,16 @@ def build_market_summary(symbol: str, name: str, tech: Dict[str, Any],
                          position: Optional[Dict[str, Any]] = None,
                          strategy_signal: Optional[Dict[str, Any]] = None,
                          order_book: Optional[Dict[str, Any]] = None,
-                         intraday: Optional[Dict[str, Any]] = None) -> str:
+                         intraday: Optional[Dict[str, Any]] = None,
+                         asof: Optional[datetime] = None) -> str:
     """
     生成 Agent 可读的中文市场状态摘要。全部字段来自特征层(脚本计算)。
     """
     if not tech:
         return f"{symbol} {name}: 无可用特征数据"
 
-    lines: List[str] = [f"{symbol} {name} 市场状态摘要 @ {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
-    lines.append(f"最新价:{tech.get('close', 0):.3f}  涨跌幅:{tech.get('change_pct', 0):+.2f}%")
+    summary_time = asof or datetime.now()
+    lines: List[str] = [f"{symbol} {name} 市场状态摘要 @ {summary_time.strftime('%Y-%m-%d %H:%M:%S')}"]
 
     # 数值安全: 字段可能为 None/NaN(修复: 原实现 None/1e4 直接 TypeError 崩溃)
     def _f(v, default=0.0):
@@ -37,6 +38,17 @@ def build_market_summary(symbol: str, name: str, tech: Dict[str, Any],
             return x if x == x else default
         except (TypeError, ValueError):
             return default
+
+    q = quote or {}
+    realtime = _f(q.get("latest_price"))
+    qtime = q.get("quote_time") or "未知"
+    source = q.get("source") or "未知"
+    lines.append(
+        f"实时行情: 最新价={realtime:.3f} 涨跌幅={_f(q.get('change_pct')):+.2f}% "
+        f"行情时间={qtime} 来源={source}")
+    lines.append(
+        f"日K参考: 最近收盘={_f(tech.get('close')):.3f} "
+        f"日K涨跌幅={_f(tech.get('change_pct')):+.2f}%")
 
     # 技术面
     t = tech

@@ -127,7 +127,7 @@ def _akshare_spot_lookup(symbol: str) -> Optional[str]:
         except Exception as exc:
             logger.warning("akshare 股票列表获取失败: %s", exc)
             _stock_spot_cache = {}
-            _stock_spot_ts = now
+            _stock_spot_ts = now - _STOCK_SPOT_TTL + 60
     return _stock_spot_cache.get(symbol)
 
 

@@ -38,12 +38,15 @@ function summarize(node) {
   const nm = node.symbol_name || o?.name || "";
   const sym = node.symbol || o?.symbol || "";
   const label = nm ? `${sym} ${nm}` : sym;
+  const snap = o.data_snapshot || {};
+  const px = Number(snap.latest_price || 0);
+  const priceText = px > 0 ? ` · 实时价 ${px.toFixed(3)} @ ${snap.quote_time || snap.captured_at || "-"}` : "";
   if (node.agent === "chief_researcher")
-    return `结论: ${o.research_decision} · 置信 ${(o.confidence * 100)?.toFixed(0)}% · 评分 ${o.score?.toFixed(0)}`;
+    return `结论: ${o.research_decision} · 置信 ${(o.confidence * 100)?.toFixed(0)}% · 评分 ${o.score?.toFixed(0)}${priceText}`;
   if (node.agent === "risk_manager")
     return `风控: ${o.risk_decision} · 等级 ${o.risk_level}${o.blocked_reason ? " · " + o.blocked_reason : ""}`;
   if (node.agent === "trader")
-    return `${o.action} ${label} ${o.estimated_quantity}份 @ ${o.limit_price ?? "市价"} · 金额 ${o.order_amount?.toFixed(0)}`;
+    return `${o.action} ${label} ${o.estimated_quantity}份 @ ${o.limit_price ?? "市价"} · 金额 ${o.order_amount?.toFixed(0)}${priceText}`;
   if (node.agent === "compliance")
     return `合规: ${o.compliance_status}${o.reason ? " · " + o.reason : ""}`;
   if (node.agent === "data_admin")

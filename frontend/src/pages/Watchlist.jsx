@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { Plus, Trash2, ArrowUpDown, RefreshCw, Star } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmt, fmtWan, Empty } from "../components/Common";
+import { useLiveQuotes } from "../hooks/useLiveQuotes";
 
 /** 实时盯盘: 自选池来自"监控标的"(DB持久化), 10s自动刷新 */
 export default function Watchlist() {
@@ -22,12 +23,14 @@ export default function Watchlist() {
   });
   const watchSymbols = (watch?.items || []).filter((i) => i.enabled).map((i) => i.symbol);
 
-  const { data, isFetching } = useQuery({
-    queryKey: ["quotes", mode, watchSymbols],
-    queryFn: () => api.get("/api/quotes", { symbols: mode === "watchlist" ? watchSymbols.join(",") : "", limit: 60 }),
-    enabled: mode === "top100" || watchSymbols.length > 0,
-    refetchInterval: 10000,
+  const liveQuery = useLiveQuotes(watchSymbols, { enabled: mode === "watchlist" && watchSymbols.length > 0 });
+  const topQuery = useQuery({
+    queryKey: ["top-quotes"],
+    queryFn: () => api.get("/api/quotes", { symbols: "", limit: 60 }),
+    enabled: mode === "top100",
+    refetchInterval: 3000,
   });
+  const { data, isFetching } = mode === "watchlist" ? liveQuery : topQuery;
 
   // 大波动检测(>0.2%): 高亮 2 秒
   useEffect(() => {
@@ -113,10 +116,12 @@ export default function Watchlist() {
           onChange={(e) => setSortKey(e.target.value)} title="排序方法">
           {SORT_OPTIONS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
         </select>
-        <button className="btn-ghost ml-auto" onClick={() => qc.invalidateQueries({ queryKey: ["quotes"] })}>
+        <button className="btn-ghost ml-auto" onClick={() => qc.invalidateQueries({ queryKey: mode === "watchlist" ? ["live-quotes"] : ["top-quotes"] })}>
           <RefreshCw size={14} className={`inline mr-1 ${isFetching ? "animate-spin" : ""}`} />刷新
         </button>
-        <span className="text-xs text-gray-400">10秒自动刷新 · 更新于 {data?.time}</span>
+        <span className={`text-xs ${data?.status === "stale" ? "text-red-500" : "text-gray-400"}`}>
+          3秒实时刷新 · 行情时间 {data?.quote_time || data?.time || "-"}{data?.status === "stale" ? " · 数据滞后" : ""}
+        </span>
       </div>
 
       {/* 行情表 */}

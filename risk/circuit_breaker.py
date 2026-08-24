@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
 from core.config import get_settings
+from core.timeutil import now as business_now, today as business_today
 
 logger = logging.getLogger("risk.circuit")
 
@@ -38,13 +39,41 @@ class CircuitBreaker:
         self._fail_order_streak = 0
         self._trip_reasons: Dict[str, str] = {}
 
+    def _read_shared(self) -> dict:
+        try:
+            from database import repository as repo
+            state = repo.get_system_state("circuit_breaker")
+            self._paused = bool(state.get("manual_paused", False))
+            self._paused_reason = str(state.get("manual_reason", "") or "")
+            self._trip_reasons = dict(state.get("trip_reasons", {}) or {})
+            self._fail_order_streak = int(state.get("fail_order_streak", 0) or 0)
+            return state
+        except Exception as exc:
+            logger.warning("读取共享熔断状态失败，暂用进程内状态: %s", exc)
+            return {}
+
+    def _mutate_shared(self, mutator):
+        try:
+            from database import repository as repo
+            state = repo.update_system_state("circuit_breaker", mutator)
+            self._paused = bool(state.get("manual_paused", False))
+            self._paused_reason = str(state.get("manual_reason", "") or "")
+            self._trip_reasons = dict(state.get("trip_reasons", {}) or {})
+            self._fail_order_streak = int(state.get("fail_order_streak", 0) or 0)
+        except Exception as exc:
+            logger.warning("写入共享熔断状态失败: %s", exc)
+
     # ---------------- 人工控制 ----------------
     def pause(self, reason: str = "人工暂停"):
         """一键暂停所有交易。"""
         with self._lock:
             self._paused = True
             self._paused_reason = reason
-            self._paused_at = datetime.now()
+            self._paused_at = business_now()
+            self._mutate_shared(lambda state: state.update({
+                "manual_paused": True, "manual_reason": reason,
+                "manual_paused_at": business_now().isoformat(),
+            }))
         from memory.audit_log import AuditLogger
         AuditLogger.instance().log("circuit_pause", "manual", {"reason": reason})
         logger.warning("熔断器已启动: %s", reason)
@@ -54,15 +83,27 @@ class CircuitBreaker:
             self._paused = False
             self._paused_reason = ""
             self._trip_reasons.clear()
+            self._fail_order_streak = 0
+            self._mutate_shared(lambda state: state.update({
+                "manual_paused": False, "manual_reason": "",
+                "trip_reasons": {}, "fail_order_streak": 0,
+            }))
         from memory.audit_log import AuditLogger
         AuditLogger.instance().log("circuit_resume", "manual", {"reason": reason})
         logger.info("熔断器已恢复: %s", reason)
 
     # ---------------- 状态 ----------------
     def is_paused(self) -> bool:
+        self._read_shared()
         return self._paused or bool(self._trip_reasons)
 
+    def exits_allowed(self) -> bool:
+        """自动熔断时仍允许减仓/止损；只有人工紧急暂停会停止全部交易。"""
+        self._read_shared()
+        return not self._paused
+
     def paused_reason(self) -> str:
+        self._read_shared()
         reasons = list(self._trip_reasons.values())
         if self._paused_reason:
             reasons.insert(0, self._paused_reason)
@@ -72,6 +113,11 @@ class CircuitBreaker:
         """触发熔断(自动)。"""
         with self._lock:
             self._trip_reasons[key] = reason
+            def _trip(state):
+                reasons = dict(state.get("trip_reasons", {}) or {})
+                reasons[key] = reason
+                state["trip_reasons"] = reasons
+            self._mutate_shared(_trip)
         from memory.audit_log import AuditLogger
         AuditLogger.instance().log("circuit_trip", "risk_engine", {"key": key, "reason": reason})
         logger.error("熔断触发 [%s]: %s", key, reason)
@@ -79,12 +125,20 @@ class CircuitBreaker:
     def reset(self, key: str):
         with self._lock:
             self._trip_reasons.pop(key, None)
+            def _reset(state):
+                reasons = dict(state.get("trip_reasons", {}) or {})
+                reasons.pop(key, None)
+                state["trip_reasons"] = reasons
+            self._mutate_shared(_reset)
 
     # ---------------- 自动检测 ----------------
     def on_order_failure(self):
         """订单失败计数: 连续失败触发熔断。"""
         with self._lock:
             self._fail_order_streak += 1
+            self._mutate_shared(lambda state: state.update({
+                "fail_order_streak": int(state.get("fail_order_streak", 0) or 0) + 1,
+            }))
             limit = int(self.cfg.get("consecutive_fail_orders", 5))
             if self._fail_order_streak >= limit:
                 self.trip("fail_orders", f"连续失败订单{self._fail_order_streak}次")
@@ -97,13 +151,19 @@ class CircuitBreaker:
             if "fail_orders" in self._trip_reasons:
                 self._trip_reasons.pop("fail_orders")
                 logger.info("连续成功订单, 自动解除失败单熔断")
+            def _success(state):
+                state["fail_order_streak"] = 0
+                reasons = dict(state.get("trip_reasons", {}) or {})
+                reasons.pop("fail_orders", None)
+                state["trip_reasons"] = reasons
+            self._mutate_shared(_success)
 
     def check_daily_loss(self, day_pnl: float, total_asset: float) -> bool:
         """单日亏损熔断。修复: 跨日后自动清除昨日的 daily_loss 熔断,
         否则一次单日亏损(或误判)会让系统永久停摆直到人工干预。"""
         limit = float(self.cfg.get("daily_loss_pct", 0.05))
         with self._lock:
-            today = date.today()
+            today = business_today()
             if getattr(self, "_daily_loss_date", None) != today:
                 self._daily_loss_date = today
                 if "daily_loss" in self._trip_reasons:

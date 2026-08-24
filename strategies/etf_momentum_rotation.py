@@ -38,6 +38,8 @@ class EtfMomentumRotationStrategy(BaseStrategy):
                 continue
             if vol > self.max_vol:
                 continue
+            if mom <= 0:
+                continue
             candidates.append({"symbol": symbol, "name": item.get("name", symbol),
                                "momentum": mom, "amount": amount_ma,
                                "score": mom})

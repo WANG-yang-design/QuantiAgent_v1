@@ -7,6 +7,7 @@ import KlineChart from "../components/KlineChart";
 import IntradayChart from "../components/IntradayChart";
 import { fmt, fmtPct, Spin, Empty, chgColor } from "../components/Common";
 import { useScanStore } from "../store/scanStore";
+import { useLiveQuotes } from "../hooks/useLiveQuotes";
 
 /** 标的详情: 无代码时显示搜索引导页 */
 export default function SymbolDetail() {
@@ -40,6 +41,7 @@ export default function SymbolDetail() {
     enabled: !!symbol,
     refetchInterval: 15000,
   });
+  const { data: liveQuotes } = useLiveQuotes(symbol ? [symbol] : []);
   // 当前标的的持仓(有持仓时展示持仓卡片)
   const { data: positions } = useQuery({
     queryKey: ["positions"],
@@ -111,7 +113,7 @@ export default function SymbolDetail() {
   }, [scanStatusData]);
 
   const t = detail?.technical || {};
-  const q = detail?.quote || {};
+  const q = liveQuotes?.quotes?.[0] || detail?.quote || {};
   const ob = detail?.order_book || {};
 
   const techItems = [
@@ -166,7 +168,7 @@ export default function SymbolDetail() {
         <div className="card border-amber-200 bg-amber-50/40">
           <div className="flex items-center gap-3 text-sm">
             <span className="badge bg-amber-50 text-amber-700 animate-pulse">分析中</span>
-            <span className="text-gray-600">{scanStatusData?.current_node || "正在启动 15 个 Agent 链路(数据闸门→分析师→多空辩论→首席→交易员→风控→合规→执行)..."}</span>
+            <span className="text-gray-600">{scanStatusData?.current_node || "正在启动 Agent 影子分析(数据闸门→分析师→多空辩论→首席→留档，不下单)..."}</span>
             {scanStatusData?.progress_pct != null && (
               <span className="text-xs text-gray-500">进度 {scanStatusData.progress_pct}%</span>
             )}
@@ -210,36 +212,36 @@ export default function SymbolDetail() {
           <div className="flex gap-3 flex-wrap text-sm">
             <span>研究结论: <b className="text-brand-600">{scanResult.chief?.research_decision || "-"}</b>
               {" "}(置信 {((scanResult.chief?.confidence ?? 0) * 100)?.toFixed(0)}%)</span>
-            <span>交易计划: <b>{scanResult.plan?.action || "-"} {scanResult.plan?.estimated_quantity || 0}份</b></span>
-            <span>风控: <b className={scanResult.risk?.risk_decision === "REJECT" ? "text-red-600" : "text-green-600"}>
-              {scanResult.risk?.risk_decision || "-"}</b>
-              {scanResult.risk?.blocked_reason && <span className="text-red-500 ml-2">{scanResult.risk.blocked_reason}</span>}
-            </span>
-            <span>执行: <b>{scanResult.execution?.status || "-"}</b></span>
+            <span>运行模式: <b className="text-green-600">影子观察，不下单</b></span>
+            <span>执行: <b>{scanResult.execution?.status || "OBSERVED_ONLY"}</b></span>
             <button className="btn-ghost ml-auto" onClick={() => nav("/agents")}>查看完整决策链路</button>
           </div>
         </div>
       )}
 
       {/* 持仓卡片(当前标的在模拟盘有持仓时展示) */}
-      {myPosition && (
+      {myPosition && (() => {
+        const livePrice = Number(q.latest_price || myPosition.latest_price || 0);
+        const livePnl = (livePrice - Number(myPosition.cost_price || 0)) * Number(myPosition.total_qty || 0);
+        const livePnlPct = myPosition.cost_price ? livePrice / Number(myPosition.cost_price) - 1 : 0;
+        return (
         <div className="card border-blue-200 bg-blue-50/40">
           <div className="card-title"><Wallet size={14} />当前持仓</div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
             <div><span className="text-xs text-gray-500 block">总数量 / 可用</span>
               <b>{myPosition.total_qty} / {myPosition.available_qty}</b></div>
             <div><span className="text-xs text-gray-500 block">成本价 / 现价</span>
-              <b>{fmt(myPosition.cost_price)} / {fmt(myPosition.latest_price)}</b></div>
+              <b>{fmt(myPosition.cost_price)} / {fmt(livePrice)}</b></div>
             <div><span className="text-xs text-gray-500 block">市值</span>
-              <b>{fmt(myPosition.market_value, 2)}</b></div>
+              <b>{fmt(livePrice * myPosition.total_qty, 2)}</b></div>
             <div><span className="text-xs text-gray-500 block">浮动盈亏</span>
-              <b className={myPosition.pnl >= 0 ? "text-up" : "text-down"}>
-                {myPosition.pnl >= 0 ? "+" : ""}{fmt(myPosition.pnl, 2)}
-                <span className="ml-1">({((myPosition.pnl_pct || 0) * 100).toFixed(2)}%)</span>
+              <b className={livePnl >= 0 ? "text-up" : "text-down"}>
+                {livePnl >= 0 ? "+" : ""}{fmt(livePnl, 2)}
+                <span className="ml-1">({(livePnlPct * 100).toFixed(2)}%)</span>
               </b></div>
           </div>
         </div>
-      )}
+      ); })()}
 
       {/* 行情卡片组 */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -247,7 +249,8 @@ export default function SymbolDetail() {
           <div className="text-xs text-gray-500">最新价</div>
           <div className={`text-2xl font-bold ${chgColor(q.change_pct)}`}>{fmt(q.latest_price)}</div>
           <div className={`text-sm ${chgColor(q.change_pct)}`}>
-            {q.change_pct > 0 ? "+" : ""}{q.change_pct?.toFixed(2)}% · 更新 {detail?.time}
+            {q.change_pct > 0 ? "+" : ""}{q.change_pct?.toFixed(2)}% · 行情 {q.quote_time?.slice?.(11, 19) || liveQuotes?.quote_time || "-"}
+            {q.status === "stale" ? <span className="text-red-500"> · 数据滞后</span> : null}
           </div>
         </div>
         <div className="card">
@@ -352,12 +355,12 @@ function SymbolSearchPage({ nav, searchCode, setSearchCode }) {
   const { data: hotEtf } = useQuery({
     queryKey: ["universe-top"],
     queryFn: () => api.get("/api/universe/top?limit=24"),
-    refetchInterval: 300000,
+    refetchInterval: 10000,
   });
   const { data: hotStock } = useQuery({
     queryKey: ["stocks-top"],
     queryFn: () => api.get("/api/stocks/spot?limit=12"),
-    refetchInterval: 600000,
+    refetchInterval: 10000,
   });
 
   const renderHot = (items, label) => (

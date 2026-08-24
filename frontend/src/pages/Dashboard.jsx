@@ -10,7 +10,7 @@ import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
 export default function Dashboard() {
   const nav = useNavigate();
   const qc = useQueryClient();
-  const { data: acc } = useQuery({ queryKey: ["account"], queryFn: () => api.get("/api/account"), refetchInterval: 15000 });
+  const { data: acc } = useQuery({ queryKey: ["account"], queryFn: () => api.get("/api/account"), refetchInterval: 3000 });
   const { data: equity } = useQuery({ queryKey: ["equity"], queryFn: () => api.get("/api/equity?limit=200") });
   const { data: orders } = useQuery({ queryKey: ["orders"], queryFn: () => api.get("/api/orders?limit=10"), refetchInterval: 15000 });
   const { data: mode } = useQuery({ queryKey: ["sysmode"], queryFn: () => api.get("/api/system/mode"), refetchInterval: 15000 });
@@ -64,7 +64,7 @@ export default function Dashboard() {
 
   // 大盘指数 + 牛熊诊断
   const { data: idx } = useQuery({
-    queryKey: ["indexes"], queryFn: () => api.get("/api/index/overview"), refetchInterval: 30000,
+    queryKey: ["indexes"], queryFn: () => api.get("/api/index/overview"), refetchInterval: 3000,
   });
   const { data: diag } = useQuery({
     queryKey: ["diagnosis"], queryFn: () => api.get("/api/market/diagnosis"), refetchInterval: 300000,

@@ -4,7 +4,8 @@
 #
 # 2026-08 修复: 东财/akshare 依赖的系统代理在本机不可用导致
 # 数据获取几乎全部失败, 主源切换为直连/免费稳定通道:
-#   - 日K:     baostock(前复权, 盘中即含当日K线)
+#   - 历史日K: baostock/新浪等提供多年复权序列；腾讯客户端不提供多年历史
+#   - 当日/缺口: tencent 第一优先，补历史源滞后的最后交易日
 #   - 分钟K:   tencent(今日分时实时) + baostock(历史)
 #   - 实时行情: tencent(qt.gtimg.cn CDN直连, 无代理)
 #   - 盘口:     tencent(内置买卖五档)
@@ -15,6 +16,11 @@ sources:
   daily_bar:
     primary: baostock
     backups: [akshare, tencent, sina]
+  # 回测/历史数据的缺失日期逐源补齐。腾讯对当日和最近交易日最稳定，
+  # 因此与多年历史链分开配置并放在第一位。
+  daily_gap:
+    primary: tencent
+    backups: [sina, baostock, akshare]
   minute_bar:
     primary: tencent
     backups: [baostock, akshare]
@@ -46,10 +52,11 @@ sources:
     primary: eastmoney
     backups: [akshare]
 
-# 多源比对: 两源收盘价相对偏差超过此阈值 → CONFLICT
+# 多源比对: 实时价偏差超过0.5%立即拒绝进入Agent/交易；
+# 日线因复权/更新时间差异允许1%。
 cross_source:
   close_price_diff_pct: 0.01
-  quote_diff_pct: 0.02
+  quote_diff_pct: 0.005
 
 # 数据新鲜度阈值(秒): 超过即 DELAYED
 freshness:

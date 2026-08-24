@@ -49,9 +49,10 @@ class TraderAgent(BaseAgent):
         account = ctx.get("account") or {}
         position = ctx.get("position")
         features = ctx.get("technical") or {}
-        price = float(features.get("close", 0) or 0)
+        # 盘中计划必须优先采用实时行情；日K收盘只作为实时源不可用时的兜底。
+        price = float((ctx.get("quote") or {}).get("latest_price", 0) or 0)
         if price <= 0:
-            price = float((ctx.get("quote") or {}).get("latest_price", 0) or 0)
+            price = float(features.get("close", 0) or 0)
 
         # 规则层先行: 决策倾向
         decision = chief.get("research_decision", "HOLD")
@@ -71,6 +72,20 @@ class TraderAgent(BaseAgent):
         plan = await self.call_llm(content, schema=TradePlanOutput)
         plan = self._rule_correct(plan, input_data, price, account, position, decision)
         return plan
+
+    def mock_output(self, input_data: AgentInput) -> Dict[str, Any]:
+        """真实 LLM 临时故障时，使用与模拟模式相同的资金/T+1规则计划。"""
+        ctx = input_data.context or {}
+        chief = ctx.get("chief") or {}
+        account = ctx.get("account") or {}
+        position = ctx.get("position")
+        features = ctx.get("technical") or {}
+        price = float((ctx.get("quote") or {}).get("latest_price", 0) or 0) or float(
+            features.get("close", 0) or 0)
+        return self._rule_plan(
+            input_data, chief.get("research_decision", "HOLD"),
+            float(chief.get("confidence", 0.5) or 0.5), price,
+            account, position, chief)
 
     # ---------------------------------------------------------------
     def _rule_plan(self, input_data, decision, confidence, price, account, position, chief) -> Dict[str, Any]:
@@ -113,8 +128,8 @@ class TraderAgent(BaseAgent):
                 "order_type": "LIMIT",
                 "limit_price": round(price * 1.005, 3),      # 限价略高于现价
                 "confidence": round(confidence, 2),
-                "reasons": chief.get("upside_reason") or "研究结论看多",
-                "risks": chief.get("downside_risk") or "",
+                "reasons": [chief.get("upside_reason") or "研究结论看多"],
+                "risks": [chief.get("downside_risk")] if chief.get("downside_risk") else [],
                 "fallback": f"若价格高于{price*1.02:.3f}则取消",
                 "human_confirm_required": False,
             }
@@ -129,7 +144,7 @@ class TraderAgent(BaseAgent):
                 "order_type": "LIMIT",
                 "limit_price": round(price * 0.995, 3),
                 "confidence": round(confidence, 2),
-                "reasons": chief.get("downside_risk") or "研究结论看空",
+                "reasons": [chief.get("downside_risk") or "研究结论看空"],
                 "risks": [],
                 "fallback": f"若价格低于{price*0.98:.3f}则市价卖出",
                 "human_confirm_required": False,
@@ -162,7 +177,9 @@ class TraderAgent(BaseAgent):
                 plan["order_amount"] = 0.0
                 return plan
         # 决策方向约束: 研究结论非多头时不允许BUY
-        if decision == "HOLD" and plan.get("action") == "BUY":
+        forbidden = ((decision in ("HOLD", "SELL_CANDIDATE") and plan.get("action") == "BUY") or
+                     (decision == "BUY_CANDIDATE" and plan.get("action") == "SELL"))
+        if forbidden:
             plan["action"] = "HOLD"
             plan["estimated_quantity"] = 0
             plan["order_amount"] = 0.0

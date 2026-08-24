@@ -71,13 +71,13 @@ class RiskEngine:
         cash = float(account_view.get("cash", 0) or 0)
 
         # 0. 熔断检查(最高优先)
-        if self.cb.is_paused():
+        action = str(plan.get("action", "HOLD")).upper()
+        if self.cb.is_paused() and (action != "SELL" or not self.cb.exits_allowed()):
             result.result = "REJECT"
             result.blocked_reason = f"系统熔断中: {self.cb.paused_reason()}"
             result.layer_results["circuit"] = {"result": "REJECT"}
             return self._finalize(plan, result)
 
-        action = plan.get("action", "HOLD")
         if action == "HOLD":
             result.result = "APPROVE"
             result.risk_level = "LOW"
@@ -165,9 +165,8 @@ class RiskEngine:
             result.approved_amount = amount
             result.approved_quantity = plan.get("estimated_quantity", 0)
         else:
-            result.result = "APPROVE"
-            result.approved_amount = amount
-            result.approved_quantity = plan.get("estimated_quantity", 0)
+            result.result = "CONFIRM_REQUIRED"
+            result.blocked_reason = "订单金额超过低风险自动执行上限"
 
         # REDUCE: 仅当尚未被 REJECT/CONFIRM_REQUIRED 时生效
         # (降仓是保护动作, 但不能绕过"需要人工确认"的分级)
@@ -233,15 +232,17 @@ class RiskEngine:
                 # 账户未初始化(无行情估值)时无法判断比率 → 放行, 由订单层资金校验兜底
                 out["warnings"].append("账户总资产为0, 跳过账户比率检查")
                 return out
-            # 总仓位检查
+            # 总仓位检查（在途买单的资金已经进入 frozen_cash）。
             market_value = float(account_view.get("market_value", 0) or 0)
-            total_position = (market_value + float(plan.get("order_amount", 0))) / total_asset
+            pending_buy = float(account_view.get("frozen_cash", 0) or 0)
+            total_position = (market_value + pending_buy + float(plan.get("order_amount", 0))) / total_asset
             if total_position > max_pos:
                 out["result"] = "REJECT"
                 out["reason"] = f"加仓后总仓位{total_position:.0%}超过上限{max_pos:.0%}"
                 return out
             # 现金比例(留底)
-            if cash / total_asset < min_cash and cash < float(plan.get("order_amount", 0)):
+            after_cash = cash - float(plan.get("order_amount", 0) or 0)
+            if after_cash / total_asset < min_cash:
                 out["result"] = "REJECT"
                 out["reason"] = f"现金比例{min_cash:.0%}保护, 不允许继续买入"
                 return out

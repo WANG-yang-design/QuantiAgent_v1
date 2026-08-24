@@ -7,7 +7,15 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import "./index.css";
 
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      refetchOnMount: "always",
+      refetchOnWindowFocus: "always",
+      refetchOnReconnect: "always",
+      refetchIntervalInBackground: true,
+    },
+  },
 });
 
 ReactDOM.createRoot(document.getElementById("root")).render(

@@ -88,11 +88,3 @@ class DataAdminAgent(BaseAgent):
             logger = __import__("logging").getLogger("agent.data_admin")
             logger.warning("数据闸门 LLM 润色失败, 降级为规则结论: %s", exc)
             return {"data_status": "PASS", "warnings": warnings, "blocked_reason": None}
-
-    # 模拟输出: 直接复用规则结果, 不让 LLM 参与
-    def mock_output(self, input_data: AgentInput) -> Dict[str, Any]:
-        return self._run_impl_blocking(input_data)
-
-    def _run_impl_blocking(self, input_data: AgentInput) -> Dict[str, Any]:
-        import asyncio
-        return asyncio.run(self._run_impl(input_data))

@@ -8,6 +8,7 @@ hq.sinajs.cn 接口, 免费, 需带 Referer 头。返回 GBK 编码。
 已移除: 新浪自身接口走 httpx.Client(verify=True 默认)。
 """
 import logging
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,36 @@ def _sina_symbol(symbol: str) -> str:
     if symbol.startswith(("5", "6", "9")):
         return "sh" + symbol
     return "sz" + symbol
+
+
+def _parse_sina_quote(symbol: str, raw: str) -> Dict[str, Any]:
+    """Normalize one ``hq.sinajs.cn`` record and keep exchange time."""
+    parts = raw.split(",")
+    if len(parts) < 10:
+        raise RuntimeError(f"新浪 {symbol} 行情字段不足")
+    quote_time = None
+    if len(parts) > 31 and parts[30] and parts[31]:
+        try:
+            quote_time = datetime.strptime(
+                f"{parts[30]} {parts[31]}", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            quote_time = None
+    price = _safe_float(parts[3])
+    prev_close = _safe_float(parts[2])
+    return {
+        "symbol": symbol,
+        "quote_time": quote_time or datetime.now(),
+        "name": _safe_str(parts[0]),
+        "latest_price": price,
+        "prev_close": prev_close,
+        "open": _safe_float(parts[1]),
+        "high": _safe_float(parts[4]),
+        "low": _safe_float(parts[5]),
+        "volume": _safe_float(parts[8]),
+        "amount": _safe_float(parts[9]),
+        "change_pct": (price / prev_close - 1) * 100 if prev_close > 0 else 0.0,
+        "source": "sina",
+    }
 
 
 class SinaClient(BaseDataSource):
@@ -145,29 +176,36 @@ class SinaClient(BaseDataSource):
             })
         return rows
 
-    def get_realtime_quote(self, symbol: str, asset_type: str = "etf") -> Dict[str, Any]:
-        resp = self.client.get(f"https://hq.sinajs.cn/list={_sina_symbol(symbol)}")
+    def get_realtime_quotes_batch(self, symbols: List[str],
+                                  code_overrides: Optional[Dict[str, str]] = None
+                                  ) -> Dict[str, Dict[str, Any]]:
+        """Fetch multiple public quotes in one request for source consensus."""
+        if not symbols:
+            return {}
+        code_overrides = code_overrides or {}
+        code_map = {
+            code_overrides.get(symbol, _sina_symbol(symbol)): symbol
+            for symbol in dict.fromkeys(symbols)
+        }
+        resp = self.client.get(
+            "https://hq.sinajs.cn/list=" + ",".join(code_map))
         resp.raise_for_status()
         text = resp.content.decode("gbk", errors="ignore")
-        if '="' not in text:
+        out: Dict[str, Dict[str, Any]] = {}
+        for match in re.finditer(r'var hq_str_(\w+)="([^"]*)"', text):
+            symbol = code_map.get(match.group(1))
+            if not symbol or not match.group(2).strip():
+                continue
+            quote = _parse_sina_quote(symbol, match.group(2))
+            if quote["latest_price"] > 0:
+                out[symbol] = quote
+        return out
+
+    def get_realtime_quote(self, symbol: str, asset_type: str = "etf",
+                           sina_code: Optional[str] = None) -> Dict[str, Any]:
+        quotes = self.get_realtime_quotes_batch(
+            [symbol], {symbol: sina_code} if sina_code else None)
+        if symbol not in quotes:
             raise RuntimeError(f"新浪无 {symbol} 行情")
-        parts = text.split('="')[1].rstrip('";').split(",")
-        # 字段: 名称,今开,昨收,现价,最高,最低,买一,卖一,成交量(股),成交额,...
-        if len(parts) < 10:
-            raise RuntimeError(f"新浪 {symbol} 行情字段不足")
-        return {
-            "symbol": symbol,
-            "quote_time": datetime.now(),
-            "name": _safe_str(parts[0]),
-            "latest_price": _safe_float(parts[3]),
-            "prev_close": _safe_float(parts[2]),
-            "open": _safe_float(parts[1]),
-            "high": _safe_float(parts[4]),
-            "low": _safe_float(parts[5]),
-            "volume": _safe_float(parts[8]),
-            "amount": _safe_float(parts[9]),
-            "change_pct": ((_safe_float(parts[3]) / _safe_float(parts[2])) - 1) * 100
-            if _safe_float(parts[2]) > 0 else 0.0,
-            "source": self.name,
-        }
+        return quotes[symbol]
 

@@ -23,7 +23,12 @@ def to_frame(bars: List[Dict[str, Any]]) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume", "amount"]:
         if c not in df.columns:
             df[c] = 0.0
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # 无效价格行不能用 0 填补，否则会制造虚假暴跌/突破信号。
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = df[(df[["open", "high", "low", "close"]] > 0).all(axis=1)]
+    df[["volume", "amount"]] = df[["volume", "amount"]].fillna(0.0)
+    df = df.reset_index(drop=True)
     return df
 
 
@@ -134,8 +139,10 @@ def compute_technical_features(bars: List[Dict[str, Any]],
     price_above_vwap = bool(close.iloc[-1] >= vwap)
 
     # ---------------- 支撑/压力 (20日高低点) ----------------
-    recent_high = float(high.tail(min(20, len(high))).max())
-    recent_low = float(low.tail(min(20, len(low))).min())
+    history_high = high.iloc[:-1].tail(min(20, max(len(high) - 1, 1)))
+    history_low = low.iloc[:-1].tail(min(20, max(len(low) - 1, 1)))
+    recent_high = float(history_high.max()) if len(history_high) else float(high.iloc[-1])
+    recent_low = float(history_low.min()) if len(history_low) else float(low.iloc[-1])
     support = recent_low
     resistance = recent_high
     near_resistance = bool(close.iloc[-1] >= resistance * 0.98)
@@ -179,12 +186,12 @@ def compute_technical_features(bars: List[Dict[str, Any]],
         "boll_mid": _f(mid.iloc[-1]), "boll_up": _f(up.iloc[-1]), "boll_dn": _f(dn.iloc[-1]),
         "boll_break_up": boll_break_up,
         # 波动/回撤
-        "atr": _f(atr), "atr_pct": atr_pct,
-        "volatility_20d": vol_20, "volatility_5d": vol_5,
-        "max_drawdown_60d": max_drawdown_60d,
+        "atr": _f(atr), "atr_pct": _f(atr_pct),
+        "volatility_20d": _f(vol_20), "volatility_5d": _f(vol_5),
+        "max_drawdown_60d": _f(max_drawdown_60d),
         # 动量
-        "momentum_5d": mom_5, "momentum_10d": mom_10, "momentum_15d": mom_15,
-        "momentum_20d": mom_20, "momentum_30d": mom_30, "momentum_60d": mom_60,
+        "momentum_5d": _f(mom_5), "momentum_10d": _f(mom_10), "momentum_15d": _f(mom_15),
+        "momentum_20d": _f(mom_20), "momentum_30d": _f(mom_30), "momentum_60d": _f(mom_60),
         # 量能
         "volume_ratio": vol_ratio, "amount_ma5": amount_ma5, "amount_ma20": amount_ma20,
         # 执行参考

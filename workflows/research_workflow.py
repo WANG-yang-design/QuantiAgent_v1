@@ -77,22 +77,24 @@ _news_fetch_cache: Dict[str, datetime] = {}
 
 # 市场环境指数缓存(修复: 每次投研都重新拉000300日K, 回测/批量扫描时
 # 数据源登录失败要等120秒, 单个标的分析被拖慢数分钟)
-_index_env_cache: Dict[str, Any] = {"ts": 0.0, "bars": []}
+_index_env_cache: Dict[str, Any] = {}
 
 
 def _market_env_bars(end: datetime, days: int = 120) -> List[dict]:
     import time as _t
     now = _t.time()
-    if now - _index_env_cache.get("ts", 0.0) < 600:
-        return _index_env_cache.get("bars", [])
+    key = str(end)[:10]
+    cached = _index_env_cache.get(key) or {}
+    if now - cached.get("ts", 0.0) < 600:
+        return cached.get("bars", [])
     try:
         idx = get_market_service().get_index_bars(
             "000300", end - timedelta(days=days), end)
-        _index_env_cache.update({"ts": now, "bars": idx})
+        _index_env_cache[key] = {"ts": now, "bars": idx}
         return idx
     except Exception as exc:
         logger.warning("市场环境指数获取失败: %s", exc)
-        return _index_env_cache.get("bars", [])
+        return cached.get("bars", [])
 
 
 async def node_collect_data(state: WorkflowState) -> Dict[str, Any]:
@@ -148,7 +150,21 @@ async def node_collect_data(state: WorkflowState) -> Dict[str, Any]:
             return await asyncio.gather(bars_res, quote_res, ob_res, mf_res,
                                         etf_res, minute_res)
 
-        (bars, rep), (quote, qrep), (ob, obrep), mf_tuple, etf_info, minute_res = await _gather()
+        gathered = await _gather()
+
+        def _pair(value, data_type: str):
+            # 任一并行源异常时 _run 返回 None。原来的直接 tuple 解包会让整个
+            # collect_data 节点崩溃，反而丢失其他已经成功取得的实时行情。
+            if isinstance(value, tuple) and len(value) >= 2:
+                return value[0], value[1] or DataQualityReport(symbol, data_type)
+            report = DataQualityReport(symbol, data_type)
+            report.block(f"{data_type} 并行采集失败")
+            return {}, report
+
+        bars, rep = _pair(gathered[0], "daily_bar")
+        quote, qrep = _pair(gathered[1], "realtime_quote")
+        ob, obrep = _pair(gathered[2], "order_book")
+        mf_tuple, etf_info, minute_res = gathered[3:]
         bars = bars or []
         quote = quote or {}
         ob = ob or {}
@@ -185,6 +201,28 @@ async def node_collect_data(state: WorkflowState) -> Dict[str, Any]:
 
     quality_reports = [rep.to_dict(), qrep.to_dict(), obrep.to_dict()]
 
+    # 一次决策只使用这一份不可变行情事实；后续页面、邮件和审计均引用它。
+    # 明确区分实时价与日K收盘价，避免把昨收/当日未收盘K线误称为“最新价”。
+    quote_time = quote.get("quote_time")
+    data_snapshot = {
+        "symbol": symbol,
+        "name": state.get("name", ""),
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "quote_time": (quote_time.isoformat(timespec="seconds")
+                       if isinstance(quote_time, datetime) else str(quote_time or "")),
+        "latest_price": float(quote.get("latest_price", 0) or 0),
+        "prev_close": float(quote.get("prev_close", 0) or 0),
+        "change_pct": float(quote.get("change_pct", 0) or 0),
+        "source": str(quote.get("source", "") or ""),
+        "selected_source": str(quote.get("selected_source", "") or ""),
+        "verified_sources": int(quote.get("verified_sources", 0) or 0),
+        "price_spread_pct": float(quote.get("price_spread_pct", 0) or 0),
+        "source_prices": dict(quote.get("source_prices") or {}),
+        "quality_status": qrep.status,
+        "daily_close": float((bars[-1] if bars else {}).get("close", 0) or 0),
+        "daily_trade_date": str((bars[-1] if bars else {}).get("trade_date", "")),
+    }
+
     return {
         "bars": bars, "quote": quote, "order_book": ob,
         "money_flow_raw": money_flow, "news": news_ctx,
@@ -192,6 +230,7 @@ async def node_collect_data(state: WorkflowState) -> Dict[str, Any]:
         "quality_reports": quality_reports,
         "etf_info": etf_info,
         "minute_bars": minute_bars,
+        "data_snapshot": data_snapshot,
         "fundamental": (svc.get_fundamentals(symbol)
                         if asset_type == "stock" and not override else {}),
     }
@@ -204,6 +243,7 @@ async def node_data_gate(state: WorkflowState) -> Dict[str, Any]:
         context={
             "quality_reports": state.get("quality_reports"),
             "system_paused": state.get("system_paused", False),
+            "data_snapshot": state.get("data_snapshot") or {},
         }))
     state.record("data_admin", f"数据状态: {result.get('data_status')}", result)
     if result.get("data_status") == "BLOCKED":
@@ -231,7 +271,9 @@ async def node_features(state: WorkflowState) -> Dict[str, Any]:
     # 市场环境: 沪深300 动量(进程内缓存, 修复: 回测/批量扫描重复拉取)
     env: Dict[str, Any] = {}
     try:
-        end = datetime.now().date()
+        override = state.get("asof_override") or {}
+        bars_end = (override.get("bars") or bars)
+        end = bars_end[-1]["trade_date"] if bars_end else datetime.now().date()
         idx = _market_env_bars(end)
         if len(idx) >= 21:
             env = {
@@ -274,6 +316,8 @@ async def node_build_summary(state: WorkflowState) -> Dict[str, Any]:
         strategy_signal=state.get("strategy_signal"),
         order_book=state.get("order_book") or {},
         intraday=state.get("intraday") or {},
+        asof=(datetime.combine(state.get("asof_date"), datetime.min.time())
+              if state.get("asof_date") else None),
     )
     return {"summary": summary}
 
@@ -295,6 +339,7 @@ async def node_analysts(state: WorkflowState) -> Dict[str, Any]:
         "market_env": state.get("market_env"),
         "order_book": state.get("order_book"),
         "intraday": state.get("intraday"),
+        "data_snapshot": state.get("data_snapshot"),
     }
     # 修复: 用全名过滤开关(短键只用于执行)
     names = [k for k in _ANALYSTS
@@ -347,6 +392,7 @@ async def node_bull(state: WorkflowState) -> Dict[str, Any]:
         "summary": state.get("summary"),
         "position": state.get("position"),
         "account": state.get("account_snapshot"),
+        "data_snapshot": state.get("data_snapshot"),
     }))
     return {"bull": result}
 
@@ -365,6 +411,7 @@ async def node_bear(state: WorkflowState) -> Dict[str, Any]:
         "summary": state.get("summary"),
         "position": state.get("position"),
         "account": state.get("account_snapshot"),
+        "data_snapshot": state.get("data_snapshot"),
     }))
     return {"bear": result}
 
@@ -379,6 +426,7 @@ async def node_chief(state: WorkflowState) -> Dict[str, Any]:
         "summary": state.get("summary"),
         "position": state.get("position"),
         "account": state.get("account_snapshot"),
+        "data_snapshot": state.get("data_snapshot"),
     }))
     result["decision_id"] = gen_decision_id()
     # 落库投研结论(审计: 谁给的观点/结论是什么)
@@ -395,6 +443,7 @@ async def node_chief(state: WorkflowState) -> Dict[str, Any]:
             "analyst_outputs": {k: {kk: vv for kk, vv in v.items()
                                     if kk != "raw"} if isinstance(v, dict) else v
                                 for k, v in (state.get("analyst_outputs") or {}).items()},
+            "data_snapshot": state.get("data_snapshot") or {},
         },
     })
     state.record("chief_researcher", f"研究结论: {result.get('research_decision')}", result)
@@ -437,7 +486,15 @@ async def run_research(symbol: str, name: str = "", asset_type: str = "etf",
     state.set("asset_type", asset_type)
     state.set("position", position)
     state.set("system_paused", system_paused)
+    from core.agent_switch import agent_system_enabled
+    if not agent_system_enabled():
+        state.interrupt("Agent总开关已关闭，未执行分析且未调用LLM")
+        state.set("mode", "AGENT_DISABLED")
+        return state
     if asof_override:
         state.set("asof_override", asof_override)
+        bars = asof_override.get("bars") or []
+        if bars:
+            state.set("asof_date", bars[-1].get("trade_date"))
     graph = build_research_graph()
     return await graph.run(state)

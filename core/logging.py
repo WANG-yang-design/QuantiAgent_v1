@@ -126,4 +126,5 @@ def audit_event(event_type: str, actor: str, payload: dict):
 
 
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    from core.timeutil import now
+    return now().strftime("%Y-%m-%d %H:%M:%S")

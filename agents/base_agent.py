@@ -15,13 +15,14 @@ Agent 之间的调用关系(关键):
 """
 import logging
 import traceback
+from contextvars import ContextVar
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Type
 
 from pydantic import BaseModel
 
 from core.ids import gen_run_id
-from core.llm import get_llm
+from core.llm import LLMError, get_llm
 from core.logging import get_logger, get_trace_id
 from core.prompt_manager import get_prompt_manager
 from database import repository as repo
@@ -54,7 +55,8 @@ class BaseAgent(ABC):
         self.logger = get_logger(f"agent.{self.name}")
         self.llm = get_llm()
         self.prompt = get_prompt_manager().get(self.name)
-        self._current_run_id = ""
+        self._current_run_id: ContextVar[str] = ContextVar(
+            f"agent_run_id_{self.name}_{id(self)}", default="")
 
     # ---------------------------------------------------------------
     # 主入口: 带审计/日志/权限的 run 包装
@@ -67,11 +69,16 @@ class BaseAgent(ABC):
         # 注意: run_id 必须用 start_agent_run 返回对象里的(数据库实际入库的),
         # 不能另生成, 否则 finish/save 查不到记录(此前审计表一直为空的原因)
         run_id = run.run_id
-        self._current_run_id = run_id
+        run_token = self._current_run_id.set(run_id)
         try:
             # 工具权限预检: 每个 Agent 的方法即"工具", 由权限表控制
             self.check_tool_access("run")
-            output = await self._run_impl(input_data)
+            try:
+                output = await self._run_impl(input_data)
+            except LLMError as exc:
+                self.logger.warning("[%s] LLM 不可用，降级规则输出: %s", run_id, exc)
+                output = self.mock_output(input_data)
+                output = self.output_schema.model_validate(output).model_dump()
             repo.finish_agent_run(run_id, "OK")
             repo.save_agent_output(
                 run_id=run_id, agent_name=self.name,
@@ -79,7 +86,9 @@ class BaseAgent(ABC):
                       output.get("risk_decision", ""))),
                 score=float(output.get("score", 0) or 0),
                 confidence=float(output.get("confidence", 0) or 0),
-                output_json=output,
+                output_json={**output,
+                             "data_snapshot": (input_data.context or {}).get("data_snapshot")}
+                if (input_data.context or {}).get("data_snapshot") else output,
             )
             self.logger.info("[%s] %s 完成 → %s",
                              run_id, self.name, str(output)[:200])
@@ -89,6 +98,8 @@ class BaseAgent(ABC):
             self.logger.error("[%s] %s 失败: %s\n%s",
                               run_id, self.name, exc, traceback.format_exc())
             raise
+        finally:
+            self._current_run_id.reset(run_token)
 
     @abstractmethod
     async def _run_impl(self, input_data: AgentInput) -> Dict[str, Any]:
@@ -109,7 +120,7 @@ class BaseAgent(ABC):
 
     def _usage_cb(self, prompt_tokens: int, completion_tokens: int):
         try:
-            repo.update_agent_usage(self._current_run_id, prompt_tokens,
+            repo.update_agent_usage(self._current_run_id.get(), prompt_tokens,
                                     completion_tokens)
         except Exception:
             pass

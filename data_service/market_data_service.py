@@ -7,7 +7,7 @@
 所有 Agent 只调这里, 不直接碰数据源。
 """
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from data_service.cache_service import (
@@ -20,6 +20,18 @@ from data_sources.hub import DataSourceHub, get_hub
 from database import repository as repo
 
 logger = logging.getLogger("data.market_service")
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """只把连接/解析/超时归类为网络故障，避免把不支持历史误报成网络问题。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "connection", "connecterror", "connecttimeout", "readtimeout",
+        "remotedisconnected", "proxyerror", "dns", "name resolution",
+        "network is unreachable", "timed out", "timeout", "连接中断",
+        "连接失败", "网络", "超时",
+    )
+    return any(marker in text for marker in markers)
 
 
 class MarketDataService:
@@ -57,14 +69,7 @@ class MarketDataService:
         if len(bars) < 20:
             logger.warning("日K仅 %d 根(%s), 回退本地日K库", len(bars), symbol)
             try:
-                from database.models import DailyBar
-                from database.db_session import get_session
-                with get_session() as s:
-                    rows = s.query(DailyBar).filter(
-                        DailyBar.symbol == symbol,
-                        DailyBar.trade_date >= start,
-                        DailyBar.trade_date <= end,
-                    ).order_by(DailyBar.trade_date).all()
+                rows = repo.get_daily_bars(symbol, start, end)
                 if len(rows) > len(bars):
                     bars = [{
                         "symbol": r.symbol, "trade_date": r.trade_date,
@@ -93,6 +98,87 @@ class MarketDataService:
                 logger.warning("日K仅 %d 根(%s), 疑似数据源降级, 不缓存", len(bars), symbol)
         return bars, rep
 
+    def fill_daily_gaps(self, symbol: str, missing_dates: List[date],
+                        asset_type: str = "etf",
+                        diagnostics: Optional[Dict[str, Any]] = None
+                        ) -> List[Dict[str, Any]]:
+        """向全部可用日K数据源逐个补缺口，而不是首个非空源成功即停止。
+
+        历史主源常滞后一个交易日，实时/备用源却已经有当日K线。普通 Hub
+        failover 会把“主源返回了大部分区间”视为成功，因此无法补最后一天。
+        """
+        remaining = set(missing_dates or [])
+        if not remaining:
+            return []
+        collected: List[Dict[str, Any]] = []
+        # 缺口链与多年历史链分离：腾讯只能合成当日日K，不能作为多年历史
+        # 请求的首源，但最适合优先补历史源滞后的最后一个交易日。
+        gap_chain = self.hub._chain("daily_gap") or self.hub._chain("daily_bar")
+        attempts = max(1, int(getattr(self, "gap_fill_attempts", 2)))
+        errors: List[str] = []
+        network_errors: List[str] = []
+        reachable_sources = set()
+        attempted_sources = set()
+        for attempt in range(attempts):
+            for source_name in gap_chain:
+                if not remaining:
+                    break
+                attempted_sources.add(source_name)
+                try:
+                    client = self.hub._get_client(source_name)
+                    fn = getattr(client, "get_daily_bars", None)
+                    if fn is None:
+                        continue
+                    rows = fn(symbol, min(remaining), max(remaining), asset_type) or []
+                    # 调用正常返回（即使为空）说明不是网络故障；空结果可能是
+                    # 上市前、停牌或该免费源没有对应历史数据。
+                    reachable_sources.add(source_name)
+                    matched = [b for b in rows if b.get("trade_date") in remaining]
+                    # 当日日K在收盘前只是未完成快照，不能冻结进日线回测。
+                    from core.timeutil import aware_now
+                    now_cn = aware_now()
+                    if now_cn.time() < time(15, 5):
+                        matched = [b for b in matched if b.get("trade_date") != now_cn.date()]
+                    if not matched:
+                        continue
+                    rep = self.qc.check_daily_bars(symbol, matched)
+                    if rep.status not in ALLOWED_QUALITY:
+                        logger.warning("缺口数据质量不合格 %s/%s: %s",
+                                       symbol, source_name, rep.status)
+                        continue
+                    for b in matched:
+                        b["quality_status"] = rep.status
+                    repo.upsert_daily_bars(matched)
+                    collected.extend(matched)
+                    remaining -= {b["trade_date"] for b in matched}
+                    logger.info("日K缺口补齐 %s/%s: %s", symbol, source_name,
+                                ",".join(str(b["trade_date"]) for b in matched))
+                except Exception as exc:
+                    msg = f"{source_name}: {exc}"
+                    errors.append(msg)
+                    if _is_network_error(exc):
+                        network_errors.append(msg)
+                    logger.warning("日K缺口源失败(第%d轮) %s/%s: %s",
+                                   attempt + 1, symbol, source_name, exc)
+            if remaining and attempt + 1 < attempts:
+                # 短退避后仅重试仍缺失的日期，避免瞬时限流/连接抖动导致误判。
+                import time as _time
+                _time.sleep(1.0)
+        if diagnostics is not None:
+            diagnostics.update({
+                "attempts": attempts,
+                "attempted_sources": sorted(attempted_sources),
+                "reachable_sources": sorted(reachable_sources),
+                "errors": errors,
+                "network_errors": network_errors,
+                "remaining_days": [str(d) for d in sorted(remaining)],
+                "all_sources_failed": bool(errors and not reachable_sources),
+                "network_failed": bool(
+                    errors and not reachable_sources and
+                    len(network_errors) == len(errors)),
+            })
+        return collected
+
     # ================================================================
     # 分钟K
     # ================================================================
@@ -101,7 +187,10 @@ class MarketDataService:
                         asset_type: str = "etf") -> Tuple[List[Dict[str, Any]], DataQualityReport]:
         end = end or datetime.now()
         start = start or (end - timedelta(days=7))
-        key = f"minute:{symbol}:{start}:{end}:{freq}"
+        # 分钟级分桶，避免 datetime 微秒让每次请求都生成新 key。
+        end_key = end.replace(second=0, microsecond=0)
+        start_key = start.replace(second=0, microsecond=0)
+        key = f"minute:{symbol}:{start_key}:{end_key}:{freq}"
         hit = minute_cache.get(key)
         if hit is not None:
             return hit, DataQualityReport(symbol, "minute_bar")
@@ -130,7 +219,15 @@ class MarketDataService:
         if hit is not None:
             return hit, self.qc.check_realtime_quote(symbol, hit)
         try:
-            quote, source = self.hub.get_realtime_quote(symbol, asset_type)
+            # Realtime decisions require two independent public-source reads.
+            # The low-latency service batches Tencent and Sina and rejects a
+            # conflicting snapshot instead of silently trusting the first 200.
+            from data_service.live_quote_service import get_live_quote_service
+            quote = get_live_quote_service().get_quotes(
+                [symbol], max_age=2.0).get(symbol, {})
+            if not quote:
+                detail = get_live_quote_service().last_error
+                raise RuntimeError(detail or f"no verified quote for {symbol}")
         except Exception as exc:
             logger.error("实时行情失败 %s: %s", symbol, exc)
             return {}, self._failed_report(symbol, "realtime_quote", str(exc))

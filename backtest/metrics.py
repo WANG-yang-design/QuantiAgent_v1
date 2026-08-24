@@ -46,9 +46,9 @@ def compute_metrics(equity_curve: List[float],
     wins = [t for t in closed if t.get("pnl", 0) > 0]
     losses = [t for t in closed if t.get("pnl", 0) <= 0]
     win_rate = len(wins) / len(closed) if closed else None        # 无平仓记录 → None(前端显示样本不足)
-    avg_win = np.mean([t["pnl"] for t in wins]) if wins else 0.0
-    avg_loss = abs(np.mean([t["pnl"] for t in losses])) if losses else 0.0
-    profit_factor = float(avg_win / avg_loss) if avg_loss > 0 else None
+    gross_profit = sum(float(t["pnl"]) for t in wins)
+    gross_loss = abs(sum(float(t["pnl"]) for t in losses))
+    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else None
 
     # 连续亏损(按平仓记录)
     max_consec_loss, cur = 0, 0
@@ -78,6 +78,10 @@ def compute_metrics(equity_curve: List[float],
             m = s.groupby([s.index.year, s.index.month]).last()
             m_ret = m.pct_change().dropna()
             monthly = {f"{y}-{mo:02d}": round(v, 4) for (y, mo), v in m_ret.items()}
+            if len(m):
+                first_key = m.index[0]
+                monthly[f"{first_key[0]}-{first_key[1]:02d}"] = round(
+                    float(m.iloc[0] / eq.iloc[0] - 1), 4)
         except Exception:
             monthly = {}
 

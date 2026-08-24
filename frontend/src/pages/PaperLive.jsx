@@ -1,7 +1,7 @@
 ﻿import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
-import { Pause, Play, XCircle, Check, X, Info, ShieldAlert, Activity, Wallet, ChevronDown } from "lucide-react";
+import { Pause, Play, XCircle, Check, X, Info, ShieldAlert, Activity, Wallet, ChevronDown, History } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
 
@@ -12,19 +12,28 @@ export default function PaperLive() {
   const { data: mode, isLoading } = useQuery({
     queryKey: ["sysmode"],
     queryFn: () => api.get("/api/system/mode"),
-    refetchInterval: 10000,
+    refetchInterval: 5000,
   });
   const { data: equity } = useQuery({ queryKey: ["equity"], queryFn: () => api.get("/api/equity?limit=500") });
   // 持仓明细(修复: 原页面只有汇总数字, 看不到持仓详细情况)
   const { data: positions } = useQuery({
     queryKey: ["positions"],
     queryFn: () => api.get("/api/positions"),
-    refetchInterval: 10000,
+    refetchInterval: 3000,
   });
   const { data: trades } = useQuery({
     queryKey: ["trades"],
     queryFn: () => api.get("/api/trades?limit=30"),
     refetchInterval: 15000,
+  });
+  const { data: confirmHistory } = useQuery({
+    queryKey: ["confirmation-history"],
+    queryFn: () => api.get("/api/confirmations/history?limit=100"),
+    refetchInterval: 10000,
+  });
+  const { data: confirmSettings } = useQuery({
+    queryKey: ["confirmation-settings"],
+    queryFn: () => api.get("/api/confirmations/settings"),
   });
 
   const pause = useMutation({
@@ -46,6 +55,7 @@ export default function PaperLive() {
     mutationFn: ({ id, ok }) => api.post(`/api/confirmations/${id}/decide`, { approved: ok, note: "web" }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["sysmode"] });
+      qc.invalidateQueries({ queryKey: ["confirmation-history"] });
       // 批准后自动恢复下单; 非 ORDERED/REJECTED 的结果提示用户
       if (r?.status && !["ORDERED", "REJECTED"].includes(r.status)) {
         window.alert(`确认处理结果: ${r.status} ${r.reason || ""}`);
@@ -241,38 +251,47 @@ export default function PaperLive() {
         </div>
         {(positions || []).length ? (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[800px]">
+            <table className="w-full min-w-[700px]">
               <thead>
                 <tr>
                   <th className="th">代码</th><th className="th">名称</th>
-                  <th className="th">总数量</th><th className="th">可用(T+1)</th>
-                  <th className="th">成本价</th><th className="th">现价</th>
-                  <th className="th">市值</th><th className="th">浮盈亏</th><th className="th">盈亏率</th>
+                  <th className="th">总数 / 可用(T+1)</th>
+                  <th className="th">成本 / 现价</th>
+                  <th className="th">市值</th><th className="th">当日盈亏</th>
+                  <th className="th">浮盈亏 / 盈亏率</th>
                 </tr>
               </thead>
               <tbody>
                 {(positions || []).map((p) => {
-                  const pnl = p.pnl || 0;
+                  const pnl = Number(p.pnl || 0);
+                  const dayPnl = Number(p.day_pnl || 0);
+                  const pnlPct = Number(p.pnl_pct || 0);
                   return (
                     <tr key={p.symbol} className="cursor-pointer hover:bg-gray-50"
                       onClick={() => nav(`/symbol/${p.symbol}`)}>
                       <td className="td font-medium">{p.symbol}</td>
                       <td className="td text-gray-500">{p.name || "-"}</td>
-                      <td className="td">{p.total_qty}</td>
                       <td className="td">
-                        {p.available_qty}
+                        <span className="font-medium">{p.total_qty}</span>
+                        <span className="text-gray-400 mx-1">/</span>
+                        <span>{p.available_qty}</span>
                         {p.today_buy_qty > 0 && (
-                          <span className="badge bg-amber-50 text-amber-700 ml-1 ml-1" title="今日买入T+1锁定">T+1 {p.today_buy_qty}</span>
+                          <span className="badge bg-amber-50 text-amber-700 ml-1" title="今日买入T+1锁定">锁 {p.today_buy_qty}</span>
                         )}
                       </td>
-                      <td className="td">{fmt(p.cost_price)}</td>
-                      <td className="td font-semibold">{fmt(p.latest_price)}</td>
+                      <td className="td">
+                        <span>{fmt(p.cost_price)}</span>
+                        <span className="text-gray-400 mx-1">/</span>
+                        <span className="font-semibold">{fmt(p.latest_price)}</span>
+                      </td>
                       <td className="td">{fmt(p.market_value, 2)}</td>
-                      <td className={`td font-semibold ${pnl >= 0 ? "text-up" : "text-down"}`}>
-                        {pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}
+                      <td className={`td font-semibold ${dayPnl >= 0 ? "text-up" : "text-down"}`}>
+                        {dayPnl >= 0 ? "+" : ""}{fmt(dayPnl, 2)}
                       </td>
                       <td className={`td font-semibold ${pnl >= 0 ? "text-up" : "text-down"}`}>
-                        {(p.pnl_pct ?? 0) >= 0 ? "+" : ""}{(p.pnl_pct ?? 0) * 100}%
+                        {pnl >= 0 ? "+" : ""}{fmt(pnl, 2)}
+                        <span className="text-gray-400 mx-1">/</span>
+                        {pnlPct >= 0 ? "+" : ""}{(pnlPct * 100).toFixed(2)}%
                       </td>
                     </tr>
                   );
@@ -285,7 +304,13 @@ export default function PaperLive() {
 
       {/* 人工确认队列(修复: 移到最近成交上方, 待确认事项优先可见) */}
       <div className="card">
-        <div className="card-title">人工确认队列 ({(mode?.confirmations || []).length})</div>
+        <div className="card-title flex items-center justify-between">
+          <span>人工确认队列 ({(mode?.confirmations || []).length})</span>
+          <span className="text-[11px] text-gray-500 font-normal">
+            {confirmSettings?.timeout_seconds ? `${Math.round(confirmSettings.timeout_seconds / 60)}分钟超时` : "-"} ·
+            {confirmSettings?.timeout_action === "execute" ? " 超时自动执行（重新取价+复检）" : " 超时自动撤销"}
+          </span>
+        </div>
         {(mode?.confirmations || []).length ? (
           <div className="space-y-2">
             {(mode?.confirmations || []).map((c) => (
@@ -296,7 +321,14 @@ export default function PaperLive() {
                     <span className="text-sm font-medium">{c.symbol} {c.name && <span className="text-gray-500">{c.name}</span>}</span>
                     <span className="text-sm font-semibold">{c.action}</span>
                     <span className="text-sm text-gray-600">¥{fmt(c.amount, 0)}</span>
-                    <span className="text-[10px] text-gray-400 ml-auto">{c.created_at}</span>
+                    <span className="text-[10px] text-gray-400 ml-auto">创建 {c.created_at}</span>
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-1.5 mt-2 text-[11px]">
+                    <span>实时价 <b>{fmt(c.context?.data_snapshot?.latest_price ?? c.context?.latest_price)}</b></span>
+                    <span>行情 {c.context?.data_snapshot?.quote_time || c.context?.data_snapshot?.captured_at || "-"}</span>
+                    <span>来源 {c.context?.data_snapshot?.source || "-"}</span>
+                    <span>Agent {c.context?.chief_decision || c.context?.agent_decision || "-"}</span>
+                    <span>到期 {c.expires_at || "-"}</span>
                   </div>
                   {/* 分析结果/原因(修复: 原只显示一行截断的 reason, 看不到分析依据) */}
                   <pre className="mt-1.5 text-[11px] text-gray-600 bg-white/60 rounded px-2 py-1.5 whitespace-pre-wrap max-h-40 overflow-y-auto">{c.reason}</pre>
@@ -317,6 +349,34 @@ export default function PaperLive() {
             ))}
           </div>
         ) : <Empty text="无待确认交易(交易员标注需人工确认或中高风险时出现, 附完整分析原因)" />}
+      </div>
+
+      {/* 确认操作历史：确认/拒绝/超时及后续订单成交统一串联 */}
+      <div className="card">
+        <div className="card-title"><History size={14} />确认操作历史 ({confirmHistory?.total ?? 0})</div>
+        {(confirmHistory?.items || []).length ? (
+          <div className="overflow-x-auto max-h-80 overflow-y-auto">
+            <table className="w-full min-w-[1050px]">
+              <thead><tr><th className="th">创建/决定</th><th className="th">标的</th><th className="th">动作</th>
+                <th className="th">决策时价格</th><th className="th">处理结果</th><th className="th">处理人</th>
+                <th className="th">后续订单</th><th className="th">成交</th><th className="th">链路</th></tr></thead>
+              <tbody>{(confirmHistory?.items || []).map((c) => {
+                const snap = c.context?.data_snapshot || c.context || {};
+                return <tr key={c.confirm_id}>
+                  <td className="td text-xs"><div>{(c.created_at || "").slice(0, 19)}</div><div className="text-gray-400">{(c.decided_at || "").slice(0, 19) || "待处理"}</div></td>
+                  <td className="td">{c.symbol} <span className="text-gray-500">{c.name}</span></td>
+                  <td className="td font-semibold">{c.action}</td>
+                  <td className="td">{fmt(snap.latest_price ?? snap.plan_price)}<div className="text-[10px] text-gray-400">{snap.quote_time || snap.captured_at || "-"}</div></td>
+                  <td className="td"><span className="badge bg-gray-100 text-gray-700">{c.status}</span><div className="text-[10px] text-gray-400">{c.decision_note}</div></td>
+                  <td className="td text-xs">{c.decided_by || "-"}</td>
+                  <td className="td text-xs">{c.order ? `${c.order.status} · ${c.order.qty}份 @${fmt(c.order.price)}` : "未下单"}</td>
+                  <td className="td text-xs">{c.trade ? `${c.trade.qty}份 @${fmt(c.trade.price)}` : "未成交"}</td>
+                  <td className="td">{c.trace_id ? <button className="text-brand-600 hover:underline text-xs" onClick={() => nav(`/agents?trace=${c.trace_id}`)}>查看决策</button> : "-"}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>
+        ) : <Empty text="暂无确认记录" />}
       </div>
 
       {/* 今日成交 */}

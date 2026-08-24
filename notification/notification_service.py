@@ -7,7 +7,8 @@
 模板: HTML 卡片式(手机友好), 复用 AAgent demo 的样式经验。
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from html import escape
 from typing import Any, Dict, List, Optional
 
 from notification.email_sender import get_email_sender
@@ -35,10 +36,12 @@ body{margin:0;padding:12px;background:#f2f2f7;font-family:-apple-system,BlinkMac
 
 
 def _wrap(title: str, subtitle: str, body: str, color: str = "#1c7a3e") -> str:
+    # body 由本模块的安全卡片组装；标题、副标题仍可能来自外部数据。
+    safe_color = color if color in {"#1c7a3e", "#c0392b", "#e67e22", "#2980b9"} else "#1c7a3e"
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{_CSS}</style></head><body><div class="wrap">
-<div class="header" style="background:{color}"><h2>{title}</h2><p>{subtitle}</p></div>
+<div class="header" style="background:{safe_color}"><h2>{escape(str(title))}</h2><p>{escape(str(subtitle))}</p></div>
 {body}
 <div class="footer">此邮件由多Agent量化交易系统自动发出, 仅供参考, 不构成投资建议。</div>
 </div></body></html>"""
@@ -46,10 +49,11 @@ def _wrap(title: str, subtitle: str, body: str, color: str = "#1c7a3e") -> str:
 
 def _card(rows: List[tuple], badge: str = "", reason: str = "") -> str:
     rows_html = "".join(
-        f'<div class="row"><span class="label">{k}</span><span class="val">{v}</span></div>'
+        f'<div class="row"><span class="label">{escape(str(k))}</span><span class="val">{escape(str(v))}</span></div>'
         for k, v in rows)
-    badge_html = f'<div><span class="badge {badge}">{badge}</span></div>' if badge else ""
-    reason_html = f'<div class="reason">{reason}</div>' if reason else ""
+    safe_badge = "".join(c for c in str(badge) if c.isalnum() or c in "_-")
+    badge_html = f'<div><span class="badge {safe_badge}">{escape(str(badge))}</span></div>' if badge else ""
+    reason_html = f'<div class="reason">{escape(str(reason))}</div>' if reason else ""
     return f'<div class="card">{badge_html}{rows_html}{reason_html}</div>'
 
 
@@ -70,34 +74,51 @@ class NotificationService:
         return "Agent决策链路"
 
     @staticmethod
-    def _confirm_links(confirm_id: str) -> tuple:
-        """人工确认邮件按钮链接(带HMAC签名, 点开即确认, 无需登录Web)。
+    def _confirm_links(confirm_id: str, timeout_seconds: int = 600) -> tuple:
+        """人工确认邮件审阅链接（GET 只展示，必须再用 POST 提交）。
         修复: 原实现写死 127.0.0.1 —— 手机/其他设备打开邮件点确认会
         打到自己设备上。改用 config.yaml web.public_base_url(可配局域网IP)。"""
         import hashlib
         import hmac as _hmac
         from core.config import get_settings
-        token = get_settings().get("web.admin_token", "quantiagent-admin")
+        secret = str(get_settings().get("web.confirm_secret", "") or "")
+        if len(secret) < 32:
+            raise RuntimeError("WEB_CONFIRM_SECRET 未配置")
         web = get_settings().section("web")
         base = str(web.get("public_base_url", "") or
                    f"http://127.0.0.1:{int(web.get('port', 8080))}").rstrip("/")
 
         def link(decision: str) -> str:
-            sig = _hmac.new(token.encode(), f"{confirm_id}:{decision}".encode(),
-                            hashlib.sha256).hexdigest()[:16]
-            return f"{base}/api/confirmations/{confirm_id}/email?decision={decision}&sig={sig}"
+            expires = int((datetime.now() + timedelta(
+                seconds=max(300, int(timeout_seconds or 600) + 300))).timestamp())
+            message = f"{confirm_id}:{decision}:{expires}"
+            sig = _hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()[:32]
+            return (f"{base}/api/confirmations/{confirm_id}/email?decision={decision}"
+                    f"&expires={expires}&sig={sig}")
         return link("approve"), link("reject")
 
     # ---------------- 1. 交易计划邮件 (文档15.2 全字段) ----------------
     def send_trade_plan_email(self, plan: Dict[str, Any],
                               risk: Optional[Dict[str, Any]] = None,
-                              confirm_id: str = "", reason: str = ""):
+                              confirm_id: str = "", reason: str = "",
+                              data_snapshot: Optional[Dict[str, Any]] = None,
+                              chief: Optional[Dict[str, Any]] = None,
+                              timeout_policy: Optional[Dict[str, Any]] = None):
         risk = risk or {}
+        data_snapshot = data_snapshot or {}
+        chief = chief or {}
+        timeout_policy = timeout_policy or {}
         source = self._plan_source(plan)
         rows = [
+            ("决策时间", data_snapshot.get("captured_at") or datetime.now().isoformat(timespec="seconds")),
             ("交易动作", plan.get("action", "")),
             ("标的代码", plan.get("symbol", "")),
             ("标的名称", plan.get("name", "") or "-"),
+            ("实时价格", f"{float(data_snapshot.get('latest_price', 0) or 0):.3f}"),
+            ("行情时间", data_snapshot.get("quote_time") or data_snapshot.get("captured_at") or "-"),
+            ("行情来源/质量", f"{data_snapshot.get('source') or '-'} / {data_snapshot.get('quality_status') or '-'}"),
+            ("Agent结论", chief.get("research_decision") or "-"),
+            ("Agent置信度", f"{float(chief.get('confidence', 0) or 0):.0%}"),
             ("计划数量", f"{plan.get('estimated_quantity', 0)} 份"),
             ("计划价格", f"{plan.get('limit_price', '市价')}"),
             ("预计金额", f"¥{plan.get('order_amount', 0):,.0f}"),
@@ -111,29 +132,61 @@ class NotificationService:
         confirm_reason = reason or risk.get("blocked_reason", "") or ""
         extra = ""
         if need_confirm and confirm_id:
-            approve_url, reject_url = self._confirm_links(confirm_id)
+            approve_url, reject_url = self._confirm_links(
+                confirm_id, int(timeout_policy.get("timeout_seconds", 600) or 600))
             extra = f"""
 <div class="card">
   <div class="reason" style="border-left:3px solid #f59f00;margin-bottom:10px">
-    <b>为什么需要人工确认:</b><br/>{confirm_reason}</div>
+    <b>为什么需要人工确认:</b><br/>{escape(str(confirm_reason))}</div>
   <div style="display:flex;gap:8px">
     <a href="{approve_url}" style="flex:1;text-align:center;padding:10px;border-radius:8px;
-       background:#1c7a3e;color:#fff;text-decoration:none;font-weight:700;font-size:14px">✅ 批准交易</a>
+       background:#1c7a3e;color:#fff;text-decoration:none;font-weight:700;font-size:14px">✅ 审阅批准</a>
     <a href="{reject_url}" style="flex:1;text-align:center;padding:10px;border-radius:8px;
-       background:#c0392b;color:#fff;text-decoration:none;font-weight:700;font-size:14px">❌ 拒绝交易</a>
+       background:#c0392b;color:#fff;text-decoration:none;font-weight:700;font-size:14px">❌ 审阅拒绝</a>
   </div>
-  <div style="font-size:11px;color:#999;margin-top:6px">点击按钮后立即生效, 无需登录网页。若已在网页处理过, 再次点击将提示"已处理"。
-  若2分钟内无人处理, 系统将按轮动策略方向自动执行(策略给买入信号→自动批准; 否则自动拒绝)。</div>
+  <div style="font-size:11px;color:#999;margin-top:6px">链接只打开审阅页，仍需在页面再次提交，避免邮件安全扫描器误执行。若客户端拦截，请到网页“模拟盘/实盘”处理。
+  超时 {int(timeout_policy.get('timeout_seconds', 0) or 0) // 60} 分钟后将<b>{'自动执行（重新取价并复检风控）' if timeout_policy.get('timeout_action') == 'execute' else '自动撤销'}</b>。</div>
 </div>"""
         elif confirm_reason:
-            extra = f'<div class="reason" style="border-left:3px solid #f59f00"><b>原因:</b> {confirm_reason}</div>'
+            extra = (f'<div class="reason" style="border-left:3px solid #f59f00">'
+                     f'<b>原因:</b> {escape(str(confirm_reason))}</div>')
         body = _wrap("📋 交易计划", datetime.now().strftime("%Y-%m-%d %H:%M"),
                      _card(rows, str(plan.get("action", "")),
                            "；".join(str(x) for x in (plan.get("reasons") or [])[:6])) + extra)
         self.mail.send_email(
-            f"【交易计划】{source.split('(')[0]} {plan.get('action')} "
-            f"{plan.get('symbol', '')} {plan.get('name', '')}",
-            body, dedup_key=f"plan:{plan.get('plan_id', '')}", dedup_minutes=1440)
+            f"【待确认·{'买入' if plan.get('action') == 'BUY' else '卖出'}】"
+            f"{plan.get('symbol', '')} {plan.get('name', '')} "
+            f"@{float(data_snapshot.get('latest_price', 0) or 0):.3f}",
+            body, dedup_key=f"plan:{plan.get('plan_id', '')}", dedup_minutes=1440,
+            priority=0)
+
+    def send_confirmation_result_email(self, confirmation: Any,
+                                       status: str, reason: str = ""):
+        """通知确认单的最终结果，尤其用于无人值守的超时自动处理。"""
+        ctx = getattr(confirmation, "context_json", {}) or {}
+        snap = ctx.get("data_snapshot") or {}
+        status_cn = {
+            "AUTO_EXECUTED": "超时自动执行", "AUTO_CANCELLED": "超时自动撤销",
+            "APPROVED": "人工批准", "REJECTED": "人工拒绝", "FAILED": "执行失败",
+        }.get(status, status)
+        rows = [
+            ("确认结果", status_cn),
+            ("标的", f"{getattr(confirmation, 'symbol', '')}"),
+            ("动作", getattr(confirmation, "action", "")),
+            ("决策时价格", snap.get("latest_price") or "-"),
+            ("行情时间", snap.get("quote_time") or snap.get("captured_at") or "-"),
+            ("Agent结论", ctx.get("chief_decision") or "-"),
+            ("处理时间", datetime.now().isoformat(timespec="seconds")),
+            ("处理方式", getattr(confirmation, "decided_by", "") or "timeout-policy"),
+        ]
+        body = _wrap("⏱️ 人工确认处理结果", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     _card(rows, "APPROVE" if "EXECUTED" in status else "REJECT", reason),
+                     color="#2980b9")
+        self.mail.send_email(
+            f"【确认结果·{status_cn}】{getattr(confirmation, 'symbol', '')} "
+            f"{getattr(confirmation, 'action', '')}", body,
+            dedup_key=f"confirm-result:{getattr(confirmation, 'confirm_id', '')}:{status}",
+            dedup_minutes=1440, priority=1)
 
     # ---------------- 2. 盘中风险提醒 ----------------
     def send_risk_alert_email(self, alerts: List[Dict[str, Any]]):
@@ -176,8 +229,10 @@ class NotificationService:
         ]
         body = _wrap("✅ 模拟成交确认", datetime.now().strftime("%Y-%m-%d %H:%M"),
                      _card(rows, str(trade.get("side", ""))))
-        self.mail.send_email(f"【模拟成交】{source.split('(')[0]} {trade.get('side')} "
-                             f"{trade.get('symbol', '')} {trade.get('qty', 0)}份",
+        action_cn = "买入" if trade.get("side") == "BUY" else "卖出"
+        self.mail.send_email(f"【已成交·{action_cn}·{source.split('(')[0]}】"
+                             f"{trade.get('symbol', '')} {trade.get('qty', 0)}份 "
+                             f"@{float(trade.get('price', 0) or 0):.3f}",
                              body, dedup_key=f"trade:{trade.get('trade_id', '')}", dedup_minutes=1440)
 
     # ---------------- 4. 异常告警 ----------------
@@ -199,7 +254,9 @@ class NotificationService:
   <div class="stat-box"><div class="stat-num">{stats.get('total_asset', 0):,.0f}</div><div class="stat-lbl">总资产</div></div>
   <div class="stat-box"><div class="stat-num">{stats.get('fee_total', 0):.0f}</div><div class="stat-lbl">手续费</div></div>
 </div>"""
-        review_html = f'<div class="reason">📝 {review.get("review_summary", "")}</div>' if review else ""
+        review_html = (f'<div class="reason">📝 '
+                       f'{escape(str(review.get("review_summary", "")))}</div>'
+                       if review else "")
         body = _wrap("📊 每日收盘复盘", f"{stats.get('date', '')} · 收盘",
                      stat_html + review_html, color="#2980b9")
         self.mail.send_email(f"【量化日报】{stats.get('date', '')} 复盘 "

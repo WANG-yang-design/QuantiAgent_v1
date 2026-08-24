@@ -29,4 +29,11 @@ def run_backtest_with_agents(symbols: List[str], start: date, end: date,
     engine = BacktestEngine(start, end, initial_cash=initial_cash,
                             use_agents=True, agent_interval_days=agent_interval_days)
     replayer = DataReplayer(symbols)
-    return engine.run_daily(replayer, signal_fn)
+    try:
+        return engine.run_daily(replayer, signal_fn)
+    except Exception as exc:
+        logger.exception("Agent 回测失败")
+        return {
+            "status": "FAILED", "error": str(exc), "metrics": {"error": str(exc)},
+            "symbols": list(symbols), "start_date": str(start), "end_date": str(end),
+        }

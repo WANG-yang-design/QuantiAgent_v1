@@ -117,14 +117,45 @@ function RiskPlanCard({ trace, limits }) {
   );
 }
 
-/** Agent 决策中心: 最近工作流列表 + 决策链路可视化 + 准确率归因 */
+function DataSnapshotCard({ trace }) {
+  const q = trace?.data_snapshot || {};
+  if (!trace) return null;
+  const price = Number(q.latest_price || 0);
+  if (!price && !q.quote_time && !q.captured_at) {
+    return (
+      <div className="card mt-3 border-amber-200 bg-amber-50/30 text-xs text-amber-700">
+        此决策产生于行情快照功能上线之前，历史记录无法补造当时价格；新产生的决策会显示实时价格、行情时间、来源和质量。
+      </div>
+    );
+  }
+  const stale = q.quality_status && q.quality_status !== "VALID";
+  return (
+    <div className={`card mt-3 ${stale ? "border-red-200 bg-red-50/30" : "border-blue-200 bg-blue-50/20"}`}>
+      <div className="card-title flex items-center justify-between">
+        <span>本次 Agent 实际看到的行情快照</span>
+        <span className={`badge ${stale ? "bg-red-50 text-red-600" : "bg-green-50 text-green-600"}`}>{q.quality_status || "未知质量"}</span>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+        <div><span className="text-gray-500">实时价格</span><div className="text-lg font-bold">{price > 0 ? price.toFixed(3) : "-"}</div></div>
+        <div><span className="text-gray-500">行情时间</span><div className="font-medium">{q.quote_time || "-"}</div></div>
+        <div><span className="text-gray-500">数据来源</span><div className="font-medium">{q.source || "-"}</div>
+          {q.verified_sources > 0 && <div className="text-[10px] text-gray-400">{q.verified_sources}源核验 · 价差 {((Number(q.price_spread_pct) || 0) * 100).toFixed(3)}%{q.selected_source ? ` · 采用 ${q.selected_source}` : ""}</div>}
+        </div>
+        <div><span className="text-gray-500">日K参考</span><div className="font-medium">{q.daily_close ? Number(q.daily_close).toFixed(3) : "-"} · {q.daily_trade_date || "-"}</div></div>
+      </div>
+      <div className="text-[10px] text-gray-400 mt-2">快照在数据采集阶段固化，后续价格变化不会改写这次 Agent 当时所见；下单前仍会重新取实时行情并复检。</div>
+    </div>
+  );
+}
+
+/** Agent 影子观察中心: 研究链路 + 与正式策略信号配对后的收益归因 */
 export default function AgentCenter() {
   const qc = useQueryClient();
   const [sp] = useSearchParams();
   // 深链接: 监控标的页点击"最近结论"跳转到 /agents?trace=xxx
   const [traceId, setTraceId] = useState(sp.get("trace") || null);
   const [code, setCode] = useState("");
-  const [tab, setTab] = useState("traces");   // traces / accuracy
+  const [tab, setTab] = useState("traces");   // traces / shadow / accuracy
   const [traceLimit, setTraceLimit] = useState(500);   // 当天全部展示(修复: 原只显示前20条)
   // 日期筛选: today / yesterday / 前天 / all(修复: 最近工作流展示太少, 前几天的可选查看)
   const [selDate, setSelDate] = useState("today");
@@ -174,6 +205,12 @@ export default function AgentCenter() {
     queryKey: ["accuracy"],
     queryFn: () => api.get("/api/agents/accuracy?days=90&horizon_days=5"),
     enabled: tab === "accuracy",
+    refetchInterval: 60000,
+  });
+  const { data: shadow } = useQuery({
+    queryKey: ["agent-shadow-performance"],
+    queryFn: () => api.get("/api/agents/shadow-performance?days=365"),
+    enabled: tab === "shadow",
     refetchInterval: 60000,
   });
   // 风控参数(止损止盈方案卡用)
@@ -234,8 +271,13 @@ export default function AgentCenter() {
   return (
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
-        <h1 className="text-lg font-bold text-brand-600">Agent 决策中心</h1>
+        <h1 className="text-lg font-bold text-brand-600">Agent 影子观察中心</h1>
         <SystemBar />
+      </div>
+
+      <div className="card border-blue-200 bg-blue-50/40 text-sm text-blue-800">
+        <b>当前权限：策略独立掌控买卖。</b>
+        Agent 只在后台分析、记录当时观点并做收益归因，不会创建订单、阻止策略、延迟成交或触发分歧确认；数据闸门、硬风控、合规和熔断仍可拒绝不安全订单。
       </div>
 
       {/* 触发分析(全局状态, 切页不丢) */}
@@ -259,7 +301,7 @@ export default function AgentCenter() {
         {taskId && scanStatus === "FAILED" && (
           <span className="badge bg-red-50 text-red-600">分析失败: {scanError}</span>
         )}
-        <span className="ml-auto text-xs text-gray-400">分析会依次调用: 数据闸门→7分析师→多空辩论→首席→交易员→风控→合规→执行</span>
+        <span className="ml-auto text-xs text-gray-400">分析链路: 数据闸门→7分析师→多空辩论→首席→影子观点留档（不下单）</span>
 
         {/* 节点级实时进度(修复: 原实现只有"分析中"三个字, 看不到任何进度) */}
         {scanning && taskStatus?.progress_pct != null && (
@@ -294,8 +336,11 @@ export default function AgentCenter() {
       {/* tab 切换 */}
       <div className="flex gap-2">
         <button className={`btn ${tab === "traces" ? "btn-primary" : "btn-ghost"}`} onClick={() => setTab("traces")}>决策链路</button>
+        <button className={`btn ${tab === "shadow" ? "btn-primary" : "btn-ghost"}`} onClick={() => setTab("shadow")}>
+          <Target size={13} className="inline mr-1" />策略分歧影子评估
+        </button>
         <button className={`btn ${tab === "accuracy" ? "btn-primary" : "btn-ghost"}`} onClick={() => setTab("accuracy")}>
-          <Target size={13} className="inline mr-1" />Agent准确率归因
+          <Target size={13} className="inline mr-1" />独立方向准确率
         </button>
       </div>
 
@@ -430,6 +475,7 @@ export default function AgentCenter() {
             {traceId ? (
               trace ? (
                 <div className="max-h-[600px] overflow-y-auto pr-1">
+                  <DataSnapshotCard trace={trace} />
                   <RiskPlanCard trace={trace} limits={limits} />
                   <DecisionTimeline trace={trace} />
                 </div>
@@ -437,9 +483,38 @@ export default function AgentCenter() {
             ) : <Empty text="选择左侧工作流查看完整 Agent 决策链路" />}
           </div>
         </div>
+      ) : tab === "shadow" ? (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="card"><div className="text-xs text-gray-500">策略信号样本</div><div className="text-2xl font-bold">{shadow?.total_samples ?? 0}</div></div>
+            <div className="card"><div className="text-xs text-gray-500">已具备5日结果</div><div className="text-2xl font-bold">{shadow?.evaluated_5d ?? 0}</div></div>
+            <div className="card"><div className="text-xs text-gray-500">Agent交易权限</div><div className="text-lg font-bold text-green-600">无</div></div>
+            <div className="card"><div className="text-xs text-gray-500">策略订单受Agent影响</div><div className="text-lg font-bold text-green-600">0</div></div>
+          </div>
+          <div className="card">
+            <div className="card-title">Agent赞同/中性/反对后的策略收益</div>
+            {shadow?.groups?.length ? (
+              <div className="overflow-x-auto"><table className="w-full min-w-[780px]">
+                <thead><tr><th className="th">当时关系</th><th className="th">样本</th>{[1,3,5,10].map(h => <th className="th" key={h}>{h}日平均 / 胜率 / 有效数</th>)}</tr></thead>
+                <tbody>{shadow.groups.map(g => (
+                  <tr key={g.group}><td className="td font-medium">{{AGREE:"赞同",NEUTRAL:"中性",DISAGREE:"反对",NO_VIEW:"无及时观点"}[g.group] || g.group}</td><td className="td">{g.samples}</td>
+                    {[1,3,5,10].map(h => <td className="td" key={h}>{g[`avg_${h}d`] == null ? "-" : `${(g[`avg_${h}d`]*100).toFixed(2)}% / ${(g[`win_${h}d`]*100).toFixed(0)}% / ${g[`n_${h}d`]}`}</td>)}</tr>
+                ))}</tbody>
+              </table></div>
+            ) : <Empty text="尚未产生正式策略信号样本；下一次轮动信号会自动开始积累" />}
+            <div className="text-xs text-gray-400 mt-2">口径：以正式策略产生信号时的实时价格为基准，用之后第1/3/5/10个交易日收盘价计算；Agent只被观察，不改变真实订单。</div>
+          </div>
+          <div className="card">
+            <div className="card-title">最近配对样本</div>
+            {shadow?.recent?.length ? <div className="overflow-x-auto"><table className="w-full min-w-[900px]">
+              <thead><tr><th className="th">时间</th><th className="th">标的</th><th className="th">策略</th><th className="th">Agent</th><th className="th">关系</th><th className="th">信号价</th><th className="th">订单</th><th className="th">1/3/5/10日</th></tr></thead>
+              <tbody>{shadow.recent.map(r => <tr key={r.shadow_id}><td className="td">{r.signal_time}</td><td className="td">{r.symbol} {r.name}</td><td className="td font-medium">{r.strategy_action}</td><td className="td">{r.agent_decision}<div className="text-[10px] text-gray-400">{r.agent_decision_time || "无及时观点"}</div></td><td className="td">{{AGREE:"赞同",NEUTRAL:"中性",DISAGREE:"反对",NO_VIEW:"无观点"}[r.agreement]}</td><td className="td">{Number(r.signal_price || 0).toFixed(3)}</td><td className="td">{r.execution_status}</td><td className="td">{[1,3,5,10].map(h => r.forward_returns?.[h] == null ? "-" : `${(r.forward_returns[h]*100).toFixed(2)}%`).join(" / ")}</td></tr>)}</tbody>
+            </table></div> : <Empty text="暂无配对样本" />}
+          </div>
+        </div>
       ) : (
         <div className="card">
-          <div className="card-title">Agent 准确率归因(结论后 {accuracy?.horizon_days} 个交易日收益校验 · 近 {accuracy?.window_days} 天)</div>
+          <div className="card-title">Agent 独立方向准确率(不代表可提升策略收益 · 结论后 {accuracy?.horizon_days} 个交易日)</div>
           {accuracy?.agents?.length ? (
             <div className="overflow-x-auto">
             <table className="w-full min-w-[640px]">

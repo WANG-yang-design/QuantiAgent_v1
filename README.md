@@ -33,7 +33,7 @@ python main.py scan 510300
 python main.py backtest --start 2025-06-01 --end 2026-07-31
 
 # 6. Web 管理台(仪表盘/实时盯盘/标的详情/Agent决策/回测中心/模拟盘实盘/设置)
-python main.py serve          # http://localhost:8080  (Bearer token: quantiagent-admin)
+python main.py serve          # http://localhost:8080（令牌从 .env 的 WEB_ADMIN_TOKEN 读取）
 
 # 7. 调度器(交易日历/行情/新闻/Agent常规分析/日报)
 python main.py scheduler

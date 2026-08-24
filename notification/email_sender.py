@@ -10,6 +10,7 @@
 - 统一 HTML 模板(卡片式, 手机友好)
 """
 import logging
+import itertools
 import queue
 import smtplib
 import ssl
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.config import get_settings
 from database.db_session import get_session
@@ -37,12 +38,14 @@ class EmailSender:
         # 修复: 原实现用 asyncio.Queue + create_task —— 非运行中事件循环里
         # create_task 的任务永不执行, 邮件静默丢失。改为独立发送线程 +
         # 线程安全队列, 不依赖任何事件循环。
-        self._queue: "queue.Queue" = queue.Queue(maxsize=200)
+        self._queue: "queue.PriorityQueue" = queue.PriorityQueue(maxsize=200)
+        self._queue_seq = itertools.count()
         self._worker_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._dedup_cache: Dict[str, float] = {}
         if self.enabled:
             self._start_worker()
+            self._recover_pending()
 
     # ------------------------------------------------------------------
     def is_enabled(self) -> bool:
@@ -99,15 +102,43 @@ class EmailSender:
     def send_email(self, subject: str, html_body: str,
                    extra_receivers: Optional[List[str]] = None,
                    dedup_key: Optional[str] = None,
-                   dedup_minutes: int = 30) -> bool:
+                   dedup_minutes: int = 30,
+                   priority: int = 10) -> bool:
         """发送入口: 入队发送(去重检查在发送线程内完成)。
         修复: 原实现发送前就写入内存去重缓存, 发送失败(网络/SMTP异常)
         也会被当成"已发送" —— 之后重试/重新触发全部被去重吞掉,
         用户永远收不到邮件。去重移到发送成功后记录。"""
         if dedup_key:
             dedup_key = f"{self.cfg.get('sender','')}:{dedup_key}"
-        self._enqueue(subject, html_body, extra_receivers, dedup_key)
+        if not self.enabled:
+            return False
+        record_id = self._record_outgoing(
+            subject, html_body, extra_receivers, dedup_key, dedup_minutes)
+        self._enqueue(subject, html_body, extra_receivers, dedup_key,
+                      dedup_minutes, record_id, priority=priority)
         return True
+
+    def status_summary(self) -> Dict[str, Any]:
+        """邮件队列可观测状态（不返回正文与凭据）。"""
+        try:
+            from sqlalchemy import func
+            with get_session() as s:
+                counts = dict(s.query(NotificationRecord.status, func.count())
+                              .group_by(NotificationRecord.status).all())
+                rows = s.query(NotificationRecord).order_by(
+                    NotificationRecord.created_at.desc()).limit(20).all()
+                return {
+                    "enabled": self.enabled, "worker_alive": bool(
+                        self._worker_thread and self._worker_thread.is_alive()),
+                    "queue_size": self._queue.qsize(), "counts": counts,
+                    "recent": [{"id": r.id, "subject": r.subject,
+                                "status": r.status, "attempts": r.attempt_count,
+                                "created_at": str(r.created_at),
+                                "updated_at": str(r.updated_at)} for r in rows],
+                }
+        except Exception as exc:
+            return {"enabled": self.enabled, "worker_alive": False,
+                    "error": str(exc), "counts": {}, "recent": []}
 
     def _sent_before(self, dedup_key: str, minutes: int) -> bool:
         try:
@@ -122,16 +153,59 @@ class EmailSender:
         except Exception:
             return False
 
-    def _record_sent(self, dedup_key: str, ok: bool):
-        # 修复: 仅发送成功才落库(失败不占去重名额)
-        if not ok:
+    def _record_outgoing(self, subject: str, html_body: str,
+                         extra_receivers: Optional[List[str]],
+                         dedup_key: Optional[str], dedup_minutes: int) -> Optional[int]:
+        """入队前落库，进程异常退出后仍能恢复未发送任务。"""
+        try:
+            with get_session() as s:
+                row = NotificationRecord(
+                    dedup_key=dedup_key or "", subject=subject,
+                    html_body=html_body, extra_receivers=extra_receivers or [],
+                    dedup_minutes=max(0, int(dedup_minutes)), status="PENDING")
+                s.add(row)
+                s.flush()
+                return int(row.id)
+        except Exception as exc:
+            logger.error("邮件任务持久化失败: %s", exc)
+            return None
+
+    @staticmethod
+    def _record_result(record_id: Optional[int], status: str):
+        if record_id is None:
             return
         try:
             with get_session() as s:
-                s.add(NotificationRecord(dedup_key=dedup_key or "",
-                                         status="SENT"))
-        except Exception:
-            pass
+                row = s.get(NotificationRecord, record_id)
+                if row:
+                    row.status = status
+                    row.attempt_count = int(row.attempt_count or 0) + 1
+                    row.updated_at = datetime.now()
+        except Exception as exc:
+            logger.error("邮件任务状态落库失败: %s", exc)
+
+    def _recover_pending(self):
+        """恢复 24 小时内未完成/失败的任务，最多 100 封。"""
+        try:
+            with get_session() as s:
+                rows = s.query(NotificationRecord).filter(
+                    NotificationRecord.status.in_(("PENDING", "FAILED")),
+                    NotificationRecord.created_at >= datetime.now() - timedelta(hours=24),
+                    NotificationRecord.attempt_count < 5,
+                ).order_by(NotificationRecord.created_at).limit(100).all()
+                pending = [{
+                    "id": int(r.id), "subject": r.subject,
+                    "html": r.html_body, "extra": list(r.extra_receivers or []),
+                    "dedup_key": r.dedup_key or None,
+                    "minutes": int(r.dedup_minutes or 30),
+                } for r in rows if r.subject and r.html_body]
+            for item in pending:
+                priority = 0 if str(item["subject"]).startswith("【待确认") else 10
+                self._enqueue(item["subject"], item["html"], item["extra"],
+                              item["dedup_key"], item["minutes"], item["id"],
+                              priority=priority)
+        except Exception as exc:
+            logger.warning("恢复邮件队列失败: %s", exc)
 
     # ------------------------------------------------------------------
     # 后台发送线程(不阻塞主流程, 也不依赖事件循环)
@@ -146,18 +220,18 @@ class EmailSender:
     def _worker_loop(self):
         while True:
             item = self._queue.get()
-            if item is None:
-                break
-            subject, html, extra, dedup_key = item
+            priority, _seq, subject, html, extra, dedup_key, dedup_minutes, record_id = item
             # 去重在发送线程内完成(发送成功才记录, 失败可重发)
             if dedup_key:
                 with self._lock:
                     last = self._dedup_cache.get(dedup_key)
-                    if last and (time.time() - last) < 1440 * 60:
+                    if last and (time.time() - last) < dedup_minutes * 60:
                         logger.debug("邮件去重跳过: %s", subject)
+                        self._record_result(record_id, "SKIPPED")
                         continue
-                if self._sent_before(dedup_key, 1440):
+                if self._sent_before(dedup_key, dedup_minutes):
                     logger.debug("邮件持久化去重跳过: %s", subject)
+                    self._record_result(record_id, "SKIPPED")
                     continue
             try:
                 ok = self._send_sync(subject, html, extra)
@@ -166,12 +240,19 @@ class EmailSender:
                 ok = False
             if ok and dedup_key:
                 with self._lock:
+                    cutoff = time.time() - 86400
+                    self._dedup_cache = {
+                        key: ts for key, ts in self._dedup_cache.items() if ts >= cutoff}
                     self._dedup_cache[dedup_key] = time.time()
-                self._record_sent(dedup_key, ok)
+            self._record_result(record_id, "SENT" if ok else "FAILED")
+            if not ok:
+                logger.error("邮件任务已持久化为 FAILED，下次启动将重试: %s", subject)
 
-    def _enqueue(self, subject, html, extra, dedup_key):
+    def _enqueue(self, subject, html, extra, dedup_key, dedup_minutes,
+                 record_id=None, priority: int = 10):
         try:
-            self._queue.put((subject, html, extra, dedup_key), timeout=1.0)
+            self._queue.put((int(priority), next(self._queue_seq), subject, html,
+                             extra, dedup_key, dedup_minutes, record_id), timeout=1.0)
         except Exception as exc:
             # 队列满/线程异常: 降级为同步发送, 保证通知不丢
             logger.warning("邮件入队失败, 转为同步发送: %s", exc)
@@ -179,8 +260,7 @@ class EmailSender:
                 ok = self._send_sync(subject, html, extra)
             except Exception:
                 ok = False
-            if dedup_key:
-                self._record_sent(dedup_key, ok)
+            self._record_result(record_id, "SENT" if ok else "FAILED")
 
 
 _sender: Optional[EmailSender] = None

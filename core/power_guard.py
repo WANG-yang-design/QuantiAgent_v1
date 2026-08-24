@@ -19,6 +19,7 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_AWAYMODE_REQUIRED = 0x00000040
 
 _guard_thread = None
+_guard_stop = threading.Event()
 
 
 def _win32_set(flags: int) -> bool:
@@ -32,6 +33,7 @@ def _win32_set(flags: int) -> bool:
 def prevent_sleep():
     """阻止系统自动睡眠(持续生效; 手动睡眠/关机/息屏不受影响)。"""
     global _guard_thread
+    _guard_stop.clear()
     if not _win32_set(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_AWAYMODE_REQUIRED):
         # 非 Windows: 无需处理
         return
@@ -39,8 +41,7 @@ def prevent_sleep():
 
     # 部分系统/服务场景下该标志需要周期性重申, 后台线程每60秒刷一次
     def _keep():
-        while True:
-            time.sleep(60)
+        while not _guard_stop.wait(60):
             try:
                 _win32_set(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
             except Exception:
@@ -54,4 +55,5 @@ def prevent_sleep():
 
 def allow_sleep():
     """撤销防睡眠(程序退出前调用; 一般不需要, 进程退出自动清除)。"""
+    _guard_stop.set()
     _win32_set(_ES_CONTINUOUS)

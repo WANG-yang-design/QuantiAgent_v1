@@ -64,6 +64,22 @@ def _safe_float(v, default: float = 0.0) -> float:
         return default
 
 
+def _quote_time(parts: List[str]) -> datetime:
+    """Use the exchange timestamp carried by Tencent, never the HTTP response time."""
+    try:
+        return datetime.strptime(parts[30], "%Y%m%d%H%M%S")
+    except (IndexError, TypeError, ValueError):
+        return datetime.now()
+
+
+def _quote_amount(parts: List[str]) -> float:
+    """Field 35 is ``price/volume/amount`` and amount is already in yuan."""
+    try:
+        return _safe_float(parts[35].split("/")[2])
+    except (IndexError, AttributeError):
+        return _safe_float(parts[37]) * 10000
+
+
 class TencentClient(BaseDataSource):
     """腾讯行情: 实时行情 / 今日分时分钟K / 当日日K合成 / 五档盘口。"""
 
@@ -106,11 +122,11 @@ class TencentClient(BaseDataSource):
             out[symbol] = {
                 "symbol": symbol,
                 "name": parts[1].strip() if len(parts) > 1 else "",
-                "quote_time": datetime.now(),
+                "quote_time": _quote_time(parts),
                 "latest_price": price,
                 "change_pct": _safe_float(parts[32]),
                 "volume": _safe_float(parts[6]) * 100,
-                "amount": 0.0,
+                "amount": _quote_amount(parts),
                 "high": _safe_float(parts[33]),
                 "low": _safe_float(parts[34]),
                 "open": _safe_float(parts[5]),
@@ -144,7 +160,7 @@ class TencentClient(BaseDataSource):
             price = prev_close
         if price <= 0:
             raise RuntimeError(f"腾讯 {symbol} 行情价格为0")
-        quote_time = datetime.now()
+        quote_time = _quote_time(parts)
         # 盘口: 9~18=买一价量..买五价量, 19~28=卖一价量..卖五价量
         bid1, bid_vol1 = _safe_float(parts[9]), _safe_float(parts[10])
         ask1, ask_vol1 = _safe_float(parts[19]), _safe_float(parts[20])
@@ -155,7 +171,7 @@ class TencentClient(BaseDataSource):
             "latest_price": price,
             "change_pct": _safe_float(parts[32]),      # 涨跌幅%
             "volume": _safe_float(parts[6]) * 100,     # 手→股
-            "amount": 0.0,
+            "amount": _quote_amount(parts),
             "high": _safe_float(parts[33]),
             "low": _safe_float(parts[34]),
             "open": _safe_float(parts[5]),
@@ -245,7 +261,8 @@ class TencentClient(BaseDataSource):
             try:
                 price = float(parts[1])
                 cum_vol = float(parts[2])
-                vol = max(0.0, cum_vol - prev_vol)
+                # 腾讯分时成交量单位为“手”，系统统一存“股/份”。
+                vol = max(0.0, cum_vol - prev_vol) * 100
                 prev_vol = cum_vol
                 dt = datetime(y, mo, d, int(t_str[:2]), int(t_str[2:]), 0)
                 rows.append((dt, price, vol))
@@ -309,22 +326,23 @@ class TencentClient(BaseDataSource):
         opens = [r[1] for r in rows if r[1] > 0]
         if not opens:
             raise RuntimeError(f"腾讯 {symbol} 当日价格为0")
-        first = rows[0]
-        price = first[1]
+        open_price = rows[0][1]
+        close_price = rows[-1][1]
         hi = max(r[1] for r in rows)
         lo = min(r[1] for r in rows)
         vol = sum(r[2] for r in rows)
+        amount = sum(r[1] * r[2] for r in rows)
         prev_close = self._prev_close(symbol)
-        change_pct = (price / prev_close - 1) * 100 if prev_close > 0 else 0.0
+        change_pct = (close_price / prev_close - 1) * 100 if prev_close > 0 else 0.0
         return [{
             "symbol": symbol,
             "trade_date": today,
-            "open": round(opens[0], 4),
+            "open": round(open_price, 4),
             "high": round(hi, 4),
             "low": round(lo, 4),
-            "close": round(price, 4),
+            "close": round(close_price, 4),
             "volume": round(vol, 0),
-            "amount": 0.0,
+            "amount": round(amount, 2),
             "change_pct": round(change_pct, 4),
             "source": self.name,
             "is_live": True,

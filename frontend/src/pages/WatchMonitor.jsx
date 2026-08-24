@@ -5,20 +5,23 @@ import { Plus, Trash2, Star, Power, Search } from "lucide-react";
 import { api } from "../api/client";
 import { SystemBar, fmtWan, fmt } from "../components/Common";
 import { decisionMeta } from "./AgentCenter";
+import { useLiveQuotes, toQuoteMap } from "../hooks/useLiveQuotes";
 
 /** 分类中文名与配色 */
 const CAT_META = {
   holding: { label: "持仓", color: "bg-blue-50 text-blue-700" },
-  hot: { label: "热门ETF", color: "bg-orange-50 text-orange-700" },
   watched: { label: "主动监控", color: "bg-green-50 text-green-700" },
   stock: { label: "股票", color: "bg-purple-50 text-purple-700" },
   etf: { label: "ETF", color: "bg-cyan-50 text-cyan-700" },
   default: { label: "默认池", color: "bg-gray-100 text-gray-600" },
+  dynamic: { label: "动态池", color: "bg-emerald-50 text-emerald-700" },
+  pool_pin: { label: "固定入池", color: "bg-blue-50 text-blue-700" },
+  pool_exclude: { label: "排除入池", color: "bg-red-50 text-red-700" },
 };
 
 /**
  * 监控标的: 盘中/每日监控池管理
- * 分类: 持仓(自动)/热门ETF(自动)/主动勾选/股票/ETF
+ * 分类: 持仓(自动)/动态ETF池/主动勾选/股票/ETF
  */
 export default function WatchMonitor() {
   const qc = useQueryClient();
@@ -31,14 +34,14 @@ export default function WatchMonitor() {
     queryFn: () => api.get("/api/watchlist"),
     refetchInterval: 20000,
   });
-  // 行情(给列表显示价格, 失败不影响)
-  const { data: quotes } = useQuery({
-    queryKey: ["quotes", (data?.items || []).map((i) => i.symbol).join(",")],
-    queryFn: () => api.get("/api/quotes", { symbols: (data?.items || []).map((i) => i.symbol).join(",") }),
-    enabled: (data?.items || []).length > 0,
-    refetchInterval: 10000,
+  const { data: poolData } = useQuery({
+    queryKey: ["etf-pool-snapshots"],
+    queryFn: () => api.get("/api/universe/etf/snapshots?limit=5&source_mode=paper"),
+    refetchInterval: 60000,
   });
-  const qmap = Object.fromEntries((quotes?.quotes || []).map((q) => [q.symbol, q]));
+  // 行情(给列表显示价格, 失败不影响)
+  const { data: quotes } = useLiveQuotes((data?.items || []).map((i) => i.symbol));
+  const qmap = toQuoteMap(quotes);
 
   // 每个标的最近一次 Agent 决策结论(修复: 监控标的页看不到 Agent 对它的判断)
   const { data: decisions } = useQuery({
@@ -70,14 +73,25 @@ export default function WatchMonitor() {
     mutationFn: ({ symbol, cats }) => api.post(`/api/watchlist/${symbol}/categories`, { categories: cats }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
   });
+  const overridePool = useMutation({
+    mutationFn: ({ symbol, mode }) => api.post(`/api/universe/etf/override/${symbol}`, { mode }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+  });
+  const refreshPool = useMutation({
+    mutationFn: () => api.post("/api/universe/etf/refresh"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["watchlist"] });
+      qc.invalidateQueries({ queryKey: ["etf-pool-snapshots"] });
+    },
+  });
 
   const items = (data?.items || []).filter((i) => !searchName || (i.name || "").includes(searchName) || (i.symbol || "").includes(searchName));
   const groups = [
     ["holding", "持仓(自动监控)"],
+    ["dynamic", "动态ETF候选池(自动维护)"],
     ["watched", "主动勾选监控"],
     ["stock", "股票"],
     ["etf", "ETF"],
-    ["hot", "热门ETF(系统自动加入)"],
   ].map(([cat, label]) => ({
     cat, label,
     items: items.filter((i) => i.categories.includes(cat)),
@@ -104,8 +118,37 @@ export default function WatchMonitor() {
             onChange={(e) => setSearchName(e.target.value)} />
         </div>
         <span className="ml-auto text-xs text-gray-400">
-          共 {items.length} 只 · 持仓与热门ETF由系统自动维护 · 调度器每30分钟扫描启用的标的
+          共 {items.length} 只 · 3秒行情 {quotes?.quote_time || "-"}
+          {quotes?.status === "stale" ? <span className="text-red-500"> · 数据滞后</span> : null}
+          · 调度器每30分钟扫描启用的标的
         </span>
+      </div>
+
+      <div className="card">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div>
+            <div className="card-title mb-0">两阶段动态ETF池</div>
+            <div className="text-xs text-gray-500">
+              {poolData?.latest
+                ? `当前 ${poolData.latest.candidate_count} 只 · 数据截止 ${poolData.latest.asof_date} · 生效 ${poolData.latest.effective_date} · ${poolData.latest.snapshot_hash?.slice(0, 12)}`
+                : "尚无模拟盘候选池快照"}
+            </div>
+          </div>
+          <button className="btn-primary ml-auto" disabled={refreshPool.isPending}
+            onClick={() => refreshPool.mutate()}>
+            {refreshPool.isPending ? "生成中..." : "立即生成候选池"}
+          </button>
+        </div>
+        {poolData?.latest?.members?.length ? (
+          <div className="flex flex-wrap gap-1 mt-2 max-h-20 overflow-y-auto">
+            {poolData.latest.members.map((m) => (
+              <span key={m.symbol} className="badge bg-emerald-50 text-emerald-700"
+                title={`${m.selection_reason} · 20日均成交额 ${(m.avg_amount / 10000).toFixed(0)}万 · 主题 ${m.theme}`}>
+                {m.rank}. {m.symbol} {m.name}
+              </span>
+            ))}
+          </div>
+        ) : null}
       </div>
 
       {groups.map(({ cat, label, items: gitems }) => (
@@ -132,6 +175,9 @@ export default function WatchMonitor() {
                 const q = qmap[i.symbol] || {};
                 const chg = q.change_pct;
                 const pos = i.position;
+                const livePrice = Number(q.latest_price || pos?.latest_price || 0);
+                const livePnl = pos ? (livePrice - Number(pos.cost_price || 0)) * Number(pos.total_qty || 0) : 0;
+                const livePnlPct = pos?.cost_price ? livePrice / Number(pos.cost_price) - 1 : 0;
                 return (
                   <tr key={i.symbol} className="cursor-pointer hover:bg-gray-50" onClick={() => nav(`/symbol/${i.symbol}`)}>
                     <td className="td font-medium">{i.symbol}</td>
@@ -140,9 +186,9 @@ export default function WatchMonitor() {
                     {cat === "holding" && (
                       <>
                         <td className="td">{pos ? `${pos.total_qty}/${pos.available_qty}` : "-"}</td>
-                        <td className="td">{pos ? `${fmt(pos.cost_price)}/${fmt(pos.latest_price)}` : "-"}</td>
-                        <td className={`td font-semibold ${!pos ? "" : pos.pnl >= 0 ? "text-up" : "text-down"}`}>
-                          {pos ? `${pos.pnl >= 0 ? "+" : ""}${fmt(pos.pnl, 2)} (${((pos.pnl_pct || 0) * 100).toFixed(2)}%)` : "-"}
+                        <td className="td">{pos ? `${fmt(pos.cost_price)}/${fmt(livePrice)}` : "-"}</td>
+                        <td className={`td font-semibold ${!pos ? "" : livePnl >= 0 ? "text-up" : "text-down"}`}>
+                          {pos ? `${livePnl >= 0 ? "+" : ""}${fmt(livePnl, 2)} (${(livePnlPct * 100).toFixed(2)}%)` : "-"}
                         </td>
                       </>
                     )}
@@ -196,7 +242,17 @@ export default function WatchMonitor() {
                           })}>
                           <Star size={13} />
                         </button>
-                        {!["holding", "hot"].includes(cat) && (
+                        {i.asset_type === "etf" && (
+                          <select className="input py-1 text-[11px] w-24"
+                            value={i.categories.includes("pool_pin") ? "pin" : i.categories.includes("pool_exclude") ? "exclude" : "auto"}
+                            title="动态ETF池覆盖；下一次生成快照时生效"
+                            onChange={(e) => overridePool.mutate({ symbol: i.symbol, mode: e.target.value })}>
+                            <option value="auto">自动选池</option>
+                            <option value="pin">固定入池</option>
+                            <option value="exclude">排除入池</option>
+                          </select>
+                        )}
+                        {!["holding", "dynamic"].includes(cat) && (
                           <button className="text-gray-300 hover:text-red-500" title="移除"
                             onClick={() => remove.mutate(i.symbol)}>
                             <Trash2 size={14} />

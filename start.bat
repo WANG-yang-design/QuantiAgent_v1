@@ -1,98 +1,83 @@
 @echo off
-rem ============================================================
-rem  Multi-Agent Quant Trading System V1 - Launcher
-rem
-rem  Usage (double-click or command line):
-rem    start.bat           -> build frontend + Web (hot reload)
-rem                           + Scheduler + Browser
-rem    start.bat nosched   -> build frontend + Web only
-rem    start.bat front     -> Vite dev server (5173, HMR instant
-rem                           update) + Web API (8080) + Browser
-rem    start.bat watch     -> also run "vite build --watch" window:
-rem                           frontend changes auto-rebuild
-rem
-rem  Frontend updates:
-rem    - Normal mode: this script builds frontend before start;
-rem      after editing frontend code run "start.bat watch" once,
-rem      then every change auto-rebuilds (refresh browser to see).
-rem    - "start.bat front": Vite HMR - changes appear instantly.
-rem
-rem  Python backend: hot reload ON by default (uvicorn --reload),
-rem  .py changes take effect automatically.
-rem  config/*.yaml changes do NOT hot-reload; run restart.bat.
-rem
-rem  How to stop:
-rem    1) Recommended: run stop.bat (kills all processes)
-rem    2) Or press Ctrl+C in each window
-rem    3) Closing windows (X) triggers exit, but leftovers may
-rem       remain - run stop.bat to clean up.
-rem  ASCII only. Do NOT add Chinese characters here.
-rem ============================================================
-setlocal enabledelayedexpansion
-chcp 65001 >nul 2>&1
+setlocal
 cd /d "%~dp0"
 
-echo.
-echo  [QuantiAgent V1] starting...
-echo  - Web console : http://localhost:8080  (Python hot reload ON)
-echo  - Scheduler   : embedded in Web process (data collection /
-echo                   agent analysis / daily report)
-echo  - Stop: run stop.bat, or press Ctrl+C in the windows.
-echo.
+set "PYTHON_EXE=%CD%\.venv\Scripts\python.exe"
+set "PID_FILE=%CD%\data\web.pid"
+set "APP_PORT=8080"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo  [ERROR] .venv not found. Please run:  python -m venv .venv
+echo.
+echo [QuantiAgent] Starting...
+
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] Python virtual environment was not found.
+    echo [ERROR] Expected: %PYTHON_EXE%
     pause
     exit /b 1
 )
 
 if not exist ".env" (
-    echo  [WARN] .env not found. Please copy .env.example to .env first.
+    echo [ERROR] .env was not found.
+    echo [ERROR] Copy .env.example to .env and configure it first.
+    pause
+    exit /b 1
 )
 
-rem ---- frontend dev server (HMR, instant update) ----
-if /i "%~1"=="front" (
-    echo  [MODE] Vite HMR on http://localhost:5173 (API proxied to 8080)
-    start "QuantiAgent-Web" cmd /k ".venv\Scripts\python.exe main.py serve"
-    timeout /t 4 /nobreak >nul
-    cd /d "%~dp0frontend"
-    start "" "http://localhost:5173"
-    call npm run dev
-    exit /b 0
+call "%CD%\stop.bat" quiet
+if errorlevel 1 (
+    echo [ERROR] Existing QuantiAgent processes could not be stopped.
+    pause
+    exit /b 1
 )
 
-rem ---- build frontend (make sure dist is up to date) ----
 if not exist "frontend\node_modules" (
-    echo  [WARN] frontend\node_modules missing, skipping build.
-    goto :skip_build
+    echo [ERROR] frontend\node_modules was not found.
+    echo [ERROR] Run npm install in the frontend directory first.
+    pause
+    exit /b 1
 )
-echo  - building frontend (npm run build)...
+
+echo [1/3] Building frontend...
 pushd frontend
 call npm run build
-set BUILD_OK=%ERRORLEVEL%
+set "BUILD_RESULT=%ERRORLEVEL%"
 popd
-if not "%BUILD_OK%"=="0" (
-    echo  [WARN] frontend build failed, using previous dist.
+if not "%BUILD_RESULT%"=="0" (
+    echo [ERROR] Frontend build failed. Service was not started.
+    pause
+    exit /b %BUILD_RESULT%
 )
-:skip_build
-
-rem ---- optional frontend watch (auto rebuild on change) ----
-if /i "%~1"=="watch" (
-    echo  [MODE] frontend watch: edits auto-rebuild (refresh browser to see)
-    start "QuantiAgent-FrontendWatch" cmd /k "cd /d %~dp0frontend && npx vite build --watch"
-    timeout /t 2 /nobreak >nul
+if not exist "frontend\dist\index.html" (
+    echo [ERROR] Frontend build did not create frontend\dist\index.html.
+    pause
+    exit /b 1
 )
 
-rem ---- normal mode: Web (hot reload) + embedded Scheduler ----
-rem NOTE: do NOT start a separate scheduler process. The Web process
-rem embeds the scheduler (web.embed_scheduler=true). Two processes
-rem holding their own broker state caused position/order/cash
-rem corruption before.
-start "QuantiAgent-Web" cmd /k ".venv\Scripts\python.exe main.py serve"
+if not exist "data" mkdir "data"
+if not exist "logs" mkdir "logs"
 
-timeout /t 6 /nobreak >nul
-start "" "http://localhost:8080"
-echo  [OK] windows opened. Python hot reload ON, frontend built.
-echo  [NOTE] Frontend: run "start.bat front" for HMR or "start.bat watch"
-echo         for auto-rebuild. After config/*.yaml changes run restart.bat.
+echo [2/3] Starting web API and embedded scheduler on port %APP_PORT%...
+powershell -NoProfile -Command "$p = Start-Process -FilePath '%PYTHON_EXE%' -ArgumentList @('main.py','serve','--port','%APP_PORT%','--no-reload') -WorkingDirectory '%CD%' -WindowStyle Hidden -RedirectStandardOutput '%CD%\logs\launcher.stdout.log' -RedirectStandardError '%CD%\logs\launcher.stderr.log' -PassThru; Set-Content -LiteralPath '%PID_FILE%' -Value $p.Id -Encoding ascii; Write-Output $p.Id"
+if errorlevel 1 (
+    echo [ERROR] Failed to create the server process.
+    pause
+    exit /b 1
+)
+
+echo [3/3] Waiting for the API and frontend to become ready...
+for /l %%I in (1,1,60) do (
+    powershell -NoProfile -Command "try { $h = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:%APP_PORT%/api/health'; $p = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 'http://127.0.0.1:%APP_PORT%/'; if ($h.StatusCode -eq 200 -and $p.StatusCode -eq 200) { exit 0 }; exit 1 } catch { exit 1 }"
+    if not errorlevel 1 goto ready
+    timeout /t 1 /nobreak >nul
+)
+
+echo [ERROR] Service did not become ready within 60 seconds.
+echo [ERROR] Check logs\launcher.stderr.log and logs\system.log.
+call "%CD%\stop.bat" quiet
+pause
+exit /b 1
+
+:ready
+echo [OK] QuantiAgent is ready at http://127.0.0.1:%APP_PORT%/
+start "" "http://127.0.0.1:%APP_PORT%/"
 exit /b 0

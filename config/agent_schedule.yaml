@@ -7,15 +7,23 @@ timezone: "Asia/Shanghai"
 jobs:
   # 交易日历更新
   update_trade_calendar:
-    cron: "0 8 * * 1-5"
+    cron: "0 8 * * mon-fri"
     enabled: true
   # 股票/ETF 基础信息更新
   update_symbols:
-    cron: "10 8 * * 1-5"
+    cron: "10 8 * * mon-fri"
+    enabled: true
+  # 两阶段动态ETF池：盘前按历史已知数据生成并保存候选池快照
+  dynamic_etf_universe:
+    cron: "20 8 * * mon-fri"
+    enabled: true
+  # 收盘后分批补齐全ETF历史数据，避免一次抓取1500只压垮免费源
+  dynamic_etf_history_backfill:
+    cron: "20 15 * * mon-fri"
     enabled: true
   # 盘前新闻公告扫描
   premarket_news:
-    cron: "30 8 * * 1-5"
+    cron: "30 8 * * mon-fri"
     enabled: true
   # 实时行情采集(交易时段, 池内标的; 每轮含容灾重试约20-30秒, 间隔30秒防任务重叠)
   collect_realtime_quote:
@@ -36,26 +44,30 @@ jobs:
   scan_news:
     interval_seconds: 600
     enabled: true
-  # Agent 常规分析(默认30分钟, 可配置)
-  # Agent 常规分析(间隔可调, 单位分钟; 30 = 每30分钟一次)
-  # 修复: 与时钟对齐 —— 自动换算成绝对时刻 cron(*/N 9-15 交易时段),
-  # 每天 9:30 开盘后整点扫描(30分钟 → 9:30/10:00/10:30/.../15:00),
-  # 程序重启/改间隔后立即按新时间表执行, 不再从启动时刻重新计时。
+  # Agent 常规分析：交易时段按整点网格每小时一次。
+  # 60分钟实际为 10:00/11:00/13:00/14:00/15:00，午休不空转，
+  # 程序重启后仍按绝对时间表执行，不从启动时刻重新计时。
   agent_routine_analysis:
-    interval_minutes: 30
+    interval_minutes: 60
+    enabled: true
+    only_trading_hours: true
+  # 14:40策略执行前，只分析同一策略在当前行情下产生的候选信号和当前持仓。
+  # 该任务为只读预演，不改变策略状态、不下单；Agent仍仅作影子观察。
+  agent_strategy_candidate_analysis:
+    cron: "30 14 * * mon-fri"
     enabled: true
     only_trading_hours: true
   # 收盘数据更新(15:10后)
   eod_data_update:
-    cron: "10 15 * * 1-5"
+    cron: "10 15 * * mon-fri"
     enabled: true
   # 日终报告(16:00-18:00)
   daily_report:
-    cron: "0 17 * * 1-5"
+    cron: "0 17 * * mon-fri"
     enabled: true
   # 市场牛熊诊断(交易时段每小时; 修复: 原 10-14 覆盖12:00午休空转且漏掉15:00)
   market_diagnosis:
-    cron: "0 10,11,14,15 * * 1-5"
+    cron: "0 10,11,14,15 * * mon-fri"
     enabled: true
   # 持仓风控巡检(间隔读 risk_limits.yaml position_monitor.check_interval_seconds)
   position_monitor:
@@ -75,13 +87,23 @@ jobs:
     only_trading_hours: true
   # 周报(周五 18:00)
   weekly_report:
-    cron: "0 18 * * 5"
+    cron: "0 18 * * fri"
     enabled: true
   # ETF动量轮动实盘执行(14:40收盘前, 回测策略在实盘的落地应用)
   # 修复: 原回测策略从未应用到实盘; 是否启用见 config.yaml strategies.live_rotation
   strategy_rotation:
-    cron: "40 14 * * 1-5"
+    cron: "40 14 * * mon-fri"
     enabled: true
+    only_trading_hours: true
+  # Agent影子样本远期收益归因（只读已落库日K，不影响交易）
+  agent_shadow_evaluation:
+    cron: "30 17 * * mon-fri"
+    enabled: true
+  # 人工确认超时扫描（持久化，服务重启后仍会继续处理）
+  confirmation_timeout:
+    interval_seconds: 15
+    enabled: true
+    only_trading_hours: false
   # 月报(每月1日18:00, 生成上月; 修复: 原无月报任务)
   monthly_report:
     cron: "0 18 1 * *"

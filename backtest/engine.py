@@ -108,7 +108,8 @@ class BacktestBroker:
             p = self.positions[symbol]
             if p["qty"] > 0 and prices.get(symbol, 0) > 0:
                 price = prices[symbol]
-                fee = fee_fn(price * p["qty"]) if fee_fn else price * p["qty"] * 0.00025
+                fee = (fee_fn(symbol, price * p["qty"], "SELL")
+                       if fee_fn else price * p["qty"] * 0.00025)
                 self.sell(symbol, p["qty"], price, fee, 0.0, date_, "期末平仓",
                           name=p.get("name", ""))
 
@@ -119,13 +120,17 @@ class BacktestEngine:
     def __init__(self, start: date, end: date, initial_cash: float = 100000.0,
                  slippage: Optional[float] = None, mode: str = "daily",
                  use_agents: bool = False, agent_interval_days: int = 5,
-                 name: str = "", run_id: Optional[str] = None):
+                 name: str = "", run_id: Optional[str] = None,
+                 asset_type: str = "etf",
+                 asset_types: Optional[Dict[str, str]] = None):
         self.start = start
         self.end = end
         self.mode = mode
         self.use_agents = use_agents
         self.agent_interval_days = max(int(agent_interval_days or 5), 1)
         self.name = name or f"回测{start}-{end}"
+        self.asset_type = asset_type
+        self.asset_types = {str(k): str(v) for k, v in (asset_types or {}).items()}
         rules = get_settings().section("trading_rules")
         self.slippage = slippage if slippage is not None else float(
             rules.get("slippage", {}).get("daily_bar", 0.001))
@@ -133,24 +138,36 @@ class BacktestEngine:
         self.agent_interval_days = max(int(agent_interval_days or 5), 1)
         fees = rules.get("fees", {})
         self.fee_rate = float(fees.get("commission_rate", 0.00025))
-        self.fee_min = float(fees.get("commission_min_etf", 0.0))   # ETF 免最低5元门槛
+        self.fee_min_stock = float(fees.get("commission_min", 5.0))
+        self.fee_min_etf = float(fees.get("commission_min_etf", 0.0))
         self.transfer_rate = float(fees.get("transfer_fee_rate", 0.00001))
+        self.stamp_tax_rate = float(fees.get("stamp_tax_rate", 0.0005))
         self.broker = BacktestBroker(initial_cash)
         self.initial_cash = initial_cash     # 保存真实初始资金(结果展示用)
         self.run_id = run_id or gen_backtest_id()   # 复用提交时的 run_id(避免重复记录)
-        self.equity_curve: List[float] = [initial_cash]
-        self.equity_dates: List[str] = [str(start)]
-        self.position_curve: List[float] = [0.0]     # 每日持仓市值曲线
+        self.equity_curve: List[float] = []
+        self.equity_dates: List[str] = []
+        self.position_curve: List[float] = []        # 每日持仓市值曲线
         self.benchmark_curve: List[float] = []
         self.name_map: Dict[str, str] = {}           # symbol -> 中文名
         self.progress_cb = None                      # 进度回调(异步任务用)
         self.params: Dict[str, Any] = {}             # 回测参数(结果展示用)
+        self.data_coverage: Dict[str, Any] = {}
+        self.market_snapshot: Dict[str, List[dict]] = {}
+        self.data_snapshot_hash = ""
+        self.universe_snapshots: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
-    def _calc_fee(self, amount: float) -> float:
-        """回测手续费(与模拟盘一致): ETF 佣金按实际费率(免最低5元) + 过户费。"""
-        commission = max(amount * self.fee_rate, self.fee_min)
-        return round(commission + amount * self.transfer_rate, 4)
+    def asset_type_for(self, symbol: str) -> str:
+        return self.asset_types.get(symbol, self.asset_type)
+
+    def _calc_fee(self, amount: float, symbol: str = "", side: str = "BUY") -> float:
+        """按标的类别与方向计算费用：股票最低佣金及卖出印花税，ETF免印花税。"""
+        asset_type = self.asset_type_for(symbol)
+        minimum = self.fee_min_stock if asset_type == "stock" else self.fee_min_etf
+        commission = max(amount * self.fee_rate, minimum)
+        stamp = amount * self.stamp_tax_rate if asset_type == "stock" and side == "SELL" else 0.0
+        return round(commission + amount * self.transfer_rate + stamp, 4)
 
     # ------------------------------------------------------------------
     def run_daily(self, data_loader, signal_fn, benchmark_symbol: str = "000300"):
@@ -165,18 +182,43 @@ class BacktestEngine:
             "mode": "daily", "status": "RUNNING",
             "config_json": {"use_agents": self.use_agents,
                             "slippage": self.slippage,
-                            "agent_interval_days": self.agent_interval_days},
+                            "agent_interval_days": self.agent_interval_days,
+                            "initial_cash": self.initial_cash,
+                            "asset_type": self.asset_type,
+                            "asset_types": self.asset_types,
+                            "params": self.params},
         })
         trade_dates = data_loader.trade_dates(self.start, self.end)
         total_days = max(len(trade_dates), 1)
         # 预加载K线: 起点前额外加载历史(算动量/均线等指标用, 仍无未来函数:
         # 指标只用 ≤T 数据, 交易只在 [start, end] 区间发生)
         load_start = self.start - timedelta(days=250)
+        if not trade_dates:
+            raise ValueError("回测区间内无可靠交易日历")
+        # 初始净值绑定到首个真实交易日，避免周末/节假日或请求日期伪装成行情点。
+        self.equity_curve = [self.initial_cash]
+        self.equity_dates = [str(trade_dates[0])]
+        self.position_curve = [0.0]
+        universe_provider = getattr(signal_fn, "universe_provider", None)
+        if hasattr(data_loader, "prepare_daily"):
+            try:
+                self.data_coverage = data_loader.prepare_daily(
+                    self.start, self.end, warmup_start=load_start,
+                    gap_fill=universe_provider is None)
+            except TypeError as exc:
+                # Keep compatibility with small/custom loaders that implement
+                # the original three-argument protocol.  Only swallow the
+                # signature mismatch; genuine TypeErrors inside a loader must
+                # still fail loudly.
+                if "gap_fill" not in str(exc):
+                    raise
+                self.data_coverage = data_loader.prepare_daily(
+                    self.start, self.end, warmup_start=load_start)
         bars_by_symbol = {s: data_loader.load_all_daily(s, load_start, self.end)
                           for s in data_loader.universe()}
-        if not trade_dates:
-            logger.warning("回测区间内无交易日, 返回空结果")
-            return self._finalize()
+        if hasattr(data_loader, "snapshot"):
+            self.market_snapshot = data_loader.snapshot()
+            self.data_snapshot_hash = data_loader.snapshot_hash()
 
         # 待成交订单意图(T日生成 → T+1开盘成交)。
         # 修复: 原实现把成交记账提前到信号日迭代, 导致 today_buy 在成交日
@@ -193,17 +235,29 @@ class BacktestEngine:
             self._execute_pending_fills(pending_fills, bars_by_symbol, d)
             # ---- 仅使用截至 d 的数据(含 d) ----
             asof = {s: [b for b in bars if b["trade_date"] <= d] for s, bars in bars_by_symbol.items()}
+            # 当日缺K线（停牌/少量数据缺口）可以按昨收估值，但绝不能用旧K线
+            # 重复生成当日交易信号。
             prices = {s: (bs[-1]["close"] if bs else 0) for s, bs in asof.items()}
+            tradable_asof = {
+                s: bs for s, bs in asof.items()
+                if bs and bs[-1]["trade_date"] == d
+            }
+            tradable_prices = {s: prices[s] for s in tradable_asof}
+
+            # Membership is refreshed from complete point-in-time histories;
+            # the signal still receives only symbols tradable on this date.
+            if universe_provider is not None:
+                universe_provider(d, asof)
 
             # 特征与信号(脚本策略; Agent 模式在关键节点介入)
             if self.use_agents and i % self.agent_interval_days == 0:
-                signals = self._agent_signals(asof, d)
+                signals = self._agent_signals(tradable_asof, d)
             else:
                 # signal_fn 可接收 broker(轮动策略需要持仓做再平衡)
                 try:
-                    signals = signal_fn(asof, prices, d, self.broker)
+                    signals = signal_fn(tradable_asof, tradable_prices, d, self.broker)
                 except TypeError:
-                    signals = signal_fn(asof, prices, d)
+                    signals = signal_fn(tradable_asof, tradable_prices, d)
 
             # ---- 信号入队(T+1 开盘成交) ----
             for symbol, sig in signals.items():
@@ -227,8 +281,12 @@ class BacktestEngine:
                         continue
                     sig = {**sig, "qty": qty}
                     if sig.get("stop"):
-                        # 止损: 当日收盘价立即成交(模拟盘中触发市价止损, 不等次日开盘)
-                        self._fill_at_close(symbol, qty, "SELL", prices, d, sig)
+                        # 日线只有收盘后才能确认止损；与普通信号一样次日开盘成交。
+                        # 盘中止损必须改用分钟K的 high/low 触发模型。
+                        pending_fills.append({
+                            "symbol": symbol, "qty": qty, "side": "SELL",
+                            "sig": sig, "plan_date": d,
+                        })
                     else:
                         pending_fills.append({
                             "symbol": symbol, "qty": qty, "side": "SELL",
@@ -244,21 +302,28 @@ class BacktestEngine:
 
         # 期末: 平仓 + 基准曲线
         prices = {s: (bs[-1]["close"] if bs else 0) for s, bs in asof.items()}
-        self.broker.close_positions(prices, trade_dates[-1], fee_fn=self._calc_fee)
-        self.equity_curve.append(self.broker.equity(prices))
-        self.equity_dates.append(str(trade_dates[-1]))
-        self.position_curve.append(0.0)
+        self.broker.close_positions(
+            prices, trade_dates[-1],
+            fee_fn=lambda symbol, amount, side: self._calc_fee(amount, symbol, side))
+        self.equity_curve[-1] = self.broker.equity(prices)
+        self.position_curve[-1] = 0.0
+
+        if universe_provider is not None:
+            self.universe_snapshots = list(
+                getattr(universe_provider, "snapshots", []) or [])
 
         bench = data_loader.load_benchmark(benchmark_symbol, self.start, self.end)
         if bench:
             b0 = bench[0]["close"]
             # 与净值曲线对齐: 基准归一化到与回测相同的初始资金(非固定10万)
             init = self.initial_cash
-            self.benchmark_curve = [init] + \
-                [b / b0 * init for b in [x["close"] for x in bench]] + \
-                [bench[-1]["close"] / b0 * init]
-            if len(self.benchmark_curve) > len(self.equity_curve):
-                self.benchmark_curve = self.benchmark_curve[:len(self.equity_curve)]
+            bench_by_date = {str(x["trade_date"]): float(x["close"]) for x in bench}
+            last = b0
+            aligned = [init]
+            for d in self.equity_dates[1:]:
+                last = bench_by_date.get(str(d)[:10], last)
+                aligned.append(last / b0 * init)
+            self.benchmark_curve = aligned
 
         return self._finalize()
 
@@ -287,9 +352,22 @@ class BacktestEngine:
             if nxt is None:
                 continue
             fill_price = nxt["open"]
+                # 只有全天封死在涨跌停（无价格波动）才认定不可成交；普通高开到
+                # 涨停但盘中打开仍可能成交，不能仅看开盘价一律拒绝。
+            previous = [b for b in bars if b["trade_date"] < d]
+            if previous:
+                from core.symbol_utils import price_limit_pct
+                limit = price_limit_pct(symbol, self.asset_type_for(symbol))
+                prev_close = float(previous[-1]["close"] or 0)
+                change = fill_price / prev_close - 1 if prev_close > 0 else 0
+                locked = abs(float(nxt.get("high", fill_price)) -
+                             float(nxt.get("low", fill_price))) <= max(abs(fill_price) * 1e-6, 1e-8)
+                if locked and ((side == "BUY" and change >= limit - 0.001) or
+                               (side == "SELL" and change <= -limit + 0.001)):
+                    continue
             slip = fill_price * self.slippage
             price = fill_price + slip if side == "BUY" else fill_price - slip
-            fee = self._calc_fee(price * qty)
+            fee = self._calc_fee(price * qty, symbol, side)
             name = self.name_map.get(symbol, "")
 
             if side == "BUY":
@@ -299,7 +377,7 @@ class BacktestEngine:
                     max_qty = int(self.broker.cash / (price * 1.001) // 100 * 100)
                     if max_qty >= 100:
                         qty = max_qty
-                        fee = self._calc_fee(price * qty)
+                        fee = self._calc_fee(price * qty, symbol, side)
                     else:
                         self.broker.skipped_buys += 1
                         pending_fills.remove(fill)
@@ -309,7 +387,8 @@ class BacktestEngine:
             else:
                 # 卖出: 执行时再查一次可卖量(T+1), 防御昨日信号后持仓变化
                 from core.symbol_utils import is_t0_etf
-                sellable = self.broker.sellable_qty(symbol, t0=is_t0_etf(symbol))
+                sellable = self.broker.sellable_qty(
+                    symbol, t0=is_t0_etf(symbol, self.asset_type_for(symbol)))
                 qty = min(qty, sellable)
                 if qty <= 0 or self.broker.positions.get(symbol, {}).get("qty", 0) < qty:
                     pending_fills.remove(fill)
@@ -317,30 +396,6 @@ class BacktestEngine:
                 self.broker.sell(symbol, qty, price, fee, slip, d,
                                  fill["sig"].get("reason", ""), name=name)
             pending_fills.remove(fill)
-
-    # ------------------------------------------------------------------
-    def _fill_at_close(self, symbol: str, qty: int, side: str,
-                       prices: Dict[str, float], d: date, sig: Dict[str, Any]):
-        """
-        止损成交: 用 T 日收盘价立即成交(模拟盘中触发市价止损单)。
-        注意: 止损是紧急行动, 不等 T+1 开盘 —— 否则高波动标的一夜暴跌后
-        止损价远低于触发价(这就是之前 -35% 才成交的原因)。
-        约束: 止损卖出不能超过当日可卖数量(T+1)。
-        """
-        fill = prices.get(symbol, 0)
-        if fill <= 0:
-            return
-        from core.symbol_utils import is_t0_etf
-        sellable = self.broker.sellable_qty(symbol, t0=is_t0_etf(symbol))
-        qty = min(qty, sellable)
-        if qty <= 0:
-            return
-        price = fill - fill * self.slippage     # 卖出按市价+滑点
-        fee = self._calc_fee(price * qty)
-        name = self.name_map.get(symbol, "")
-        if self.broker.positions.get(symbol, {}).get("qty", 0) >= qty:
-            self.broker.sell(symbol, qty, price, fee, fill * self.slippage, d,
-                             sig.get("reason", ""), name=name)
 
     # ------------------------------------------------------------------
     def _agent_signals(self, asof, d: date) -> Dict[str, str]:
@@ -397,6 +452,8 @@ class BacktestEngine:
         撮合: 信号在第 i 根收盘后生成, 第 i+1 根开盘价成交(杜绝"用收盘价成交自己信号"的乐观执行)。
         修复: 原实现用当前K线收盘价撮合(轻度未来函数)且无 T+1 处理。
         """
+        if getattr(signal_fn, "strategy_timeframe", "") == "daily":
+            raise ValueError("分钟回测不能直接运行日线策略；请使用分钟策略或日线模式")
         repo.save_backtest_run({
             "run_id": self.run_id, "name": self.name,
             "start_date": self.start, "end_date": self.end,
@@ -408,7 +465,9 @@ class BacktestEngine:
             "trading_rules.slippage.minute_bar", 0.0005))
         window: Dict[str, List[dict]] = {}
         prices: Dict[str, float] = {}
+        last_day = None
         for d in data_loader.trade_dates(self.start, self.end):
+            last_day = d
             freq = f"{interval_minutes}m"
             bars_by_symbol = {s: data_loader.load_all_minute(s, d, freq)
                               for s in data_loader.universe()}
@@ -448,8 +507,12 @@ class BacktestEngine:
             self.equity_curve.append(self.broker.equity(prices))
             self.equity_dates.append(str(d))
             self.position_curve.append(self.broker.position_value(prices))
-        self.broker.close_positions(prices, d, fee_fn=self._calc_fee)
-        self.position_curve.append(0.0)
+        if last_day is not None and prices:
+            self.broker.close_positions(
+                prices, last_day,
+                fee_fn=lambda symbol, amount, side: self._calc_fee(amount, symbol, side))
+            self.equity_curve[-1] = self.broker.equity(prices)
+            self.position_curve[-1] = 0.0
         return self._finalize()
 
     @staticmethod
@@ -470,7 +533,7 @@ class BacktestEngine:
         fill = nxt["open"]
         slip = fill * minute_slippage
         price = fill + slip if side == "BUY" else fill - slip
-        fee = self._calc_fee(price * qty)
+        fee = self._calc_fee(price * qty, symbol, side)
         name = self.name_map.get(symbol, "")
         bar_time = nxt["bar_time"]
         if side == "BUY":
@@ -481,7 +544,7 @@ class BacktestEngine:
                     self.broker.skipped_buys += 1
                     return
                 qty = max_qty
-                fee = self._calc_fee(price * qty)
+                fee = self._calc_fee(price * qty, symbol, side)
             self.broker.buy(symbol, qty, price, fee, slip, bar_time.date(),
                             sig.get("reason", ""), name=name)
         elif self.broker.positions.get(symbol, {}).get("qty", 0) >= qty:
@@ -494,6 +557,9 @@ class BacktestEngine:
         metrics = compute_metrics(self.equity_curve, self.broker.trades,
                                   self.benchmark_curve or None,
                                   dates=self.equity_dates)
+        if "error" in metrics:
+            metrics.update({"equity_curve": self.equity_curve,
+                            "dates": self.equity_dates, "trade_details": []})
         # 附加: 持仓市值曲线/参数/名称映射/跳过统计
         metrics["position_curve"] = [round(v, 2) for v in self.position_curve]
         metrics["params"] = {
@@ -502,9 +568,41 @@ class BacktestEngine:
             "initial_cash": round(self.initial_cash, 2),
             "use_agents": self.use_agents,
             "slippage": self.slippage,
+            "asset_type": self.asset_type,
+            "asset_types": self.asset_types,
             **self.params,
         }
         metrics["skipped_buys"] = self.broker.skipped_buys
+        metrics["data_coverage"] = self.data_coverage
+        metrics["data_snapshot_hash"] = self.data_snapshot_hash
+        metrics["universe_snapshots"] = self.universe_snapshots
+        metrics["symbol_names"] = dict(self.name_map)
+        sells = [t for t in metrics.get("trade_details", []) if t.get("side") == "SELL"]
+        exit_counts = {"cost_stop": 0, "trailing_stop": 0, "rotation": 0,
+                       "market": 0, "final": 0, "other": 0}
+        for trade in sells:
+            reason = str(trade.get("reason") or "")
+            if "成本止损" in reason:
+                exit_counts["cost_stop"] += 1
+            elif "移动止损" in reason:
+                exit_counts["trailing_stop"] += 1
+            elif "排名" in reason or "轮动" in reason:
+                exit_counts["rotation"] += 1
+            elif "risk_off" in reason or "市场" in reason:
+                exit_counts["market"] += 1
+            elif "期末平仓" in reason:
+                exit_counts["final"] += 1
+            else:
+                exit_counts["other"] += 1
+        stop_count = exit_counts["cost_stop"] + exit_counts["trailing_stop"]
+        metrics["exit_reason_stats"] = {
+            **exit_counts, "total_sells": len(sells),
+            "stop_ratio": round(stop_count / len(sells), 4) if sells else 0.0,
+        }
+        metrics["market_snapshot"] = {
+            sym: [{**b, "trade_date": str(b.get("trade_date"))} for b in bars]
+            for sym, bars in self.market_snapshot.items()
+        }
         # 单标的收益统计(修复: 轮动换仓后看不出每只标的的贡献)
         from collections import defaultdict
         sym_stats = defaultdict(lambda: {"symbol": "", "name": "", "buy_count": 0,
@@ -544,6 +642,9 @@ class BacktestEngine:
             metrics["note"] = "回测仅涉及 1 个标的, 轮动策略需要至少 2-3 只标的才有换仓效果。"
         elif len(traded) == 0:
             metrics["note"] = "回测期内无任何成交(可能所有标的都被参数过滤, 请检查成交额/波动率参数)。"
+        # run_id 必须在持久化 metrics_json 前写入，否则服务重启后历史结果恢复时
+        # 前端无法请求 /backtest/{run_id}/kline，K线卡片会永久停在加载状态。
+        metrics["run_id"] = self.run_id
         repo.save_backtest_result({
             "run_id": self.run_id,
             "total_return": metrics.get("total_return", 0),
@@ -555,7 +656,6 @@ class BacktestEngine:
             "metrics_json": metrics,
         })
         repo.update_backtest_run(self.run_id, "DONE")
-        metrics["run_id"] = self.run_id
         logger.info("回测完成 %s: 总收益 %.2f%% 回撤 %.2f%% 夏普 %.2f 交易 %d 笔",
                     self.run_id, metrics.get("total_return", 0) * 100,
                     metrics.get("max_drawdown", 0) * 100, metrics.get("sharpe", 0),

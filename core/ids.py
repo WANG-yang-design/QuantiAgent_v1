@@ -7,17 +7,23 @@ ID 生成器: 全链路订单/决策/风控/回测的幂等 ID
 同一 order_intent_id 只能提交一次(幂等), 即使 API 超时也不能重复下单。
 """
 import uuid
-from datetime import datetime
+from core.timeutil import now
 
 
 def _prefix(kind: str) -> str:
-    return f"{kind}{datetime.now().strftime('%y%m%d%H%M%S')}"
+    return f"{kind}{now().strftime('%y%m%d%H%M%S')}"
 
 
 def gen_id(kind: str = "id") -> str:
-    """生成唯一 ID: 前缀 + 时间戳 + uuid 短尾。
-    修复: 尾部由 8 hex 位(32bit)提升到 12 hex 位(48bit), 降低高频并发下单的碰撞率。"""
-    return f"{_prefix(kind)}_{uuid.uuid4().hex[:12].upper()}"
+    """生成最长 32 字符的唯一 ID。
+
+    旧格式的 48-bit 短尾对高频全链路 ID 偏短；直接扩容又会超过
+    部分历史 VARCHAR(32) 列。改用带类型前缀的 UUID 截取，通常保留
+    100 bit 以上随机性，同时兼容旧表结构。
+    """
+    safe_kind = "".join(c for c in str(kind).upper() if c.isalnum())[:10] or "ID"
+    random_len = max(16, 31 - len(safe_kind))
+    return f"{safe_kind}_{uuid.uuid4().hex[:random_len].upper()}"
 
 
 def gen_trace_id() -> str:

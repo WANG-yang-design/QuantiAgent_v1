@@ -130,8 +130,10 @@ class LLMClient:
         - 返回 dict 已通过 schema 校验(字段合法)。
         """
         if self.mock:
-            return self._mock_complete(messages, schema)
-        client = self._client_for()
+            result = self._mock_complete(messages, schema)
+            if usage_cb is not None:
+                usage_cb(0, 0)
+            return result
 
         model = self.get_model(task)
         prompt_json = json.dumps(self._schema_hint(schema), ensure_ascii=False)
@@ -152,6 +154,9 @@ class LLMClient:
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
+                # 客户端初始化也纳入统一重试/审计路径，避免配置异常绕过
+                # llm_failure 记录。
+                client = self._client_for()
                 # 简单并发门控: 超过在途上限时等待(防止 7 分析师并行+池扫描 触发 ~35 路并发)
                 while self._in_flight >= self.max_concurrent:
                     await asyncio.sleep(0.2)
@@ -193,6 +198,8 @@ class LLMClient:
                 # 重试分类: 网络/超时/服务端错误才重试; 4xx 客户端错误不重试(白等)
                 retriable = self._is_retriable_error(e)
                 logger.warning("LLM 调用失败(第%d次): %s", attempt + 1, e)
+                if not retriable:
+                    break
                 if attempt < self.max_retries and retriable:
                     await asyncio.sleep(2 ** attempt + (time.time() % 0.5))   # 退避+jitter
 
@@ -333,7 +340,13 @@ class LLMClient:
         try:
             client = self._client_for()
             resp = await client.embeddings.create(model=self.embedding_model, input=texts)
-            return [d.embedding for d in resp.data]
+            vectors = [d.embedding for d in resp.data]
+            expected_dim = int(self.settings.get("rag.vector_dim", 1024) or 1024)
+            if len(vectors) != len(texts) or any(len(v) != expected_dim for v in vectors):
+                raise ValueError(
+                    f"embedding 返回数量/维度不匹配: {len(vectors)}/{len(texts)}, "
+                    f"expected_dim={expected_dim}")
+            return vectors
         except Exception as e:
             logger.warning("embedding 接口失败, 降级为哈希向量: %s", e)
             return [self._hash_embed(t) for t in texts]

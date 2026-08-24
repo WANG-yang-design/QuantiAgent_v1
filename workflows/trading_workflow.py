@@ -10,13 +10,14 @@ Agent 调用关系(关键):
 """
 import asyncio
 import logging
-import threading
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from agents.base_agent import AgentInput
 from agents.execution_agents import ComplianceAgent, ExecutionSupervisorAgent
 from agents.trader_agent import TraderAgent
 from core.config import get_settings
+from core.timeutil import today as business_today
 from core.ids import gen_plan_id
 from database import repository as repo
 from memory.audit_log import AuditLogger
@@ -44,6 +45,7 @@ async def node_trader(state: WorkflowState) -> Dict[str, Any]:
         "position": state.get("position"),
         "technical": state.get("technical") or {},
         "quote": state.get("quote") or {},
+        "data_snapshot": state.get("data_snapshot") or {},
         "summary": state.get("summary"),
         "broker": state.get("broker"),
     }
@@ -51,6 +53,7 @@ async def node_trader(state: WorkflowState) -> Dict[str, Any]:
     plan["plan_id"] = gen_plan_id()
     plan["decision_id"] = (state.get("chief") or {}).get("decision_id", "")
     plan["name"] = state.get("name", "")
+    plan["trace_id"] = state.trace_id
     state.record("trader", f"交易计划: {plan.get('action')} {plan.get('estimated_quantity')}股", plan)
     repo.save_trade_plan(plan)
     return {"plan": plan}
@@ -75,9 +78,15 @@ async def node_risk_manager(state: WorkflowState) -> Dict[str, Any]:
 
 async def node_compliance(state: WorkflowState) -> Dict[str, Any]:
     """合规审计。"""
+    account = state.get("account_snapshot") or {}
+    positions = account.get("positions") or []
+    holding = next((int(p.get("total_qty", 0) or 0) for p in positions
+                    if p.get("symbol") == state.symbol), 0)
     result = await _COMPLIANCE.run(AgentInput(symbol=state.symbol, context={
         "plan": state.get("plan") or {},
         "enforce_trading_hours": state.get("enforce_trading_hours", True),
+        "holding_qty": holding,
+        "account_id": account.get("account_id", "PA-001"),
     }))
     state.record("compliance", f"合规: {result.get('compliance_status')}", result)
     return {"compliance": result}
@@ -105,20 +114,6 @@ async def node_execute(state: WorkflowState) -> Dict[str, Any]:
         return {"execution": {"status": "REJECTED",
                               "reason": risk.get("blocked_reason")}}
 
-    # 修复: 策略与Agent买入分歧 → 强制人工确认(并邮件通知, 2分钟超时按策略执行)。
-    # 轮动策略未给出买入信号的 BUY 计划, 一律进人工确认队列:
-    #   人工批准 → 按Agent计划执行; 2分钟无人处理 → 自动拒绝(跟随策略)。
-    if plan.get("action") == "BUY" and risk_decision not in ("CONFIRM_REQUIRED",):
-        strategy_signal = state.get("strategy_signal") or {}
-        if strategy_signal.get("signal") != "BUY":
-            risk = {**risk, "risk_decision": "CONFIRM_REQUIRED",
-                    "blocked_reason": risk.get("blocked_reason")
-                    or "策略与Agent买入分歧(策略未给出买入信号), 需人工确认"}
-            risk_decision = "CONFIRM_REQUIRED"
-            state.record("execute",
-                         f"策略与Agent买入分歧(策略信号={strategy_signal.get('signal', '无')}), 需人工确认",
-                         {"plan_id": plan.get("plan_id"), "strategy_signal": strategy_signal})
-
     if risk_decision in ("CONFIRM_REQUIRED", "REDUCE"):
         return await _handle_confirm(state, plan, risk, broker)
 
@@ -130,8 +125,7 @@ async def _handle_confirm(state: WorkflowState, plan, risk, broker) -> Dict[str,
     """人工确认分级: 创建确认记录 + 发送确认邮件/通知。
     修复: 确认单 reason 只存"中风险交易, 需要人工确认"一句, 人工在界面上
     看不到任何分析依据。现在把首席结论/交易理由/风控提示拼进 reason。
-    修复: 创建确认单后自动安排"超时按策略执行"(默认120秒) ——
-    人工未在时限内处理时, 按轮动策略方向自动批准/拒绝。"""
+    超时动作和到期时间固化到数据库，进程重启后仍可恢复处理。"""
     plan_id = plan.get("plan_id", "")
     repo.update_plan_status(plan_id, "PENDING_CONFIRM")
 
@@ -154,22 +148,39 @@ async def _handle_confirm(state: WorkflowState, plan, risk, broker) -> Dict[str,
     if risk_warnings:
         parts.append("风控提示: " + "；".join(str(x) for x in risk_warnings[:5]))
     plan_info = "\n".join(parts) if parts else ""
+    data_snapshot = state.get("data_snapshot") or {}
+    timeout_cfg = confirmation_policy()
+    expires_at = datetime.now() + timedelta(seconds=timeout_cfg["timeout_seconds"])
 
     confirm_id = repo.save_human_confirmation({
         "plan_id": plan_id,
+        "trace_id": state.trace_id,
         "symbol": plan.get("symbol", ""),
         "action": plan.get("action", ""),
         "amount": float(plan.get("order_amount", 0) or 0),
         "risk_level": risk.get("risk_level", "MEDIUM"),
         "reason": (risk.get("blocked_reason") or "中风险交易, 需要人工确认")
                   + ("\n" + plan_info if plan_info else ""),
+        "timeout_action": timeout_cfg["timeout_action"],
+        "expires_at": expires_at,
+        "context_json": {
+            "data_snapshot": data_snapshot,
+            "chief_decision": chief.get("research_decision", ""),
+            "chief_confidence": chief.get("confidence"),
+            "strategy_signal": strategy_signal,
+            "plan_price": plan.get("limit_price"),
+            "plan_quantity": plan.get("estimated_quantity"),
+            "timeout_seconds": timeout_cfg["timeout_seconds"],
+        },
         "status": "PENDING",
     })
     audit = AuditLogger.instance()
     audit.log("human_confirm_required", "workflow",
               {"confirm_id": confirm_id, "plan_id": plan_id,
                "reason": risk.get("blocked_reason"),
-               "analysis": plan_info})
+               "analysis": plan_info, "data_snapshot": data_snapshot,
+               "expires_at": expires_at, "timeout_action": timeout_cfg["timeout_action"]},
+              trace_id=state.trace_id)
     # 邮件通知(交易计划邮件: 文档15.2 全字段)
     # 修复: 附带 confirm_id 与完整确认原因 —— 邮件里能直接看到"为什么需要确认",
     # 并带"批准/拒绝"签名链接, 点开即可处理, 无需登录网页。
@@ -177,49 +188,47 @@ async def _handle_confirm(state: WorkflowState, plan, risk, broker) -> Dict[str,
         get_notification_service().send_trade_plan_email(
             plan, risk, confirm_id=confirm_id,
             reason=(risk.get("blocked_reason") or "中风险交易, 需要人工确认")
-                   + ("\n" + plan_info if plan_info else ""))
+                   + ("\n" + plan_info if plan_info else ""),
+            data_snapshot=data_snapshot, chief=chief,
+            timeout_policy=timeout_cfg)
     except Exception as exc:
         logger.warning("确认邮件发送失败: %s", exc)
     # 超时自动决定(按策略方向, 修复: 无人处理不再无限挂起)
-    _schedule_auto_decide(confirm_id, plan, strategy_signal, broker)
     return {"execution": {"status": "PENDING_CONFIRM", "confirm_id": confirm_id,
                           "reason": "等待人工确认"}}
 
 
-def _schedule_auto_decide(confirm_id: str, plan: Dict[str, Any],
-                          strategy_signal: Dict[str, Any], broker: PaperBroker):
-    """人工确认超时自动决定(默认120秒, 修复: 需确认单无人处理时无限挂起)。
-    按策略方向执行: BUY 需策略给出买入信号才批准, 否则拒绝(跟随策略);
-    SELL 默认批准(持仓保护优先), 策略明确看多时拒绝。"""
-    try:
-        timeout = float(get_settings().get(
-            "risk.confirmation_policy.auto_decide_timeout_seconds", 120))
-    except Exception:
-        timeout = 120.0
-    action = str(plan.get("action", "")).upper()
-    if action == "BUY":
-        approved = (strategy_signal or {}).get("signal") == "BUY"
-    else:
-        approved = (strategy_signal or {}).get("signal") != "BUY"
+def confirmation_policy() -> Dict[str, Any]:
+    """当前确认策略。新建确认单会固化一份，后续改设置不追溯修改旧单。"""
+    cfg = get_settings().get("risk.confirmation_policy", {}) or {}
+    # 设置页写入数据库共享状态，避免运行时修改 YAML 导致注释丢失；
+    # 数据库无覆盖值时才使用版本化配置文件默认值。
+    override = repo.get_system_state("confirmation_policy")
+    if override:
+        cfg = {**cfg, **override}
+    action = str(cfg.get("timeout_action", "cancel") or "cancel").lower()
+    if action not in ("execute", "cancel"):
+        action = "cancel"
+    seconds = max(60, min(int(cfg.get("timeout_seconds", 600) or 600), 86400))
+    return {"timeout_action": action, "timeout_seconds": seconds}
 
-    def _run():
-        import asyncio
-        import time as _t
-        _t.sleep(max(timeout, 10))
+
+def process_expired_confirmations(broker: PaperBroker) -> List[Dict[str, Any]]:
+    """持久化超时扫描；调度器重启后仍能处理数据库中的待确认单。"""
+    now = datetime.now()
+    results = []
+    for c in repo.list_pending_confirmations():
+        if not c.expires_at or c.expires_at > now:
+            continue
+        approved = str(c.timeout_action or "cancel").lower() == "execute"
         try:
-            c = repo.get_confirmation(confirm_id)
-            if c is None or c.status != "PENDING":
-                return
             result = asyncio.run(resume_confirmed_plan(
-                confirm_id, approved, broker, by="auto-timeout"))
-            logger.info("确认单 %s 超时自动%s(按策略): %s",
-                        confirm_id, "批准" if approved else "拒绝",
-                        result.get("status"))
+                c.confirm_id, approved, broker, by="timeout-policy",
+                note=f"确认超时，按预设{'自动执行' if approved else '自动撤销'}"))
+            results.append({"confirm_id": c.confirm_id, **result})
         except Exception as exc:
-            logger.error("确认单自动决定失败 %s: %s", confirm_id, exc)
-
-    threading.Thread(target=_run, daemon=True,
-                     name=f"confirm-auto-{confirm_id[:8]}").start()
+            logger.error("确认单超时处理失败 %s: %s", c.confirm_id, exc)
+    return results
 
 
 async def _submit_order(state: WorkflowState, plan, risk, broker) -> Dict[str, Any]:
@@ -262,7 +271,8 @@ async def _submit_order(state: WorkflowState, plan, risk, broker) -> Dict[str, A
         audit.log("order_placed", "workflow",
                   {"plan_id": plan_id, "order_id": order.get("order_id"),
                    "symbol": order.get("symbol"), "side": action,
-                   "qty": qty, "price": price, "risk_decision": risk.get("risk_decision")})
+                   "qty": qty, "price": price, "risk_decision": risk.get("risk_decision")},
+                  trace_id=plan.get("trace_id", ""))
         return {"execution": {"status": "ORDERED", "order_id": order.get("order_id"),
                               "order": order}}
     except ValueError as exc:
@@ -340,7 +350,8 @@ def _plan_to_dict(plan) -> Dict[str, Any]:
 
 
 async def resume_confirmed_plan(confirm_id: str, approved: bool,
-                                broker: PaperBroker, by: str = "web") -> Dict[str, Any]:
+                                broker: PaperBroker, by: str = "web",
+                                note: str = "") -> Dict[str, Any]:
     """
     人工确认闭环: 批准 → 重新过风控(批准到成交有时间差, 行情已变化) → 幂等下单。
     拒绝 → 计划标记 REJECTED。
@@ -352,17 +363,30 @@ async def resume_confirmed_plan(confirm_id: str, approved: bool,
         return {"status": "NOT_FOUND", "reason": "确认单不存在"}
     if c.status != "PENDING":
         return {"status": "SKIPPED", "reason": f"确认单已处理({c.status})"}
-    repo.decide_confirmation(confirm_id, approved, by=by)
+    if not repo.decide_confirmation(confirm_id, approved, by=by, note=note):
+        return {"status": "SKIPPED", "reason": "确认单已被其他请求处理"}
 
     if not approved:
         repo.update_plan_status(c.plan_id, "REJECTED")
-        audit.log("human_confirm_rejected", "workflow",
-                  {"confirm_id": confirm_id, "plan_id": c.plan_id, "by": by})
-        return {"status": "REJECTED", "reason": "人工拒绝"}
+        final_status = "AUTO_CANCELLED" if by == "timeout-policy" else "REJECTED"
+        repo.set_confirmation_status(confirm_id, final_status, by=by,
+                                     expected="REJECTED", note=note)
+        audit.log("human_confirm_auto_cancelled" if by == "timeout-policy" else "human_confirm_rejected",
+                  by, {"confirm_id": confirm_id, "plan_id": c.plan_id,
+                       "by": by, "note": note}, trace_id=c.trace_id)
+        if by == "timeout-policy":
+            try:
+                c.decided_by = by
+                get_notification_service().send_confirmation_result_email(
+                    c, final_status, note or "确认超时，交易计划已撤销")
+            except Exception as exc:
+                logger.warning("确认结果邮件入队失败 %s: %s", confirm_id, exc)
+        return {"status": final_status, "reason": note or "人工拒绝"}
 
     plan_row = repo.get_trade_plan(c.plan_id)
     if plan_row is None:
         repo.update_plan_status(c.plan_id, "FAILED")
+        repo.set_confirmation_status(confirm_id, "PENDING", by=by, expected="PROCESSING")
         return {"status": "FAILED", "reason": "交易计划不存在"}
     plan = _plan_to_dict(plan_row)
 
@@ -370,15 +394,32 @@ async def resume_confirmed_plan(confirm_id: str, approved: bool,
     # 修复: 去掉 human_confirm_required 标记 —— 人工已批准, 复检不应再次
     # 因该标记(或高风险卖出)落入 CONFIRM_REQUIRED, 造成批准后永远无法下单。
     recheck_plan = {k: v for k, v in plan.items() if k != "human_confirm_required"}
+    technical: Dict[str, Any] = {}
+    etf_context: Dict[str, Any] = {}
+    try:
+        from data_service.market_data_service import get_market_service
+        from features.technical_indicators import compute_etf_features, compute_technical_features
+        svc = get_market_service()
+        bars, _ = svc.get_daily_bars(
+            plan.get("symbol", ""), business_today() - timedelta(days=150),
+            business_today(), "etf")
+        quote, _ = svc.get_realtime_quote(plan.get("symbol", ""), "etf")
+        technical = compute_technical_features(bars)
+        etf_context = compute_etf_features(bars, quote)
+    except Exception as exc:
+        logger.warning("确认复检上下文刷新失败 %s: %s", plan.get("symbol"), exc)
     from agents.execution_agents import RiskManagerAgent
     risk = await RiskManagerAgent().run(AgentInput(symbol=plan.get("symbol", ""), context={
         "plan": recheck_plan,
         "account": broker.get_account(),
+        "technical": technical,
+        "etf": etf_context,
         "broker": broker,
     }))
     rd = risk.get("risk_decision")
     if rd == "REJECT":
         repo.update_plan_status(c.plan_id, "REJECTED")
+        repo.set_confirmation_status(confirm_id, "REJECTED", by=by, expected="PROCESSING")
         audit.log("plan_rejected", "risk_manager",
                   {"plan_id": c.plan_id, "reason": risk.get("blocked_reason")})
         return {"status": "REJECTED", "reason": risk.get("blocked_reason")}
@@ -399,10 +440,30 @@ async def resume_confirmed_plan(confirm_id: str, approved: bool,
     except Exception as exc:
         logger.warning("确认恢复执行取行情失败 %s: %s", plan.get("symbol"), exc)
         state.set("quote", {})
-    exec_ = await _submit_order(state, plan, risk, broker)
+    try:
+        exec_ = await _submit_order(state, plan, risk, broker)
+    except Exception:
+        repo.set_confirmation_status(confirm_id, "PENDING", by=by, expected="PROCESSING")
+        raise
     execution = exec_.get("execution") or {}
-    audit.log("human_confirm_approved", "workflow",
+    status = execution.get("status", "ORDERED")
+    if status in ("ORDERED", "SUBMITTED", "APPROVED"):
+        final_status = "AUTO_EXECUTED" if by == "timeout-policy" else "APPROVED"
+        repo.set_confirmation_status(confirm_id, final_status, by=by,
+                                     expected="PROCESSING", note=note)
+    else:
+        repo.set_confirmation_status(confirm_id, "PENDING", by=by, expected="PROCESSING")
+    audit.log("human_confirm_auto_executed" if by == "timeout-policy" else "human_confirm_approved", by,
               {"confirm_id": confirm_id, "plan_id": c.plan_id,
-               "execution": execution.get("status"), "by": by})
-    return {"status": execution.get("status", "ORDERED"),
+               "execution": execution.get("status"), "by": by,
+               "note": note}, trace_id=c.trace_id)
+    if by == "timeout-policy":
+        try:
+            c.decided_by = by
+            final = "AUTO_EXECUTED" if status in ("ORDERED", "SUBMITTED", "APPROVED") else "FAILED"
+            get_notification_service().send_confirmation_result_email(
+                c, final, execution.get("reason", ""))
+        except Exception as exc:
+            logger.warning("确认结果邮件入队失败 %s: %s", confirm_id, exc)
+    return {"status": status,
             "reason": execution.get("reason", ""), "execution": execution}

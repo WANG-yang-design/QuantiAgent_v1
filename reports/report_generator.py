@@ -27,6 +27,12 @@ from database import repository as repo
 logger = logging.getLogger("reports")
 
 
+def _md(value: Any) -> str:
+    """把外部文本放入 Markdown 表格/单行时进行最小必要转义。"""
+    return str(value if value is not None else "").replace("\\", "\\\\").replace(
+        "|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 class ChartGenerator:
     """图表生成: 保存 PNG 到 data/charts/。"""
 
@@ -264,7 +270,7 @@ class ReportGenerator:
                 pos_txt = (f"{pos['total_qty']}份 盈亏{pos['pnl']:+.2f}"
                            if pos else "已清仓")
                 ret = f"{st['price_return']:+.2%}" if st.get("price_return") is not None else "-"
-                md.append(f"| {st['symbol']} | {st['name']} | "
+                md.append(f"| {_md(st['symbol'])} | {_md(st['name'])} | "
                           f"{st['buy_count']}/{st['sell_count']} | "
                           f"{st['realized_pnl']:+.2f} | {st['fee']:.2f} | "
                           f"{pos_txt} | {ret} |")
@@ -273,8 +279,8 @@ class ReportGenerator:
         md += ["", "## 交易明细", ""]
         for t in trades[-100:]:
             pnl_txt = f"盈亏{t.pnl:+.2f}" if t.pnl is not None else ""
-            md.append(f"- [{t.trade_time:%m-%d %H:%M}] {t.side} {t.symbol} "
-                      f"{t.name or ''} {t.qty}份 @ {t.price:.3f} {pnl_txt}")
+            md.append(f"- [{t.trade_time:%m-%d %H:%M}] {_md(t.side)} {_md(t.symbol)} "
+                      f"{_md(t.name or '')} {t.qty}份 @ {t.price:.3f} {pnl_txt}")
         # 图表
         chart_lines = []
         try:
@@ -289,11 +295,11 @@ class ReportGenerator:
                     eq, [str(s.snapshot_time.date()) for s in in_snap],
                     benchmark=bench_curve if bench_curve and len(bench_curve) == len(eq) else None,
                     title=f"{title} 净值")
-                chart_lines.append(f"![净值曲线]({p})")
+                chart_lines.append(f"![净值曲线](../data/charts/{Path(p).name})")
                 if any(d > 0.001 for d in dd):
                     p2 = self.charts.drawdown_curve(
                         dd, [str(s.snapshot_time.date()) for s in in_snap])
-                    chart_lines.append(f"![回撤曲线]({p2})")
+                    chart_lines.append(f"![回撤曲线](../data/charts/{Path(p2).name})")
         except Exception as exc:
             logger.warning("报告图表生成失败: %s", exc)
         md += ["", "## 图表", ""] + chart_lines
@@ -340,9 +346,9 @@ class ReportGenerator:
         ]
         if bench_ret is not None:
             md.append(f"- 沪深300当日: {bench_ret:+.2%}")
-        md += ["", "## 复盘总结", f"{review.get('review_summary', '')}", "", "## 改进建议"]
+        md += ["", "## 复盘总结", _md(review.get('review_summary', '')), "", "## 改进建议"]
         for i in review.get("improvement", []) or []:
-            md.append(f"- {i}")
+            md.append(f"- {_md(i)}")
         md += ["", "## 单标的统计", ""]
         if sym_stats:
             md.append("| 标的 | 名称 | 买卖(次) | 已实现盈亏 | 当前持仓 |")
@@ -350,17 +356,17 @@ class ReportGenerator:
             for st in sym_stats:
                 pos = st.get("position")
                 pos_txt = (f"{pos['total_qty']}份" if pos else "已清仓")
-                md.append(f"| {st['symbol']} | {st['name']} | "
+                md.append(f"| {_md(st['symbol'])} | {_md(st['name'])} | "
                           f"{st['buy_count']}/{st['sell_count']} | "
                           f"{st['realized_pnl']:+.2f} | {pos_txt} |")
         md += ["", "## 成交明细", ""]
         for t in trades[-100:]:
             pnl_txt = f"盈亏{t.pnl:+.2f}" if t.pnl is not None else ""
-            md.append(f"- [{t.trade_time:%H:%M}] {t.side} {t.symbol} "
-                      f"{t.name or ''} {t.qty}份 @ {t.price:.3f} {pnl_txt}")
+            md.append(f"- [{t.trade_time:%H:%M}] {_md(t.side)} {_md(t.symbol)} "
+                      f"{_md(t.name or '')} {t.qty}份 @ {t.price:.3f} {pnl_txt}")
         md += ["", "## 持仓", ""]
         for p in stats.get("positions", []) or []:
-            md.append(f"- {p.get('symbol')} {p.get('name', '')}: "
+            md.append(f"- {_md(p.get('symbol'))} {_md(p.get('name', ''))}: "
                       f"{p.get('total_qty', 0)}份 成本{p.get('cost_price', 0):.3f} "
                       f"浮盈{p.get('pnl_pct', 0):+.2%}")
 
@@ -376,7 +382,9 @@ class ReportGenerator:
     def generate_backtest_report(self, metrics: Dict[str, Any],
                                  charts: bool = True) -> str:
         """回测报告 → reports/backtest_<run_id>.md (+图表)。"""
-        run_id = metrics.get("run_id", datetime.now().strftime("%H%M%S"))
+        import re
+        run_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(
+            metrics.get("run_id", datetime.now().strftime("%H%M%S"))))[:64]
         eq = metrics.get("equity_curve", [])
         dd = metrics.get("drawdown_curve", [])
         dates = metrics.get("dates") or [str(i) for i in range(len(eq))]
@@ -385,14 +393,14 @@ class ReportGenerator:
             # 修复: 原实现 benchmark 参数恒为 None(`x and None` 表达式),
             # 基准曲线分支永不生效, 回测报告图表缺失基准线。
             bench_curve = metrics.get("benchmark_curve") or None
-            path = self.charts.equity_curve(
+            path = Path(self.charts.equity_curve(
                 eq, dates,
                 benchmark=bench_curve if bench_curve and len(bench_curve) == len(eq) else None,
-                title=f"回测净值 {run_id}")
-            chart_lines.append(f"![净值曲线]({path})")
+                title=f"回测净值 {run_id}"))
+            chart_lines.append(f"![净值曲线](../data/charts/{path.name})")
             if dd:
-                path2 = self.charts.drawdown_curve(dd, dates)
-                chart_lines.append(f"![回撤曲线]({path2})")
+                path2 = Path(self.charts.drawdown_curve(dd, dates))
+                chart_lines.append(f"![回撤曲线](../data/charts/{path2.name})")
 
         b = metrics.get("benchmark", {}) or {}
         md = [
@@ -421,7 +429,7 @@ class ReportGenerator:
             "## 交易明细",
         ]
         for t in metrics.get("trade_details", [])[:100]:
-            md.append(f"- [{t.get('date')}] {t.get('side')} {t.get('symbol')} "
+            md.append(f"- [{_md(t.get('date'))}] {_md(t.get('side'))} {_md(t.get('symbol'))} "
                       f"{t.get('qty')}份 @ {t.get('price', 0):.3f} "
                       f"盈亏{t.get('pnl', 0):+.2f}")
         md += ["", "## 图表", ""] + chart_lines

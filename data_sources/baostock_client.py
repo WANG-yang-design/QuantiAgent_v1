@@ -147,9 +147,13 @@ class BaostockClient(BaseDataSource):
     def get_minute_bars(self, symbol: str, start: datetime, end: datetime,
                         freq: str = "5m", asset_type: str = "etf",
                         bs_code: Optional[str] = None) -> List[Dict[str, Any]]:
+        if freq == "1m":
+            raise NotImplementedError("baostock 不支持 1 分钟K线")
         _ensure_login()
         import baostock as bs
-        bs_freq = {"1m": "5", "5m": "5", "15m": "15", "30m": "30", "60m": "60"}.get(freq, "5")
+        bs_freq = {"5m": "5", "15m": "15", "30m": "30", "60m": "60"}.get(freq)
+        if bs_freq is None:
+            raise NotImplementedError(f"baostock 不支持频率 {freq}")
         code = bs_code or _symbol_to_bs(symbol)
 
         def _q():

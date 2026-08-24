@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from core.ids import gen_order_id
 from core.config import get_settings
+from core.timeutil import now as business_now
 from database import repository as repo
 from paper_trading.paper_account import PaperAccount
 
@@ -78,12 +79,6 @@ class OrderManager:
             view = self._to_view(o)
             # 修复: 重启后按剩余数量×限价重建冻结金额。
             # 原实现硬置 0, 导致成交/撤单时冻结资金永远无法释放, 资金滞留 frozen_cash。
-            if o.side == "BUY" and o.remaining_qty > 0:
-                fee_est = self._calc_fee("BUY", float(o.price or 0),
-                                         o.remaining_qty, self._asset_type(o.symbol))
-                view["frozen_amount"] = round(float(o.price or 0) * o.remaining_qty + fee_est, 2)
-            else:
-                view["frozen_amount"] = 0.0
             self._orders[o.order_id] = view
 
     # ------------------------------------------------------------------
@@ -105,11 +100,21 @@ class OrderManager:
                                        order_intent_id, exist.order_id)
                         return self._to_view(exist)
                     # 终态: 允许重报, 但唯一约束要求新 intent
-                    order_intent_id = f"{order_intent_id}#{datetime.now():%H%M%S%f}"
+                    suffix = f"#{business_now():%H%M%S%f}"
+                    order_intent_id = f"{order_intent_id[:64-len(suffix)]}{suffix}"
                     logger.warning("意图 %s 的旧订单为终态(%s), 以新意图重报",
                                    exist.order_intent_id, exist.status)
             if qty <= 0:
                 raise ValueError("下单数量必须 > 0")
+
+            side = side.upper()
+            order_type = order_type.upper()
+            if side not in {"BUY", "SELL"}:
+                raise ValueError("订单方向必须为 BUY 或 SELL")
+            if order_type not in {"LIMIT", "MARKET"}:
+                raise ValueError("订单类型必须为 LIMIT 或 MARKET")
+            if price <= 0:
+                raise ValueError("订单价格必须大于 0")
 
             # 资金/持仓冻结
             frozen_amount = 0.0
@@ -117,13 +122,7 @@ class OrderManager:
                 # 冻结含手续费估算, 防止成交时 fee 部分透支现金(修复)
                 fee_est = self._calc_fee(side, price, qty, self._asset_type(symbol))
                 need = price * qty + fee_est
-                self.account.freeze_cash(need)
                 frozen_amount = need
-            else:
-                avail = self.account.get_available_qty(symbol)
-                if avail < qty:
-                    raise ValueError(f"可用持仓不足: {symbol} 可用{avail}, 需{qty}")
-                self.account.freeze_qty(symbol, qty)
 
             order = {
                 "order_id": gen_order_id(),
@@ -139,32 +138,26 @@ class OrderManager:
                 "remaining_qty": qty,
                 "avg_fill_price": 0.0,
                 "status": ST_SUBMITTED,
-                "submit_time": datetime.now(),
+                "submit_time": business_now(),
                 "name": name,
                 "source": source,
                 "frozen_amount": frozen_amount,   # 下单时冻结的金额(成交时精确释放)
             }
             try:
-                saved = repo.save_order({k: v for k, v in order.items()
-                                         if k != "frozen_amount"})
+                saved = repo.reserve_order(order)
             except Exception:
                 # 修复: 落库失败(如幂等键超长/DB异常)必须回滚冻结 ——
                 # 原实现冻结后保存失败, 资金/股数被永久冻结, 反复重试把
                 # 可用持仓扣成负数(曾出现"总数量300 可用600"的脏数据)。
-                if side == "BUY":
-                    self.account.unfreeze_cash(frozen_amount)
-                else:
-                    self.account.unfreeze_qty(symbol, qty)
                 raise
+            self.account._sync_from_db(force=True)
             self._orders[saved.order_id] = self._to_view(saved)
             from memory.audit_log import AuditLogger
             AuditLogger.instance().log("order_submitted", "order_manager", {
                 "order_id": saved.order_id, "symbol": symbol, "side": side,
                 "qty": qty, "price": price, "intent": order["order_intent_id"],
             })
-            # 内存订单保留 frozen_amount(不落库)
             view = self._to_view(saved)
-            view["frozen_amount"] = frozen_amount
             self._orders[saved.order_id] = view
             return view
 
@@ -220,41 +213,28 @@ class OrderManager:
     def _do_fill(self, order: dict, price: float, qty: int, fee: float,
                  bar: Dict[str, Any]) -> Optional[dict]:
         """执行一笔成交并更新订单/账户。"""
-        now = datetime.now()
-        order["filled_qty"] += qty
-        order["remaining_qty"] -= qty
-        order["avg_fill_price"] = ((order["avg_fill_price"] *
-                                    (order["filled_qty"] - qty)) + price * qty) / order["filled_qty"]
-        # 释放冻结(只释放实际冻结部分, 避免资金凭空多出)
-        if order["side"] == "BUY":
-            frozen = float(order.get("frozen_amount", 0) or 0)
-            # 按成交比例释放(部分成交时释放对应比例)
-            release = frozen * qty / max(order["qty"], 1)
-            self.account.unfreeze_cash(release)
-        else:
-            self.account.consume_frozen_on_fill(order["symbol"], qty, "SELL")
-        # 已实现盈亏(卖出): 用成交前持仓成本价计算(修复: 界面看不到每笔盈亏)
-        pnl = None
-        if order["side"] == "SELL":
-            cost = self.account.get_position_cost(order["symbol"])
-            if cost and cost > 0:
-                pnl = round((price - cost) * qty - fee, 2)
-        # 更新持仓/资金
-        self.account.apply_trade(order["symbol"], order.get("name", ""), order["side"],
-                                 price, qty, fee, now)
-        order["status"] = ST_FILLED if order["remaining_qty"] == 0 else ST_PARTIAL
+        now = business_now()
+        from core.symbol_utils import is_t0_etf
+        result = repo.fill_order(order["order_id"], price, qty, fee, now,
+                                 is_t0=is_t0_etf(order["symbol"]))
+        if result is None:
+            return None
+        for key in ("status", "filled_qty", "remaining_qty", "avg_fill_price",
+                    "frozen_amount"):
+            order[key] = result[key]
         order["filled_time"] = now
-        self._persist_order(order)
+        self._orders[order["order_id"]] = order
+        self.account._sync_from_db(force=True)
         # 成交成功: 重置连续失败订单计数(熔断自动复位, 修复永久熔断问题)
         from risk.circuit_breaker import CircuitBreaker
         CircuitBreaker.instance().on_order_success()
         trade = {
+            "trade_id": result.get("trade_id"),
             "order_id": order["order_id"], "symbol": order["symbol"],
             "name": order.get("name", ""),
             "side": order["side"], "price": price, "qty": qty,
-            "fee": fee, "pnl": pnl, "trade_time": now,
+            "fee": fee, "pnl": result.get("pnl"), "trade_time": now,
         }
-        repo.save_trade(trade)
         from memory.audit_log import AuditLogger
         AuditLogger.instance().log("trade_filled", "order_manager",
                                    {**trade, "plan_id": order.get("plan_id", "")})
@@ -292,25 +272,10 @@ class OrderManager:
     # ------------------------------------------------------------------
     def cancel_order(self, order_id: str, reason: str = "manual") -> dict:
         with self._lock:
-            order = self._orders.get(order_id)
-            if order is None:
-                row = repo.get_order(order_id)
-                if row is None:
-                    raise ValueError(f"订单不存在: {order_id}")
-                order = self._to_view(row)
-            if order["status"] not in _ACTIVE_STATES and order["status"] != ST_CREATED:
-                raise ValueError(f"订单状态 {order['status']} 不可撤单")
-            remaining = order["remaining_qty"]
-            # 释放冻结(只释放未成交部分的冻结)
-            if order["side"] == "BUY" and remaining > 0:
-                frozen = float(order.get("frozen_amount", 0) or 0)
-                release = frozen * remaining / max(order["qty"], 1)
-                self.account.unfreeze_cash(release)
-            elif order["side"] == "SELL" and remaining > 0:
-                self.account.unfreeze_qty(order["symbol"], remaining)
-            order["status"] = ST_CANCELLED
-            order["cancel_time"] = datetime.now()
-            self._persist_order(order)
+            row = repo.cancel_order_atomic(order_id, reason)
+            order = self._to_view(row)
+            self._orders[order_id] = order
+            self.account._sync_from_db(force=True)
             from memory.audit_log import AuditLogger
             AuditLogger.instance().log("order_cancelled", "order_manager",
                                        {"order_id": order_id, "reason": reason})
@@ -330,13 +295,11 @@ class OrderManager:
             rows = repo2.get_orders_recent(limit=100,
                                            account_id=self.account.account_id)
             db_map = {r.order_id: r for r in rows}
-            # 用 DB 最新状态刷新内存订单(只更新状态字段, 保留 frozen_amount)
+            # 用 DB 最新状态刷新内存订单。
             for oid, order in list(self._orders.items()):
                 row = db_map.get(oid)
                 if row is not None and row.status != order.get("status"):
-                    fresh = self._to_view(row)
-                    fresh["frozen_amount"] = order.get("frozen_amount", 0)
-                    self._orders[oid] = fresh
+                    self._orders[oid] = self._to_view(row)
             out = []
             for oid, order in self._orders.items():
                 if status and order.get("status") != status:
@@ -360,7 +323,7 @@ class OrderManager:
         cancelled = []
         for oid, order in list(self._orders.items()):
             if order["status"] in _ACTIVE_STATES and order.get("submit_time"):
-                elapsed = (datetime.now() - order["submit_time"]).total_seconds()
+                elapsed = (business_now() - order["submit_time"]).total_seconds()
                 if elapsed > timeout_seconds:
                     try:
                         cancelled.append(self.cancel_order(oid, reason="timeout"))
@@ -394,6 +357,7 @@ class OrderManager:
             "cancel_time": o.cancel_time, "reject_reason": o.reject_reason,
             "fee": o.fee, "source": getattr(o, "source", "") or "agent",
             "name": getattr(o, "name", "") or "",
+            "frozen_amount": float(getattr(o, "frozen_amount", 0) or 0),
         }
 
     # ------------------------------------------------------------------

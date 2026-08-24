@@ -79,7 +79,7 @@ class DataQualityChecker:
         try:
             from core.symbol_utils import price_limit_pct
             # 修复: 原实现硬编码 "etf", 创业板/科创板股票(±20%)被误判
-            asset = "stock" if symbol[:1] in ("0", "3", "6") else "etf"
+            asset = "stock" if symbol[:1] in ("0", "3", "4", "6", "8", "9") else "etf"
             limit = price_limit_pct(symbol, asset)
         except Exception:
             pass
@@ -92,6 +92,10 @@ class DataQualityChecker:
                 break
             if b["high"] < b["low"] or b["high"] < b["close"] or b["low"] > b["close"]:
                 rep.add_warning("SUSPICIOUS", f"日期{b['trade_date']} OHLC 矛盾")
+                rep.status = QUALITY_SUSPICIOUS
+                break
+            if b["low"] <= 0:
+                rep.add_warning("SUSPICIOUS", f"日期{b['trade_date']} 最低价异常(<=0)")
                 rep.status = QUALITY_SUSPICIOUS
                 break
             if b["high"] > b["low"] * (1 + amp_threshold):
@@ -114,7 +118,7 @@ class DataQualityChecker:
         # 时间连续性: 检查相邻K线间隔
         # 修复: 排除午休(11:30-13:00)与跨日(隔夜)的正常间隙 —— 原实现把正常
         # 行情误判为 DELAYED, 导致分钟K永不落库、盘中数据持续被阻断
-        expect = {"1m": 1, "5m": 5, "15m": 15}.get(freq, 5)
+        expect = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(freq, 5)
         prev = None
         gaps = 0
         for b in bars:
@@ -135,6 +139,28 @@ class DataQualityChecker:
         if not quote or quote.get("latest_price", 0) <= 0:
             rep.block("实时行情缺失或价格异常(MISSING)")
             return rep
+        if quote.get("source_conflict"):
+            rep.status = QUALITY_CONFLICT
+            rep.blocked_reason = str(quote.get("source_conflict"))
+            return rep
+        verified_sources = quote.get("verified_sources")
+        if verified_sources is not None and int(verified_sources) < 2:
+            rep.status = QUALITY_SUSPICIOUS
+            rep.blocked_reason = "实时行情只有单一公开源确认"
+            rep.add_warning("SUSPICIOUS", rep.blocked_reason)
+        spread = float(quote.get("price_spread_pct", 0) or 0)
+        threshold = float(self.cross.get("quote_diff_pct", 0.005))
+        if spread > threshold:
+            rep.status = QUALITY_CONFLICT
+            rep.blocked_reason = f"实时行情多源价差 {spread:.3%} 超过 {threshold:.3%}"
+            return rep
+        price = float(quote.get("latest_price", 0) or 0)
+        high = float(quote.get("high", 0) or 0)
+        low = float(quote.get("low", 0) or 0)
+        if high > 0 and price > high + 1e-9 or low > 0 and price < low - 1e-9:
+            rep.status = QUALITY_SUSPICIOUS
+            rep.blocked_reason = "最新价落在当日最高/最低价区间之外"
+            rep.add_warning("SUSPICIOUS", rep.blocked_reason)
         now = now or datetime.now()
         stale_seconds = int(self.freshness.get("realtime_quote", 60))
         qtime = quote.get("quote_time")
@@ -144,11 +170,16 @@ class DataQualityChecker:
                 qtime = datetime.fromisoformat(qtime.replace("Z", "+00:00"))
             except Exception:
                 qtime = None
+        if qtime and qtime.tzinfo and now.tzinfo is None:
+            now = now.astimezone().replace(tzinfo=None)
+            qtime = qtime.astimezone().replace(tzinfo=None)
+        elif qtime and now.tzinfo and qtime.tzinfo is None:
+            qtime = qtime.replace(tzinfo=now.tzinfo)
         if qtime and (now - qtime).total_seconds() > stale_seconds:
             rep.add_warning("DELAYED", f"行情时间 {qtime} 已超过 {stale_seconds}s")
             rep.status = QUALITY_DELAYED
         # 涨跌幅合理性(±21%内)
-        chg = abs(quote.get("change_pct", 0))
+        chg = abs(float(quote.get("change_pct", 0) or 0))
         if chg > 21:
             rep.add_warning("SUSPICIOUS", f"涨跌幅 {chg:.1f}% 异常")
             rep.status = QUALITY_SUSPICIOUS

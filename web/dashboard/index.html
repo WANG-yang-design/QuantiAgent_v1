@@ -70,7 +70,7 @@ th{background:#f7f7fa;color:#666}
   </div>
 </main>
 <script>
-const TOKEN = "quantiagent-admin";
+const TOKEN = localStorage.getItem("quantiagent_token") || "";
 async function api(path, method="GET"){
   const r = await fetch(path, {method, headers:{Authorization:"Bearer "+TOKEN}});
   if(!r.ok) throw new Error(r.status);
