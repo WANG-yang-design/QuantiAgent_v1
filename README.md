@@ -52,6 +52,11 @@ python main.py scheduler
 
 # 8. 重置模拟盘(自动归档上一轮运行记录, 可随时回看)
 python main.py reset-paper --yes --initial-cash 100000 --note "策略V2上线"
+
+# 9. 辅助命令
+python main.py rotate                        # 手动执行一次ETF轮动调仓(回测外)
+python main.py universe                      # 查看当前动态ETF池候选/母池/分布
+python main.py status                        # 系统状态(调度器/账户/持仓)
 ```
 
 前端开发: `cd frontend && npm run dev`(5173, 已代理 /api); 上线 `npm run build`。
@@ -129,21 +134,21 @@ QuantiAgent/
 ├── backtest/                # 回测引擎(无未来函数/涨跌停/基准/覆盖度校验)
 ├── config/                  # 全部YAML配置 + Agent提示词
 ├── core/                    # 配置加载/日志/LLM/ID/符号工具/防休眠/Agent开关
-├── data_service/            # 统一数据服务(行情/实时/新闻/RAG/质量校验)
+├── data_service/            # 统一数据服务(行情/实时/新闻/RAG/缓存/质量校验)
 ├── data_sources/            # 数据源客户端 + hub 多源容灾
 ├── database/                # SQLAlchemy模型 + repository + 初始化迁移
 ├── docs/                    # 技术方案/表结构/数据源调研/审计文档
 ├── features/                # 技术指标/市场状态特征
 ├── frontend/                # React 前端(Vite+Tailwind+ECharts, 构建产物由后端托管)
 ├── live_trading/            # 实盘预留(BrokerAdapter/QMT/PTrade 桩)
-├── memory/                  # 审计日志/长短记忆
+├── memory/                  # 审计日志
 ├── notification/            # 邮件通知(队列/去重/确认链接)
 ├── paper_trading/           # 模拟盘(账户/撮合/组合/重置归档)
 ├── reports/                 # 报告生成 + paper_archive/(运行记录JSON)
 ├── risk/                    # 五层风控/熔断器/持仓巡检
 ├── scheduler/               # APScheduler 调度(单例锁+心跳)
-├── scripts/                 # 历史回填/网格搜索/结果分析
-├── strategies/              # 动态ETF池/轮动信号/参数预设/实盘落地
+├── scripts/                 # 历史回填/网格搜索/分析/状态回验
+├── strategies/              # 动态ETF池/轮动信号/市场状态/参数预设/实盘落地
 ├── tests/                   # 单元测试(55项)
 ├── web/api/                 # FastAPI 路由
 └── workflows/               # 研究/交易/盘中监控/日终复盘 工作流
@@ -170,8 +175,8 @@ QuantiAgent/
   各 Top5 已保存为 `V4-*` 命名策略, 可在回测中心查看/应用(未自动切换 active_paper)。
 - **市场状态自适应切换**: `regime_switch`(默认启用, config.yaml 可一键关闭)。
   按沪深300状态(MA20/MA60+20日动量, 连续5日确认, 间隔≥20交易日)自动在
-  `V4-切换-进攻/稳健/防守` 之间切换; 离线3年验证 +56.7%/夏普1.09/回撤-10.2%
-  (见 `REGIME_SWITCH_REPORT.md`); 模拟盘页顶部实时显示状态与当前策略。
+  `V4-切换-进攻/稳健/防守` 之间切换; 离线3年验证 +58.26%/夏普1.15/回撤-8.93%
+  (见 `data/backtest_grid/v4/analysis/REGIME_SWITCH_REPORT.md`); 模拟盘页顶部实时显示状态与当前策略。
 - 批量运行: `python -m scripts.grid_search_v4 run --candidates ... --results ...`(见脚本头注释)。
 
 ### 五层风控 + 组合 + 熔断
