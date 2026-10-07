@@ -177,6 +177,10 @@ QuantiAgent/
   按沪深300状态(MA20/MA60+20日动量, 连续5日确认, 间隔≥20交易日)自动在
   `V4-切换-进攻/稳健/防守` 之间切换; 离线3年验证 +58.26%/夏普1.15/回撤-8.93%
   (见 `data/backtest_grid/v4/analysis/REGIME_SWITCH_REPORT.md`); 模拟盘页顶部实时显示状态与当前策略。
+- **共享研究资料**(已随仓库分发, 供共同验证): 38个命名策略(`data/strategy_presets.json`,
+  含 V2-Top5 / V4-* / V4-切换-*); V2/V3 参数实验汇总(`data/strategy_grid_*.json`);
+  v3/v4 全部分析表与报告(`data/backtest_grid/{v3,v4}/analysis/`, 其中 `ranked_all.csv`
+  含全部候选参数与分段指标); 原始逐日净值(results_*.jsonl, ~15MB)未入库, 可用 `scripts/` 重跑生成。
 - 批量运行: `python -m scripts.grid_search_v4 run --candidates ... --results ...`(见脚本头注释)。
 
 ### 五层风控 + 组合 + 熔断
