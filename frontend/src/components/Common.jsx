@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useNavigate } from "react-router-dom";
 
 /** 涨跌颜色工具 */
 export function chgColor(v) {
@@ -24,6 +23,17 @@ export function fmtWan(v) {
 export function fmtPct(v, d = 2) {
   const n = Number(v);
   return Number.isFinite(n) ? n.toFixed(d) + "%" : "-";
+}
+/** 盈亏颜色: 0 用中性灰(A股习惯红涨绿跌, 0 显示红色会误导) */
+export function pnlColor(v) {
+  const n = Number(v) || 0;
+  if (n > 1e-9) return "text-up";
+  if (n < -1e-9) return "text-down";
+  return "text-gray-500";
+}
+/** 错误信息提取(axios error → 可读文案) */
+export function errMsg(e) {
+  return e?.response?.data?.detail || e?.message || "请求失败";
 }
 
 /** 顶部系统状态条: 数据库/LLM/熔断/运行模式。
@@ -72,30 +82,37 @@ export function SystemBar() {
   );
 }
 
-/** 行情表格行(盯盘/仪表盘复用) */
-export function QuoteRow({ q, onView }) {
-  const nav = useNavigate();
-  return (
-    <tr
-      className="cursor-pointer hover:bg-gray-50"
-      onClick={() => (onView ? onView(q.symbol) : nav(`/symbol/${q.symbol}`))}
-    >
-      <td className="td font-medium">{q.symbol}</td>
-      <td className="td text-gray-500">{q.name}</td>
-      <td className={`td font-semibold ${chgColor(q.change_pct)}`}>{fmt(q.latest_price)}</td>
-      <td className={`td font-semibold ${chgColor(q.change_pct)}`}>
-        {q.change_pct > 0 ? "+" : ""}{q.change_pct?.toFixed(2)}%
-      </td>
-      <td className="td text-gray-600">{fmtWan(q.amount)}</td>
-      <td className="td text-gray-600">{q.premium_rate ? (q.premium_rate * 100).toFixed(2) + "%" : "-"}</td>
-    </tr>
-  );
-}
-
 export function Empty({ text = "暂无数据" }) {
   return <div className="text-center text-gray-400 text-sm py-8">{text}</div>;
 }
 
-export function Spin() {
-  return <div className="text-center text-gray-400 text-sm py-8">加载中...</div>;
+/** 查询失败提示(替代"暂无数据"误导) */
+export function ErrorBox({ error, onRetry, text = "加载失败" }) {
+  return (
+    <div className="text-center py-8 space-y-2">
+      <div className="text-sm text-red-500">{text}: {errMsg(error)}</div>
+      {onRetry && <button className="btn-ghost text-xs" onClick={onRetry}>重试</button>}
+    </div>
+  );
 }
+
+export function Spin({ text = "加载中..." }) {
+  return (
+    <div className="flex items-center justify-center gap-2 text-gray-400 text-sm py-8">
+      <span className="w-4 h-4 border-2 border-gray-300 border-t-brand-600 rounded-full animate-spin" />
+      {text}
+    </div>
+  );
+}
+
+/** 骨架屏(卡片内容加载中) */
+export function SkeletonLines({ rows = 3 }) {
+  return (
+    <div className="space-y-2.5 py-1">
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="skeleton-line" style={{ width: `${88 - i * 12}%` }} />
+      ))}
+    </div>
+  );
+}
+

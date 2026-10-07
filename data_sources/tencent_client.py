@@ -30,10 +30,29 @@ _lock = threading.RLock()
 
 
 def _tx_symbol(symbol: str) -> str:
-    """sh510300 / sz159915"""
+    """sh510300 / sz159915 / bj430047"""
     if symbol.startswith(("6", "5", "9")):
         return "sh" + symbol
+    if symbol.startswith(("4", "8")):
+        return "bj" + symbol
     return "sz" + symbol
+
+
+# 指数代码 → 腾讯代码(000001 既是上证指数也是平安银行, 必须显式映射)
+_INDEX_TX = {
+    "000001": "sh000001", "000016": "sh000016", "000300": "sh000300",
+    "000688": "sh000688", "000852": "sh000852", "000905": "sh000905",
+    "399001": "sz399001", "399006": "sz399006", "399300": "sh000300",
+    "399905": "sh000905", "000903": "sh000903",
+}
+
+
+def _index_tx_code(symbol: str) -> str:
+    if symbol in _INDEX_TX:
+        return _INDEX_TX[symbol]
+    if symbol.startswith(("399", "159", "980")):
+        return "sz" + symbol
+    return "sh" + symbol
 
 
 def _in_trading_hours(now: Optional[datetime] = None) -> bool:
@@ -313,40 +332,139 @@ class TencentClient(BaseDataSource):
         return out
 
     # ------------------------------------------------------------------
+    # 历史日K (腾讯 ifzq, 免费直连, 前复权)
+    # ------------------------------------------------------------------
+    _FQKLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    _KLINE_MAX_ROWS = 640          # 单次请求上限(腾讯实测)
+    _KLINE_HEADERS = {"Referer": "https://gu.qq.com/"}
+
+    def _fetch_kline_window(self, tx_code: str, start: date, end: date,
+                            fq: bool = True) -> List[list]:
+        """请求单窗口K线(≤640根), 返回原始行 [date, open, close, high, low, vol]。"""
+        param = (f"{tx_code},day,{start.isoformat()},{end.isoformat()},"
+                 f"{self._KLINE_MAX_ROWS},{'qfq' if fq else ''}")
+        resp = _tx_client.get(self._FQKLINE_URL, params={"param": param},
+                              headers=self._KLINE_HEADERS)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        data = (payload.get("data") or {}).get(tx_code) or {}
+        rows = data.get("qfqday") or data.get("day") or []
+        return rows
+
+    def _fetch_hist_daily(self, tx_code: str, start: date, end: date,
+                          fq: bool = True, max_windows: int = 8) -> List[dict]:
+        """分窗拉取历史日K(每次最多640根, 向前翻页), 去重并按日期升序。"""
+        collected: Dict[str, list] = {}
+        cur_end = end
+        for _ in range(max_windows):
+            rows = self._fetch_kline_window(tx_code, start, cur_end, fq=fq)
+            if not rows:
+                break
+            for r in rows:
+                if len(r) >= 6 and r[0]:
+                    collected[str(r[0])] = r
+            first = str(rows[0][0])
+            if first <= start.isoformat() or len(rows) < self._KLINE_MAX_ROWS:
+                break
+            cur_end = date.fromisoformat(first) - timedelta(days=1)
+            if cur_end < start:
+                break
+        return [collected[d] for d in sorted(collected)]
+
+    @staticmethod
+    def _kline_row_to_bar(symbol: str, r: list) -> Optional[Dict[str, Any]]:
+        """腾讯行格式: [date, open, close, high, low, volume(手)]。"""
+        try:
+            trade_date = date.fromisoformat(str(r[0])[:10])
+            o, c, h, l = (_safe_float(r[1]), _safe_float(r[2]),
+                          _safe_float(r[3]), _safe_float(r[4]))
+            vol_hand = _safe_float(r[5])
+        except (IndexError, ValueError):
+            return None
+        if min(o, c, h, l) <= 0:
+            return None
+        vol_shares = vol_hand * 100.0
+        # 腾讯日K不含成交额, 用典型价×成交量近似(与各源成交额口径量级一致,
+        # 仅用于流动性过滤/选池的相对比较)
+        vwap = (h + l + c) / 3 if h and l else c
+        return {
+            "symbol": symbol,
+            "trade_date": trade_date,
+            "open": round(o, 4),
+            "high": round(h, 4),
+            "low": round(l, 4),
+            "close": round(c, 4),
+            "volume": round(vol_shares, 0),
+            "amount": round(vol_shares * vwap, 2),
+            "change_pct": 0.0,
+            "source": "tencent",
+        }
+
     def get_daily_bars(self, symbol: str, start: date, end: date,
                        asset_type: str = "etf") -> List[Dict[str, Any]]:
-        """当日日K合成: 用今日分时聚合一根当日K线(盘中即有当天数据)。
-        历史日K由 baostock 主源提供, 本方法仅在请求区间包含当日时补充当日一根。"""
+        """历史日K(前复权): 腾讯 ifzq 接口, 覆盖 ETF/股票/北交所。
+        区间含当日且当日K线尚未生成(盘中)时, 用分时合成当日一根。"""
+        tx_code = _tx_symbol(symbol)
+        raw = self._fetch_hist_daily(tx_code, start, end, fq=True)
+        if not raw:
+            raw = self._fetch_hist_daily(tx_code, start, end, fq=False)
+        bars = [b for b in (self._kline_row_to_bar(symbol, r) for r in raw) if b]
+        # 当日补充(盘中): 请求区间覆盖今天且历史K线还没有今天
         today = datetime.now().date()
-        if not (start <= today <= end):
-            raise RuntimeError("腾讯日K仅支持当日合成")
+        if start <= today <= end and (not bars or bars[-1]["trade_date"] < today):
+            if _in_trading_hours() or datetime.now().time() >= dtime(15, 5):
+                try:
+                    live = self.get_daily_bars_live(symbol, asset_type)
+                    if live:
+                        bars.append(live)
+                except Exception as exc:
+                    logger.debug("腾讯当日K合成失败 %s: %s", symbol, exc)
+        if not bars:
+            raise RuntimeError(f"腾讯无 {symbol} 历史日K")
+        return bars
+
+    def get_daily_bars_live(self, symbol: str,
+                            asset_type: str = "etf") -> Optional[Dict[str, Any]]:
+        """当日日K合成: 用今日分时聚合一根当日K线(盘中即有当天数据)。"""
+        today = datetime.now().date()
         rows = self._minute_rows(symbol)
         if not rows:
-            raise RuntimeError(f"腾讯无 {symbol} 今日分时, 无法合成日K")
+            return None
         opens = [r[1] for r in rows if r[1] > 0]
         if not opens:
-            raise RuntimeError(f"腾讯 {symbol} 当日价格为0")
-        open_price = rows[0][1]
+            return None
         close_price = rows[-1][1]
         hi = max(r[1] for r in rows)
         lo = min(r[1] for r in rows)
         vol = sum(r[2] for r in rows)
         amount = sum(r[1] * r[2] for r in rows)
         prev_close = self._prev_close(symbol)
-        change_pct = (close_price / prev_close - 1) * 100 if prev_close > 0 else 0.0
-        return [{
+        return {
             "symbol": symbol,
             "trade_date": today,
-            "open": round(open_price, 4),
+            "open": round(rows[0][1], 4),
             "high": round(hi, 4),
             "low": round(lo, 4),
             "close": round(close_price, 4),
             "volume": round(vol, 0),
             "amount": round(amount, 2),
-            "change_pct": round(change_pct, 4),
+            "change_pct": round((close_price / prev_close - 1) * 100, 4)
+            if prev_close > 0 else 0.0,
             "source": self.name,
             "is_live": True,
-        }]
+        }
+
+    # ------------------------------------------------------------------
+    def get_index_bars(self, index_code: str, start: date, end: date
+                       ) -> List[Dict[str, Any]]:
+        """指数日K(沪深300/上证/中证500等): 腾讯 ifzq 指数接口。"""
+        tx_code = _index_tx_code(index_code)
+        raw = self._fetch_hist_daily(tx_code, start, end, fq=False)
+        bars = [b for b in (self._kline_row_to_bar(index_code, r) for r in raw) if b]
+        if not bars:
+            raise RuntimeError(f"腾讯无 {index_code} 指数日K")
+        return bars
+
 
     def _prev_close(self, symbol: str) -> float:
         try:

@@ -122,11 +122,15 @@ class BacktestEngine:
                  use_agents: bool = False, agent_interval_days: int = 5,
                  name: str = "", run_id: Optional[str] = None,
                  asset_type: str = "etf",
-                 asset_types: Optional[Dict[str, str]] = None):
+                 asset_types: Optional[Dict[str, str]] = None,
+                 persist: bool = True):
         self.start = start
         self.end = end
         self.mode = mode
         self.use_agents = use_agents
+        # persist=False: 批量网格实验不写 backtest_runs/backtest_results 表,
+        # 避免数百次实验淹没 Web 回测历史(结果由调用方落文件)。
+        self.persist = bool(persist)
         self.agent_interval_days = max(int(agent_interval_days or 5), 1)
         self.name = name or f"回测{start}-{end}"
         self.asset_type = asset_type
@@ -176,12 +180,13 @@ class BacktestEngine:
         data_loader(symbol, asof) -> bars(截至asof, 含asof)
         signal_fn(asof, prices) -> {symbol: {"action": BUY/SELL, "qty": n, "price": limit}}
         """
-        repo.save_backtest_run({
-            "run_id": self.run_id, "name": self.name,
-            "start_date": self.start, "end_date": self.end,
-            "mode": "daily", "status": "RUNNING",
-            "config_json": {"use_agents": self.use_agents,
-                            "slippage": self.slippage,
+        if self.persist:
+            repo.save_backtest_run({
+                "run_id": self.run_id, "name": self.name,
+                "start_date": self.start, "end_date": self.end,
+                "mode": "daily", "status": "RUNNING",
+                "config_json": {"use_agents": self.use_agents,
+                                "slippage": self.slippage,
                             "agent_interval_days": self.agent_interval_days,
                             "initial_cash": self.initial_cash,
                             "asset_type": self.asset_type,
@@ -223,7 +228,16 @@ class BacktestEngine:
         # 待成交订单意图(T日生成 → T+1开盘成交)。
         # 修复: 原实现把成交记账提前到信号日迭代, 导致 today_buy 在成交日
         # 被 start_new_day 提前清零(T+1 提前一天解锁), 且净值提前一天反映持仓。
-        pending_fills: List[Dict[str, Any]] = []
+        pending_fills: List[dict] = []
+
+        # 性能: 每日对全部标的做 `[b for b in bars if date<=d]` 的 Python 过滤,
+        # 在千级标的×数百日下是主要瓶颈(约10亿次迭代/回测)。改为对已排序的
+        # 日期表做 bisect + 切片, 语义完全一致但由 C 完成。
+        from bisect import bisect_right
+        bar_dates: Dict[str, List] = {
+            s: [b["trade_date"] for b in bars]
+            for s, bars in bars_by_symbol.items()
+        }
 
         for i, d in enumerate(trade_dates):
             # 进度回调(供 Web 异步任务显示进度)
@@ -234,7 +248,8 @@ class BacktestEngine:
             # 先执行昨日生成的订单意图(今日开盘价成交, 记账落在今日迭代)
             self._execute_pending_fills(pending_fills, bars_by_symbol, d)
             # ---- 仅使用截至 d 的数据(含 d) ----
-            asof = {s: [b for b in bars if b["trade_date"] <= d] for s, bars in bars_by_symbol.items()}
+            asof = {s: bars[:bisect_right(bar_dates[s], d)]
+                    for s, bars in bars_by_symbol.items()}
             # 当日缺K线（停牌/少量数据缺口）可以按昨收估值，但绝不能用旧K线
             # 重复生成当日交易信号。
             prices = {s: (bs[-1]["close"] if bs else 0) for s, bs in asof.items()}
@@ -328,6 +343,19 @@ class BacktestEngine:
         return self._finalize()
 
     # ------------------------------------------------------------------
+    def _slip_fraction(self, symbol: str, price: float) -> float:
+        """成交滑点(比例): 以最小变动价位为上限, 配置值为下限参考。
+
+        A股最小价差: ETF 0.001元 / 股票 0.01元。原实现全市场固定 0.1%,
+        对 4 元的 ETF 高估约 4 倍滑点, 系统性压低回测收益。现按价位折算
+        一个最小价差, 同时保留配置值 20% 的保守下限。
+        """
+        if price <= 0:
+            return self.slippage
+        tick = 0.001 if self.asset_type_for(symbol) == "etf" else 0.01
+        return max(min(self.slippage, tick / price), self.slippage * 0.2)
+
+    # ------------------------------------------------------------------
     def _execute_pending_fills(self, pending_fills: List[dict],
                                bars_by_symbol: Dict[str, List[dict]],
                                d: date):
@@ -365,7 +393,7 @@ class BacktestEngine:
                 if locked and ((side == "BUY" and change >= limit - 0.001) or
                                (side == "SELL" and change <= -limit + 0.001)):
                     continue
-            slip = fill_price * self.slippage
+            slip = fill_price * self._slip_fraction(symbol, fill_price)
             price = fill_price + slip if side == "BUY" else fill_price - slip
             fee = self._calc_fee(price * qty, symbol, side)
             name = self.name_map.get(symbol, "")
@@ -454,13 +482,14 @@ class BacktestEngine:
         """
         if getattr(signal_fn, "strategy_timeframe", "") == "daily":
             raise ValueError("分钟回测不能直接运行日线策略；请使用分钟策略或日线模式")
-        repo.save_backtest_run({
-            "run_id": self.run_id, "name": self.name,
-            "start_date": self.start, "end_date": self.end,
-            "mode": "minute", "status": "RUNNING",
-            "config_json": {"interval_minutes": interval_minutes,
-                            "slippage": self.slippage},
-        })
+        if self.persist:
+            repo.save_backtest_run({
+                "run_id": self.run_id, "name": self.name,
+                "start_date": self.start, "end_date": self.end,
+                "mode": "minute", "status": "RUNNING",
+                "config_json": {"interval_minutes": interval_minutes,
+                                "slippage": self.slippage},
+            })
         minute_slippage = float(get_settings().get(
             "trading_rules.slippage.minute_bar", 0.0005))
         window: Dict[str, List[dict]] = {}
@@ -645,17 +674,18 @@ class BacktestEngine:
         # run_id 必须在持久化 metrics_json 前写入，否则服务重启后历史结果恢复时
         # 前端无法请求 /backtest/{run_id}/kline，K线卡片会永久停在加载状态。
         metrics["run_id"] = self.run_id
-        repo.save_backtest_result({
-            "run_id": self.run_id,
-            "total_return": metrics.get("total_return", 0),
-            "annual_return": metrics.get("annual_return", 0),
-            "max_drawdown": metrics.get("max_drawdown", 0),
-            "sharpe": metrics.get("sharpe", 0),
-            "calmar": metrics.get("calmar", 0),
-            "win_rate": metrics.get("win_rate", 0) or 0,
-            "metrics_json": metrics,
-        })
-        repo.update_backtest_run(self.run_id, "DONE")
+        if self.persist:
+            repo.save_backtest_result({
+                "run_id": self.run_id,
+                "total_return": metrics.get("total_return", 0),
+                "annual_return": metrics.get("annual_return", 0),
+                "max_drawdown": metrics.get("max_drawdown", 0),
+                "sharpe": metrics.get("sharpe", 0),
+                "calmar": metrics.get("calmar", 0),
+                "win_rate": metrics.get("win_rate", 0) or 0,
+                "metrics_json": metrics,
+            })
+            repo.update_backtest_run(self.run_id, "DONE")
         logger.info("回测完成 %s: 总收益 %.2f%% 回撤 %.2f%% 夏普 %.2f 交易 %d 笔",
                     self.run_id, metrics.get("total_return", 0) * 100,
                     metrics.get("max_drawdown", 0) * 100, metrics.get("sharpe", 0),

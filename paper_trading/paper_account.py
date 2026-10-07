@@ -95,6 +95,7 @@ class PaperAccount:
                 "total_pnl": round(a.total_pnl, 2),
                 "day_pnl": round(a.day_pnl, 2),
                 "total_fee": round(a.total_fee, 2),
+                "init_cash": round(float(a.init_cash or 0), 2),
                 "total_return": round(a.total_pnl / a.init_cash, 4) if a.init_cash else 0,
                 "status": a.status,
                 "update_time": str(a.update_time),
@@ -207,10 +208,22 @@ class PaperAccount:
                 cash_flow[t.symbol] -= (
                     float(t.price or 0) * (t.qty or 0) + (t.fee or 0))
         prev: Dict[str, float] = {}
-        for sym in set(self._positions.keys()) | set(sold) | set(bought):
+        syms = set(self._positions.keys()) | set(sold) | set(bought)
+        # 昨收优先取实时行情(腾讯/新浪均带昨收, 盘后依然有效), 再回退日K库。
+        # 修复: 原实现只查日K库, 数据源缺失时回退"现价"→ 日初市值=当前市值,
+        # 当日盈亏恒为 0.00(用户反馈"当日盈亏没数据")。
+        try:
+            from data_service.live_quote_service import get_live_quote_service
+            quotes = get_live_quote_service().get_quotes(list(syms), max_age=600.0)
+            for sym, q in quotes.items():
+                pc = float((q or {}).get("prev_close", 0) or 0)
+                if pc > 0:
+                    prev[sym] = pc
+        except Exception as exc:
+            logger.debug("昨收批量获取失败(回退日K库): %s", exc)
+        for sym in syms - set(prev.keys()):
             prev[sym] = self._prev_close(sym, today)
         by_symbol: Dict[str, float] = {}
-        syms = set(self._positions.keys()) | set(sold) | set(bought)
         for sym in syms:
             cur = self._positions.get(sym)
             qty = (int(cur.total_qty or 0) if cur else 0) \

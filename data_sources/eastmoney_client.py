@@ -17,6 +17,9 @@ from data_sources.akshare_client import _safe_float, _safe_str
 logger = logging.getLogger("data.eastmoney")
 
 _PUSH2 = "https://push2.eastmoney.com/api/qt/stock/get"
+_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"
+# 场内ETF基金板块(沪/深 ETF)
+_ETF_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024"
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://quote.eastmoney.com/",
@@ -49,6 +52,92 @@ class EastMoneyClient(BaseDataSource):
         # 东财接口报 ProxyError 导致数据获取失败(数据源容灾链全灭)
         self.client = httpx.Client(headers=_HEADERS, timeout=10,
                                    proxy=None, trust_env=False)
+
+    # ---------------- 全市场ETF列表 (直连 clist, 替代 akshare 分页) ----------------
+    def get_etf_spot(self) -> List[Dict[str, Any]]:
+        """全市场ETF实时列表(push2 clist 分页, 每页500只, 约4次请求)。
+
+        修复: 原主源 akshare.fund_etf_spot_em 走东财分页, 本机网络下
+        RemoteDisconnected 且无备源 → 动态ETF池/监控池/预热全部拿不到列表。
+        直连 clist 接口(同一数据源, 更少的请求)稳定快速, 并保留磁盘缓存。
+        """
+        out: List[Dict[str, Any]] = []
+        total = None
+        for pn in range(1, 9):
+            params = {
+                "pn": pn, "pz": 500, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                "fid": "f6", "fs": _ETF_FS,
+                "fields": "f2,f3,f4,f5,f6,f8,f12,f14,f15,f16,f17,f18",
+            }
+            resp = self.client.get(_CLIST, params=params)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = data.get("diff") or []
+            if total is None:
+                total = int(data.get("total") or 0)
+            if not diff:
+                break
+            for d in diff:
+                symbol = _safe_str(d.get("f12"))
+                if not symbol:
+                    continue
+                out.append({
+                    "symbol": symbol,
+                    "name": _safe_str(d.get("f14")),
+                    "latest_price": _safe_float(d.get("f2")),
+                    "change_pct": _safe_float(d.get("f3")),
+                    "change": _safe_float(d.get("f4")),
+                    "volume": _safe_float(d.get("f5")) * 100,   # 手→份
+                    "amount": _safe_float(d.get("f6")),
+                    "turnover_rate": _safe_float(d.get("f8")),
+                    "high": _safe_float(d.get("f15")),
+                    "low": _safe_float(d.get("f16")),
+                    "open": _safe_float(d.get("f17")),
+                    "prev_close": _safe_float(d.get("f18")),
+                    "iopv": 0.0,
+                    "premium_rate": 0.0,
+                    "source": self.name,
+                })
+            if total and len(out) >= total:
+                break
+        if not out:
+            raise RuntimeError("东方财富ETF列表为空")
+        return out
+
+    # ---------------- 全市场A股列表 (成交额排序, 热门股票页) ----------------
+    def get_stock_spot(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """沪深A股+北交所按成交额排序列表(push2 clist)。"""
+        out: List[Dict[str, Any]] = []
+        fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
+        for pn in range(1, 4):
+            params = {
+                "pn": pn, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                "fid": "f6", "fs": fs,
+                "fields": "f2,f3,f6,f12,f14",
+            }
+            resp = self.client.get(_CLIST, params=params)
+            resp.raise_for_status()
+            data = (resp.json() or {}).get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            for d in diff:
+                symbol = _safe_str(d.get("f12"))
+                if not symbol:
+                    continue
+                out.append({
+                    "symbol": symbol,
+                    "name": _safe_str(d.get("f14")),
+                    "asset_type": "stock",
+                    "latest_price": _safe_float(d.get("f2")),
+                    "change_pct": _safe_float(d.get("f3")),
+                    "amount": _safe_float(d.get("f6")),
+                })
+            if len(out) >= limit:
+                break
+        if not out:
+            raise RuntimeError("东方财富A股列表为空")
+        return out[:limit]
 
     # ---------------- 实时行情 ----------------
     def get_realtime_quote(self, symbol: str, asset_type: str = "etf") -> Dict[str, Any]:

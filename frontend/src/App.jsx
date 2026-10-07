@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { NavLink, Route, Routes, useNavigate } from "react-router-dom";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { NavLink, Route, Routes } from "react-router-dom";
 import {
   LayoutDashboard, Activity, CandlestickChart, Bot, FlaskConical,
   PiggyBank, Settings, ListChecks, Pause, Play, ShieldCheck, KeyRound, BarChart3,
@@ -7,17 +7,20 @@ import {
 } from "lucide-react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, setToken, getToken } from "./api/client";
-import Dashboard from "./pages/Dashboard";
-import Watchlist from "./pages/Watchlist";
-import WatchMonitor from "./pages/WatchMonitor";
-import SymbolDetail from "./pages/SymbolDetail";
-import AgentCenter from "./pages/AgentCenter";
-import BacktestCenter from "./pages/BacktestCenter";
-import PaperLive from "./pages/PaperLive";
-import AccountAnalysis from "./pages/AccountAnalysis";
-import SettingsPage from "./pages/Settings";
-import { SystemBar } from "./components/Common";
+import { SystemBar, Spin } from "./components/Common";
+import { toastErr } from "./components/Toast";
 import { useLiveQuotes } from "./hooks/useLiveQuotes";
+
+// 路由级懒加载: 首屏只加载仪表盘, ECharts 等重依赖按页面分包
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const Watchlist = lazy(() => import("./pages/Watchlist"));
+const WatchMonitor = lazy(() => import("./pages/WatchMonitor"));
+const SymbolDetail = lazy(() => import("./pages/SymbolDetail"));
+const AgentCenter = lazy(() => import("./pages/AgentCenter"));
+const BacktestCenter = lazy(() => import("./pages/BacktestCenter"));
+const PaperLive = lazy(() => import("./pages/PaperLive"));
+const AccountAnalysis = lazy(() => import("./pages/AccountAnalysis"));
+const SettingsPage = lazy(() => import("./pages/Settings"));
 
 const NAV = [
   { to: "/", label: "仪表盘", icon: LayoutDashboard },
@@ -37,6 +40,13 @@ const MORE_TABS = NAV.slice(3);
 
 function MobileNav() {
   const [moreOpen, setMoreOpen] = useState(false);
+  // 抽屉打开时锁定背景滚动(修复: 原实现可穿透滚动)
+  useEffect(() => {
+    if (!moreOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [moreOpen]);
   return (
     <>
       <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t border-gray-200 flex
@@ -90,19 +100,27 @@ function MobileNav() {
 /** 鉴权失败弹窗: 401 时提示输入令牌(修复: 原实现无任何用户可见的令牌入口) */
 function TokenModal({ open, onClose }) {
   const [val, setVal] = useState(getToken());
+  const [show, setShow] = useState(false);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-      onClick={onClose}>
-      <div className="card w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal-panel max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
         <div className="card-title"><KeyRound size={15} />API 令牌设置</div>
         <p className="text-xs text-gray-500 mb-3">
           鉴权失败(401)。请在 <code className="bg-gray-100 px-1 rounded">.env</code>
           的 <code className="bg-gray-100 px-1 rounded">WEB_ADMIN_TOKEN</code> 配置并重启后端后,
           在这里填入相同的令牌。
         </p>
-        <input className="input w-full" value={val} autoFocus
-          placeholder="Bearer 令牌" onChange={(e) => setVal(e.target.value)} />
+        <div className="relative">
+          <input className="input w-full pr-16" value={val} autoFocus
+            type={show ? "text" : "password"} autoComplete="off"
+            placeholder="Bearer 令牌" onChange={(e) => setVal(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { setToken(val.trim()); onClose(); window.location.reload(); } }} />
+          <button type="button" onClick={() => setShow((s) => !s)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-gray-600">
+            {show ? "隐藏" : "显示"}
+          </button>
+        </div>
         <div className="flex gap-2 mt-3 justify-end">
           <button className="btn-ghost" onClick={onClose}>取消</button>
           <button className="btn-primary" onClick={() => {
@@ -153,9 +171,21 @@ function TopBar({ onAuthError }) {
     }
     setLastPendingCount(pendingCount);
   }, [pendingCount]);
+  // 浏览器通知权限: 首次出现待确认时申请(修复: 原实现从未申请权限, 通知永不生效)
+  useEffect(() => {
+    if (pendingCount > 0 && "Notification" in window &&
+        Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, [pendingCount]);
+  const qc = useQueryClient();
   const pause = useMutation({
     mutationFn: () => api.post(`/api/emergency/${paused ? "resume" : "pause"}`, null),
-    onSuccess: () => window.location.reload(),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["sysmode"] });
+      qc.invalidateQueries({ queryKey: ["health"] });
+    },
+    onError: (e) => toastErr("操作失败: " + (e.response?.data?.detail || e.message)),
   });
 
   return (
@@ -268,24 +298,26 @@ export default function App() {
       <main className="flex-1 flex flex-col overflow-y-auto pb-16 md:pb-0">
         <TopBar onAuthError={authErrorFlag} />
         <div className="flex-1">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/watchlist" element={<Watchlist />} />
-            <Route path="/monitor" element={<WatchMonitor />} />
-            <Route path="/symbol" element={<SymbolDetail />} />
-            <Route path="/symbol/:code" element={<SymbolDetail />} />
-            <Route path="/agents" element={<AgentCenter />} />
-            <Route path="/backtest" element={<BacktestCenter />} />
-            <Route path="/paper-live" element={<PaperLive />} />
-            <Route path="/analysis" element={<AccountAnalysis />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={
-              <div className="p-5 flex flex-col items-center gap-3">
-                <div className="text-4xl font-bold text-gray-300">404</div>
-                <div className="text-sm text-gray-500">页面不存在</div>
-              </div>
-            } />
-          </Routes>
+          <Suspense fallback={<div className="p-5"><Spin text="页面加载中..." /></div>}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/watchlist" element={<Watchlist />} />
+              <Route path="/monitor" element={<WatchMonitor />} />
+              <Route path="/symbol" element={<SymbolDetail />} />
+              <Route path="/symbol/:code" element={<SymbolDetail />} />
+              <Route path="/agents" element={<AgentCenter />} />
+              <Route path="/backtest" element={<BacktestCenter />} />
+              <Route path="/paper-live" element={<PaperLive />} />
+              <Route path="/analysis" element={<AccountAnalysis />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="*" element={
+                <div className="p-5 flex flex-col items-center gap-3">
+                  <div className="text-4xl font-bold text-gray-300">404</div>
+                  <div className="text-sm text-gray-500">页面不存在</div>
+                </div>
+              } />
+            </Routes>
+          </Suspense>
         </div>
       </main>
       <MobileNav />

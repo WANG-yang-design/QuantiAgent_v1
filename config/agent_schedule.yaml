@@ -61,9 +61,9 @@ jobs:
   eod_data_update:
     cron: "10 15 * * mon-fri"
     enabled: true
-  # 日终报告(16:00-18:00)
+  # 日终报告(15:30, 收盘后30分钟; 修复: 原17:00太晚; 节假日由 job 内交易历保护跳过)
   daily_report:
-    cron: "0 17 * * mon-fri"
+    cron: "30 15 * * mon-fri"
     enabled: true
   # 市场牛熊诊断(交易时段每小时; 修复: 原 10-14 覆盖12:00午休空转且漏掉15:00)
   market_diagnosis:

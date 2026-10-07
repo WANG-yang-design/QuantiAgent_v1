@@ -623,7 +623,13 @@ class QuantScheduler:
             raise RuntimeError("收盘数据更新全部失败")
 
     def job_daily_report(self):
-        """日终报告(17:00)。"""
+        """日终报告(默认15:30, 可配 report.daily_time)。
+
+        修复: 原实现只按"周一~五"的cron触发, 法定节假日(如中秋)也发日报,
+        内容全是休市空数据。现交易日历不在场时跳过。"""
+        if not _is_trade_day(business_today()):
+            logger.info("今日休市, 跳过日终报告")
+            return
         import asyncio
         from workflows.daily_review_workflow import run_daily_review
         asyncio.run(run_daily_review())
@@ -788,7 +794,10 @@ class QuantScheduler:
             raise
 
     def job_weekly_report(self):
-        """周报(周五18:00)。"""
+        """周报(周五)。休市日(节假日)跳过, 顺延至下一个周五。"""
+        if not _is_trade_day(business_today()):
+            logger.info("今日休市, 跳过周报")
+            return
         from reports.report_generator import get_report_generator
         path = get_report_generator().generate_weekly_report()
         logger.info("周报生成: %s", path)

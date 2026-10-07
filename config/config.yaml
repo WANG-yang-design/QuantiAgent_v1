@@ -42,6 +42,11 @@ universe:
     min_price: 0.20
     max_per_theme: 2              # 相同跟踪指数/主题最多2只，按流动性保留
     exclude_qdii: false
+    # 排除债券/货币类ETF(现金管理工具): 成交额巨大但无方向性动量, 会占用
+    # 候选池名额、挤压真正的方向性ETF(实测数据补全后导致候选池失真)。
+    exclude_cash_like: true
+    # 波动率下限兜底: 年化波动<5%视为债券/货币类(名称未命中关键词也能识别)
+    min_annualized_volatility: 0.05
     history_backfill_batch_size: 30
     history_backfill_days: 900
     history_target_bars: 250
@@ -142,6 +147,27 @@ strategies:
     enabled: true                # 每日14:40由调度器自动执行轮动调仓
     max_orders_per_day: 6        # 每日最多提交订单数(防失控)
     # params: {}                 # 可选: 覆盖上方 etf_momentum_rotation 参数
+    # ---- 市场状态自适应策略切换 (确定性规则, 无需LLM) ----
+    # 每日14:40执行前按沪深300状态选择映射策略; 状态需连续confirm_days日成立
+    # 才切换(sticky防抖), 且两次切换间隔≥min_switch_days个交易日(防横跳)。
+    # 离线3年验证(2023-10~2026-09): 切换组合 +56.7%/夏普1.09/回撤-10.2%,
+    # 优于静态稳健(+54.9%/0.98/-11.6%)与静态进攻(+61.1%/1.03/-12.1%)的
+    # 风险调整水平。无法识别/映射缺失时自动回退 active_paper。
+    # 一键关闭: enabled: false
+    regime_switch:
+      enabled: true
+      index: "000300"
+      ma_short: 20
+      ma_long: 60
+      risk_on_mom: 0.02          # 20日动量≥2% 且 多头排列 → risk_on
+      risk_off_mom: -0.03        # 20日动量≤-3% 且 跌破MA20 → risk_off
+      confirm_days: 5            # 状态需连续5日成立才切换
+      sticky: true               # 防抖: 不满足确认时保持上一状态
+      min_switch_days: 20        # 两次切换最小间隔(交易日)
+      presets:
+        risk_on: "V4-切换-进攻"
+        neutral: "V4-切换-稳健"
+        risk_off: "V4-切换-防守"
 
 # ---- 回测可信度 ----
 backtest:
@@ -181,7 +207,7 @@ web:
 
 # ---- 报告 ----
 report:
-  daily_time: "17:00"
+  daily_time: "15:30"            # 盈亏日报(收盘后30分钟; 修复: 原17:00太晚, 且节假日不再发送)
   weekly_day: 5                  # 周五
   monthly_day: 1
 

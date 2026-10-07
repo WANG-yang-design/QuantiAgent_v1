@@ -4,7 +4,8 @@
 ===============================
 供数据服务/Agent/风控/模拟盘等上层模块调用, 统一会话管理。
 """
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import delete, func, select
@@ -18,10 +19,12 @@ from database.models import (
     AuditLog, BacktestResult, BacktestRun, DailyBar, EtfInfo, EtfNavRecord,
     EtfUniverseSnapshot, FeatureRecord, FundamentalRecord, HumanConfirmation, MemoryRecord,
     MinuteBar, MoneyFlowRecord, NewsRecord, Order, OrderBookSnapshot,
-    Position, PromptVersion, RagChunk, RagDocument, RealtimeQuote,
+    PaperRunArchive, Position, PromptVersion, RagChunk, RagDocument, RealtimeQuote,
     ReportRecord, ResearchDecision, RiskCheck, SentimentRecord, StrategySignal,
     Symbol, SystemLog, SystemState, ToolPermission, Trade, TradePlan,
 )
+
+logger = logging.getLogger("database.repo")
 
 
 # ================================================================
@@ -396,16 +399,25 @@ def get_etf_metadata(symbols: Optional[List[str]] = None) -> Dict[str, Dict[str,
         }
 
 
-def get_etf_history_symbols(end: date, min_bars: int = 20) -> List[str]:
-    """ETF master available locally by an historical date, including delisted rows."""
+def get_etf_history_symbols(end: date, min_bars: int = 20,
+                            recent_days: Optional[int] = None) -> List[str]:
+    """ETF master available locally by an historical date, including delisted rows.
+
+    recent_days: 仅返回最后K线在 end 之前 N 个自然日内有数据的标的
+    (回测/选池用, 避免行情停在几周前的僵尸标的进入候选池)。
+    """
     with get_session() as s:
-        rows = s.query(DailyBar.symbol).join(
+        q = s.query(DailyBar.symbol).join(
             Symbol, Symbol.symbol == DailyBar.symbol).filter(
                 DailyBar.trade_date <= end,
                 Symbol.asset_type == "etf",
             ).group_by(DailyBar.symbol).having(
                 func.count(func.distinct(DailyBar.trade_date)) >= max(int(min_bars), 1)
-            ).order_by(DailyBar.symbol).all()
+            )
+        if recent_days:
+            cutoff = end - timedelta(days=max(int(recent_days), 1))
+            q = q.having(func.max(DailyBar.trade_date) >= cutoff)
+        rows = q.order_by(DailyBar.symbol).all()
         return [str(r[0]) for r in rows]
 
 
@@ -1128,6 +1140,182 @@ def get_account_snapshots(account_id: str = "PA-001", limit: int = 1000) -> List
     with get_session() as s:
         return list(s.query(AccountSnapshot).filter_by(account_id=account_id)
                     .order_by(AccountSnapshot.snapshot_time).limit(limit).all())
+
+
+# ================================================================
+# 模拟盘运行记录归档 / 重置
+# ================================================================
+
+_archive_table_ready = False
+
+
+def ensure_paper_archive_table():
+    """确保归档表存在(兼容未重跑 init-db 的升级场景, 进程内只检查一次)。"""
+    global _archive_table_ready
+    if _archive_table_ready:
+        return
+    try:
+        from database.db_session import get_engine
+        PaperRunArchive.__table__.create(bind=get_engine(), checkfirst=True)
+    except Exception as exc:
+        logger.warning("归档表检查失败(可能已存在): %s", exc)
+    _archive_table_ready = True
+
+
+def collect_paper_run_data(account_id: str = "PA-001") -> Dict[str, Any]:
+    """一次性读取某账户当前一轮的全部交易数据(重置前归档用)。
+
+    返回 dict: account/positions/orders/trades/snapshots/confirmations。
+    同一会话内读取, 保证归档数据彼此一致。
+    """
+    with get_session() as s:
+        acc = s.get(Account, account_id)
+        positions = list(s.query(Position).filter_by(account_id=account_id).all())
+        orders = list(s.query(Order).filter_by(account_id=account_id)
+                      .order_by(Order.created_at).all())
+        order_ids = [o.order_id for o in orders]
+        trades = []
+        if order_ids:
+            trades = list(s.query(Trade).filter(Trade.order_id.in_(order_ids))
+                          .order_by(Trade.trade_time).all())
+        snaps = list(s.query(AccountSnapshot).filter_by(account_id=account_id)
+                     .order_by(AccountSnapshot.snapshot_time).all())
+        confirms = list(s.query(HumanConfirmation)
+                        .order_by(HumanConfirmation.created_at).all())
+
+        def _order_view(o: Order) -> Dict[str, Any]:
+            return {
+                "order_id": o.order_id, "order_intent_id": o.order_intent_id,
+                "plan_id": o.plan_id, "symbol": o.symbol, "name": o.name,
+                "side": o.side, "order_type": o.order_type, "price": o.price,
+                "qty": o.qty, "filled_qty": o.filled_qty,
+                "remaining_qty": o.remaining_qty, "avg_fill_price": o.avg_fill_price,
+                "status": o.status, "fee": o.fee, "source": o.source,
+                "submit_time": str(o.submit_time or ""),
+                "filled_time": str(o.filled_time or ""),
+                "cancel_time": str(o.cancel_time or ""),
+                "reject_reason": o.reject_reason,
+                "created_at": str(o.created_at or ""),
+            }
+
+        def _trade_view(t: Trade) -> Dict[str, Any]:
+            return {
+                "trade_id": t.trade_id, "order_id": t.order_id,
+                "symbol": t.symbol, "name": t.name, "side": t.side,
+                "price": t.price, "qty": t.qty, "fee": t.fee, "pnl": t.pnl,
+                "trade_time": str(t.trade_time or ""),
+            }
+
+        def _snap_view(x: AccountSnapshot) -> Dict[str, Any]:
+            return {
+                "snapshot_time": str(x.snapshot_time or ""),
+                "cash": x.cash, "market_value": x.market_value,
+                "total_asset": x.total_asset, "pnl": x.pnl, "source": x.source,
+            }
+
+        def _confirm_view(c: HumanConfirmation) -> Dict[str, Any]:
+            return {
+                "confirm_id": c.confirm_id, "plan_id": c.plan_id,
+                "trace_id": c.trace_id, "symbol": c.symbol, "action": c.action,
+                "amount": c.amount, "risk_level": c.risk_level,
+                "status": c.status, "reason": c.reason,
+                "created_at": str(c.created_at or ""),
+                "decided_at": str(c.decided_at or ""),
+                "decided_by": c.decided_by, "decision_note": c.decision_note,
+            }
+
+        return {
+            "account": {
+                "account_id": acc.account_id, "account_type": acc.account_type,
+                "cash": acc.cash, "frozen_cash": acc.frozen_cash,
+                "market_value": acc.market_value, "total_asset": acc.total_asset,
+                "total_pnl": acc.total_pnl, "day_pnl": acc.day_pnl,
+                "total_fee": acc.total_fee, "init_cash": acc.init_cash,
+                "status": acc.status, "update_time": str(acc.update_time or ""),
+            } if acc else {},
+            "positions": [{
+                "symbol": p.symbol, "name": p.name, "total_qty": p.total_qty,
+                "available_qty": p.available_qty, "frozen_qty": p.frozen_qty,
+                "today_buy_qty": p.today_buy_qty, "cost_price": p.cost_price,
+                "latest_price": p.latest_price, "peak_price": p.peak_price,
+                "market_value": p.market_value, "pnl": p.pnl, "pnl_pct": p.pnl_pct,
+                "buy_date": str(p.buy_date or ""),
+            } for p in positions],
+            "orders": [_order_view(o) for o in orders],
+            "trades": [_trade_view(t) for t in trades],
+            "snapshots": [_snap_view(x) for x in snaps],
+            "confirmations": [_confirm_view(c) for c in confirms],
+        }
+
+
+def save_paper_run_archive(data: Dict[str, Any]) -> PaperRunArchive:
+    ensure_paper_archive_table()
+    with get_session() as s:
+        if not data.get("archive_id"):
+            data["archive_id"] = gen_id("ARCH")
+        row = PaperRunArchive(**data)
+        s.add(row)
+        s.flush()
+        s.expunge(row)
+    return row
+
+
+def list_paper_run_archives(account_id: Optional[str] = "PA-001",
+                            limit: int = 50) -> List[PaperRunArchive]:
+    ensure_paper_archive_table()
+    with get_session() as s:
+        q = s.query(PaperRunArchive)
+        if account_id:
+            q = q.filter_by(account_id=account_id)
+        rows = list(q.order_by(PaperRunArchive.created_at.desc())
+                    .limit(limit).all())
+        for r in rows:
+            s.expunge(r)
+        return rows
+
+
+def get_paper_run_archive(archive_id: str) -> Optional[PaperRunArchive]:
+    ensure_paper_archive_table()
+    with get_session() as s:
+        row = s.query(PaperRunArchive).filter_by(archive_id=archive_id).first()
+        if row:
+            s.expunge(row)
+        return row
+
+
+def delete_paper_run_archive(archive_id: str) -> bool:
+    ensure_paper_archive_table()
+    with get_session() as s:
+        n = s.query(PaperRunArchive).filter_by(archive_id=archive_id).delete()
+        return bool(n)
+
+
+def purge_paper_account_data(account_id: str = "PA-001") -> Dict[str, int]:
+    """重置账户前清空交易数据(订单/成交/持仓/净值快照/待确认单)。
+
+    在单事务内完成: 先删成交(引用订单), 再删订单/持仓/快照/确认单。
+    返回各类删除条数。审计日志(audit_logs)不删除, 保证可追溯。
+    """
+    with get_session() as s:
+        order_ids = [oid for (oid,) in s.query(Order.order_id)
+                     .filter(Order.account_id == account_id).all()]
+        n_trades = 0
+        if order_ids:
+            n_trades = s.query(Trade).filter(Trade.order_id.in_(order_ids)).delete(
+                synchronize_session=False)
+        n_orders = s.query(Order).filter_by(account_id=account_id).delete()
+        n_positions = s.query(Position).filter_by(account_id=account_id).delete()
+        n_snaps = s.query(AccountSnapshot).filter_by(account_id=account_id).delete()
+        # 待确认单: 重置后无对应持仓/资金, 一律作废(保留历史记录不删)
+        n_confirms = s.query(HumanConfirmation).filter(
+            HumanConfirmation.status.in_(("PENDING", "CREATED"))).update(
+            {"status": "CANCELLED", "decided_by": "paper-reset",
+             "decision_note": "模拟盘重置, 确认单自动作废",
+             "decided_at": datetime.now()},
+            synchronize_session=False)
+        return {"trades": int(n_trades or 0), "orders": int(n_orders or 0),
+                "positions": int(n_positions or 0), "snapshots": int(n_snaps or 0),
+                "confirmations": int(n_confirms or 0)}
 
 
 # ================================================================

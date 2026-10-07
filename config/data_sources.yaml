@@ -13,14 +13,18 @@
 # =========================================================
 
 sources:
+  # 2026-09 修复: 历史日K主源切换为新浪(直连, 单次可拉1023根≈4年, ETF/股票/指数
+  # 通用), 腾讯 ifzq 因高频访问会被 501 反爬拦截(仍保留为备源, 恢复后其前复权
+  # 数据优先级更高时可通过调整此顺序启用); baostock/akshare 兜底。
+  # 原主源 baostock 对大量ETF无数据且慢, 返回部分数据后备源永不触发,
+  # 造成"很多标的行情缺失/停在几周前"。
   daily_bar:
-    primary: baostock
-    backups: [akshare, tencent, sina]
-  # 回测/历史数据的缺失日期逐源补齐。腾讯对当日和最近交易日最稳定，
-  # 因此与多年历史链分开配置并放在第一位。
+    primary: sina
+    backups: [tencent, baostock, akshare]
+  # 回测/历史数据的缺失日期逐源补齐
   daily_gap:
-    primary: tencent
-    backups: [sina, baostock, akshare]
+    primary: sina
+    backups: [tencent, baostock, akshare]
   minute_bar:
     primary: tencent
     backups: [baostock, akshare]
@@ -45,9 +49,10 @@ sources:
   trade_calendar:
     primary: baostock
     backups: [akshare, tushare]
+  # 全市场ETF列表: 东财直连 clist(每页500只, 约4次请求) → 新浪ETF节点 → akshare
   etf_info:
-    primary: akshare
-    backups: []
+    primary: eastmoney
+    backups: [sina, akshare]
   fund_flow:
     primary: eastmoney
     backups: [akshare]

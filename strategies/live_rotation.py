@@ -73,6 +73,44 @@ class _LiveBrokerView:
                    for s in self.positions)
 
 
+def _trading_days_since(start_iso: str) -> int:
+    """距指定日期(含当日)经过的交易日数; 日历不可用时按 5/7 估算。"""
+    try:
+        d0 = date.fromisoformat(str(start_iso)[:10])
+    except ValueError:
+        return 10 ** 6
+    today = business_today()
+    if d0 >= today:
+        return 0
+    try:
+        from data_service.market_data_service import get_market_service
+        cal = get_market_service().get_trade_calendar(d0, today)
+        if cal:
+            return max(0, len(cal) - 1)
+    except Exception:
+        pass
+    return int((today - d0).days * 5 / 7)
+
+
+def _load_preset_params(name: str) -> Dict[str, Any]:
+    """读取指定命名策略的参数(动态池快照格式, 不含 universe_mode)。"""
+    if not name:
+        return {}
+    try:
+        import json
+        from core.config import ROOT_DIR
+        store = json.loads((ROOT_DIR / "data" / "strategy_presets.json")
+                           .read_text(encoding="utf-8")) or {}
+        p = dict((store.get("presets") or {}).get(name) or {})
+        if p.get("universe_mode") != "dynamic_etf":
+            return {}
+        p.pop("universe_mode", None)
+        return p
+    except Exception as exc:
+        logger.warning("读取策略预设失败 %s: %s", name, exc)
+        return {}
+
+
 def _paper_rotation_universe(watch: List[Dict[str, Any]],
                              held_symbols: List[str]) -> tuple[List[str], Dict[str, str], Dict[str, str]]:
     """Build the exact tradable paper universe; retained holdings stay sellable."""
@@ -181,14 +219,52 @@ def run_live_rotation(broker=None, notify: bool = True,
             pass
     # A selected named strategy is authoritative. Optional config params are a
     # fallback only when no named paper preset is active.
-    preset_name = active_rotation_preset_name()
+    # 市场状态自适应: 开启 regime_switch 时, 按指数状态选择映射策略(默认关闭)。
+    active_name = active_rotation_preset_name()
+    preset_name = active_name
+    regime_info = None
+    if cfg.get("regime_switch", {}).get("enabled"):
+        try:
+            from strategies.market_regime import resolve_preset_for_regime
+            resolved = resolve_preset_for_regime(active_name)
+            regime_info = {"regime": resolved.get("regime"),
+                           "reason": resolved.get("reason"),
+                           "mapped": resolved.get("mapped"),
+                           "manual": resolved.get("manual", False)}
+            target = resolved.get("preset") if resolved.get("mapped") else active_name
+            # 最小切换间隔(交易日): 防状态横跳导致的来回换策略
+            min_days = int(cfg.get("regime_switch", {}).get("min_switch_days", 0) or 0)
+            stored = repo.get_system_state("rotation_regime") or {}
+            last_preset = str(stored.get("selected_preset") or "")
+            switched_on = str(stored.get("switched_on") or "")
+            if (min_days > 0 and last_preset and target != last_preset and switched_on
+                    and not regime_info.get("manual")
+                    and _trading_days_since(switched_on) < min_days):
+                regime_info["reason"] = (
+                    f"{regime_info['reason']} | 距上次切换不足{min_days}个交易日, "
+                    f"保持 {last_preset}")
+                target = last_preset
+                regime_info["mapped"] = True
+            if target:
+                preset_name = target
+            logger.info("市场状态切换: %s (active=%s → %s)",
+                        regime_info.get("reason"), active_name, preset_name)
+        except Exception as exc:
+            logger.warning("市场状态切换失败, 使用当前策略: %s", exc)
+            regime_info = {"regime": None, "reason": f"切换失败: {exc}", "mapped": False}
     if dynamic_cfg["enabled"] and not preset_name:
         return {"skipped": [
             "动态ETF池已启用，但尚未选择经动态池重新回测的兼容策略；已禁止自动开仓"
         ], "universe_snapshot": dynamic_snapshot}
     signal_params = ({} if preset_name else dict(cfg.get("params") or {}))
+    if preset_name and preset_name != active_name:
+        signal_params = _load_preset_params(preset_name) or signal_params
     effective_params = resolve_rotation_params(
-        signal_params, use_live_preset=True)
+        signal_params, use_live_preset=False)
+    if preset_name == active_name:
+        # 与旧行为一致: active_paper 叠加 config 默认值
+        effective_params = resolve_rotation_params(
+            signal_params, use_live_preset=True)
     param_signature = hashlib.sha256(json.dumps(
         effective_params, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
@@ -229,6 +305,44 @@ def run_live_rotation(broker=None, notify: bool = True,
         repo.update_system_state(
             "rotation_rebalance_state", lambda state: (
                 state.clear(), state.update(persisted_rebalance_state)))
+    if not dry_run and regime_info is not None:
+        stored = repo.get_system_state("rotation_regime") or {}
+        prev_preset = str(stored.get("selected_preset") or "")
+        switch_day = (str(stored.get("switched_on") or business_today().isoformat())
+                      if stored.get("selected_preset") == preset_name
+                      else business_today().isoformat())
+        repo.update_system_state("rotation_regime", lambda state: (
+            state.clear(), state.update({
+                "regime": (regime_info or {}).get("regime") or {},
+                "selected_preset": preset_name,
+                "previous_preset": prev_preset,
+                "active_preset": active_name,
+                "manual": bool((regime_info or {}).get("manual")),
+                "switched_on": switch_day,
+                "reason": (regime_info or {}).get("reason", ""),
+                "updated": business_today().isoformat(),
+            })))
+        # 切换历史: 状态或策略变化时记录一条(供页面回看"当时用的什么策略")
+        try:
+            from strategies.market_regime import append_history, get_history
+            r_state = ((regime_info or {}).get("regime") or {}).get("state")
+            last = (get_history(1) or [{}])[-1]
+            if (last.get("preset") != preset_name or last.get("state") != r_state
+                    or last.get("date") != business_today().isoformat()):
+                append_history({
+                    "time": business_today().isoformat(),
+                    "state": r_state,
+                    "raw_state": ((regime_info or {}).get("regime") or {}).get("raw_state"),
+                    "data_asof": ((regime_info or {}).get("regime") or {}).get("asof"),
+                    "preset": preset_name,
+                    "previous_preset": prev_preset,
+                    "manual": bool((regime_info or {}).get("manual")),
+                    "reason": (regime_info or {}).get("reason", ""),
+                    "index_close": ((regime_info or {}).get("regime") or {}).get("close"),
+                    "mom20": ((regime_info or {}).get("regime") or {}).get("mom20"),
+                })
+        except Exception as exc:
+            logger.warning("切换历史记录失败: %s", exc)
 
     if dry_run:
         # 正式信号优先；持仓随后补入。即使持仓本轮无交易，也需要在收盘前
@@ -248,6 +362,8 @@ def run_live_rotation(broker=None, notify: bool = True,
             "skipped": [],
             "universe_snapshot": dynamic_snapshot,
             "dry_run": True,
+            "preset": preset_name,
+            "regime": regime_info,
         }
 
     orders = []
@@ -334,7 +450,8 @@ def run_live_rotation(broker=None, notify: bool = True,
         except Exception as exc:
             logger.warning("轮动通知发送失败: %s", exc)
     return {"signals": signals, "orders": orders, "skipped": skipped,
-            "universe_snapshot": dynamic_snapshot}
+            "universe_snapshot": dynamic_snapshot,
+            "preset": preset_name, "regime": regime_info}
 
 
 def _strategy_hard_gate(broker, symbol: str, name: str, side: str, qty: int,

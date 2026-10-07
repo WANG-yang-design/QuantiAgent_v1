@@ -823,6 +823,8 @@ def get_system_mode():
         "trade_mode": cfg.get("system.trade_mode", "paper"),          # paper/live/backtest
         "broker_adapter": cfg.get("broker.adapter", "paper"),         # paper/qmt/ptrade
         "live_connected": False,                                       # V1 实盘未接入
+        "account_id": acc.get("account_id") or str(
+            cfg.get("paper_account.account_id", "PA-001")),
         "account_status": acc.get("status", "normal"),                 # normal/paused/readonly
         "circuit": {"paused": cb.is_paused(), "reason": cb.paused_reason()},
         "today": today_info,
@@ -833,6 +835,7 @@ def get_system_mode():
             "day_pnl": acc.get("day_pnl"),
             "total_pnl": acc.get("total_pnl"),
             "total_return": acc.get("total_return"),
+            "init_cash": acc.get("init_cash"),
         },
         "confirmations": confirms,
     }
@@ -889,6 +892,8 @@ def _run_backtest_task(run_id: str, body: Dict[str, Any]):
             symbols = _repo.get_etf_history_symbols(
                 date.fromisoformat(body["end"]),
                 min_bars=max(20, dynamic_cfg["liquidity_window"]),
+                # 排除行情停在数周前的僵尸标的(修复: 回测大量缺失/用陈旧价交易)
+                recent_days=15,
             )
             if len(symbols) < dynamic_cfg["min_candidates"]:
                 raise ValueError(
@@ -1629,24 +1634,36 @@ def get_index_overview(response: Response):
 @router.get("/market/diagnosis", dependencies=[Depends(require_auth)])
 def get_market_diagnosis(refresh: int = 0):
     """
-    牛熊诊断(规则为主, 结果落库, 默认1小时更新):
-    基于四大指数 20日动量/均线排列/回撤 → 判断 risk_on/neutral/risk_off + 建议。
-    refresh=1 时强制重新计算; 否则优先返回库内1小时内的诊断。
-    """
-    from database import repository as _repo
-    if refresh != 1:
-        cached = _repo.get_latest_market_diagnostic(max_age_minutes=60)
-        if cached:
-            return cached
+    牛熊诊断(规则为主, 结果落库, 每日收盘口径一次):
+    基于三大指数 20日动量/均线排列/回撤 → 判断 risk_on/neutral/risk_off + 建议。
 
+    修复: 原实现用实时指数K线(含当日盘中未收盘K), 盘中价格波动会让状态在
+    一天内来回切换(用户反馈"下跌/中性/上升"乱跳)。现只使用**已完成收盘**的
+    日K, 并按数据截止日冻结(同一交易日内结果不变), 收盘后自动更新。
+    """
+    from core.timeutil import completed_daily_bars, market_closed
     from datetime import timedelta as _td
     svc = get_market_service()
     end = date.today()
     start = end - _td(days=160)
+
+    # 当前"已完成"的最新交易日(用于缓存键与展示)
+    data_asof = ""
+    try:
+        cal = svc.get_trade_calendar(end - _td(days=12), end) or []
+        done = [d for d in cal if d < end or (d == end and market_closed())]
+        data_asof = str(done[-1]) if done else str(end)
+    except Exception:
+        data_asof = str(end)
+    if refresh != 1:
+        cached = repo.get_system_state("market_diagnosis_cache") or {}
+        if cached.get("asof") == data_asof and cached.get("result"):
+            return cached["result"]
+
     detail = []
     scores = []
     for code in ["000300", "000905", "000001"]:
-        bars = svc.get_index_bars(code, start, end)
+        bars = completed_daily_bars(list(svc.get_index_bars(code, start, end)))
         if len(bars) < 21:
             continue
         closes = [b["close"] for b in bars]
@@ -1665,7 +1682,8 @@ def get_market_diagnosis(refresh: int = 0):
         scores.append(s)
         detail.append({"code": code, "mom20": round(mom20, 4),
                        "above_ma20": above_ma, "drawdown60": round(drawdown, 4),
-                       "score": s})
+                       "score": s,
+                       "asof": str(bars[-1].get("trade_date"))[:10]})
     total = sum(scores)
     if total >= 2:
         state, label, advice = "risk_on", "偏牛/进攻", "指数趋势向上, 可保持较高仓位, 优先强势板块(动量排名靠前)。"
@@ -1675,10 +1693,18 @@ def get_market_diagnosis(refresh: int = 0):
         state, label, advice = "neutral", "震荡/观望", "多空信号交织, 建议中性仓位, 等待方向明确, 谨慎追涨杀跌。"
     result = {"state": state, "label": label, "advice": advice,
               "score": total, "detail": detail,
+              "data_asof": data_asof,
               "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    # 落库(历史可查)
+    # 冻结当日结果 + 落库(历史可查, 同一收盘日只记一条)
     try:
-        _repo.save_market_diagnostic({
+        repo.update_system_state("market_diagnosis_cache", lambda state_: (
+            state_.clear(),
+            state_.update({"asof": data_asof, "result": result})))
+    except Exception as exc:
+        logger.warning("市场诊断缓存写入失败: %s", exc)
+    try:
+        _repo_ = repo
+        _repo_.save_market_diagnostic({
             "state": state, "label": label, "advice": advice,
             "score": total, "detail": detail,
         })
@@ -1719,30 +1745,31 @@ def get_stock_spot(limit: int = 100):
         except Exception as exc:
             logger.debug("热门股票实时价刷新失败: %s", exc)
         return _clean({"stocks": stocks, "cached": True})
-    import akshare as ak
+    # 数据源链: 东财直连clist(快) → 新浪榜单 → baostock名称兜底
+    # 修复: 原实现依赖 akshare(东财分页, 本机 RemoteDisconnected)且无有效备源,
+    # 页面长期"热门股票加载失败"。
+    stocks: List[Dict[str, Any]] = []
     try:
-        df = ak.stock_zh_a_spot_em()
-        if "成交额" in df.columns:
-            df = df.sort_values("成交额", ascending=False)
-        stocks = [
-            {"symbol": str(r["代码"]), "name": str(r["名称"]),
-             "asset_type": "stock",
-             "latest_price": float(r["最新价"] or 0),
-             "change_pct": float(r["涨跌幅"] or 0),
-             "amount": float(r["成交额"] or 0) if "成交额" in df.columns else 0}
-            for _, r in df.head(500).iterrows()]
+        from data_sources.eastmoney_client import EastMoneyClient
+        stocks = EastMoneyClient().get_stock_spot(limit=500)
+    except Exception as exc:
+        logger.warning("热门股票(东财)获取失败, 尝试新浪榜单: %s", exc)
+    if not stocks:
+        try:
+            from data_sources.sina_client import SinaClient
+            stocks = SinaClient().get_stock_rank(limit=100)
+        except Exception as exc:
+            logger.warning("热门股票(新浪)获取失败, 回退代码表: %s", exc)
+    if stocks:
         _stock_spot_cache = stocks
         _stock_spot_cache_ts = now
         return _clean({"stocks": stocks[:limit], "cached": False})
-    except Exception as exc:
-        logger.warning("股票列表获取失败(回退baostock): %s", exc)
-        # 兜底: baostock 全量代码+名称(无行情, 仅供搜索/看名称)
-        fallback = _stock_spot_cache or _baostock_stock_names()
-        if fallback:
-            _stock_spot_cache = fallback
-            _stock_spot_cache_ts = now
-        return _clean({"stocks": fallback[:limit] if fallback else [],
-                       "error": "股票列表数据源暂不可用", "fallback": True})
+    fallback = _stock_spot_cache or _baostock_stock_names()
+    if fallback:
+        _stock_spot_cache = fallback
+        _stock_spot_cache_ts = now
+    return _clean({"stocks": fallback[:limit] if fallback else [],
+                   "error": "股票列表数据源暂不可用", "fallback": True})
 
 
 def _baostock_stock_names() -> List[Dict[str, Any]]:
@@ -2090,11 +2117,13 @@ def apply_strategy_preset_paper(name: str):
 # 13.5 账户分析(日报/周报/月报/年报 + 单标的统计 + 基准对比)
 # ================================================================
 @router.get("/account/analysis", dependencies=[Depends(require_auth)])
-def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
+def get_account_analysis(period: str = "week", account_id: str = ""):
     """账户分析: period=day/week/month/year。
     返回区间净值曲线、沪深300基准、账户统计、单标的统计、成交明细。"""
     from reports.report_generator import get_report_generator
     rg = get_report_generator()
+    if not account_id:
+        account_id = str(get_settings().get("paper_account.account_id", "PA-001"))
     if period not in ("day", "week", "month", "year"):
         raise HTTPException(status_code=400, detail="period 应为 day/week/month/year")
     start, end = rg._period_bounds(period, date.today())
@@ -2125,7 +2154,7 @@ def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
     bench_points = [{"time": t["time"][:10], "value": bench_map.get(t["time"][:10])}
                     for t in eq_curve]
 
-    # 账户统计
+    # 账户统计(全部本地数据, 不再发起网络请求 —— 修复账户分析页加载慢)
     snap_stats = rg._account_snapshot_stats(start, end, account_id)
     trades = repo.get_trades(start=start_dt, end=end_dt, account_id=account_id)
     realized = sum(float(t.pnl or 0) for t in trades if t.pnl is not None)
@@ -2138,6 +2167,25 @@ def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
     if snap_stats.get("start_asset"):
         period_ret = round(total_asset / float(snap_stats["start_asset"]) - 1, 4)
     bench_ret = (bench_curve[-1] - 1) if bench_curve else None
+
+    # 最大回撤: 与页面净值曲线同一序列(含当前资产)。
+    # 修复: 原值只统计区间内快照, 不含"现在"这个点, 图上跌3.5%却显示1.15%。
+    all_snaps = repo.get_account_snapshots(account_id=account_id, limit=100000)
+    curve_assets = [float(s.total_asset or 0) for s in all_snaps
+                    if start <= s.snapshot_time.date() <= end and float(s.total_asset or 0) > 0]
+    if total_asset > 0 and (not curve_assets or abs(curve_assets[-1] - total_asset) > 0.01):
+        curve_assets.append(total_asset)
+    max_dd = 0.0
+    peak = 0.0
+    for v in curve_assets:
+        peak = max(peak, v)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - v) / peak)
+
+    # 每日盈亏(净值序列 + 当日成交) —— 用户要求可见每天的盈亏
+    daily_pnl = _build_daily_pnl(all_snaps, start, end, total_asset, account_id)
+    # 历史标的盈亏(含已清仓) —— 曾持仓过的标的也要能查到盈亏
+    history_symbols = _build_history_symbols(account_id, positions)
 
     symbol_stats = rg._symbol_stats(start_dt, end_dt, account_id, total_asset)
     # 区间外但当前持有的标的也纳入(账户全貌)
@@ -2182,7 +2230,7 @@ def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
             "period_return": period_ret,
             "benchmark_return": bench_ret,
             "excess_return": (period_ret - bench_ret) if (period_ret is not None and bench_ret is not None) else None,
-            "max_drawdown": snap_stats.get("max_drawdown"),
+            "max_drawdown": round(max_dd, 4),
             "trade_count": len(trades),
             "realized_pnl": round(realized, 2),
             "win_rate": round(wins / (wins + losses), 4) if (wins + losses) else None,
@@ -2190,6 +2238,8 @@ def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
         },
         "equity_curve": eq_curve,
         "benchmark_curve": bench_points,
+        "daily_pnl": daily_pnl,
+        "history_symbols": history_symbols,
         "symbol_stats": symbol_stats,
         "trades": [{"trade_time": str(t.trade_time)[:19], "symbol": t.symbol,
                     "name": t.name or "", "side": t.side, "price": t.price,
@@ -2197,6 +2247,109 @@ def get_account_analysis(period: str = "week", account_id: str = "PA-001"):
                    for t in trades[-100:]],
         "positions": positions,
     })
+
+
+def _build_daily_pnl(snaps, start: date, end: date, current_asset: float,
+                     account_id: str = "PA-001"):
+    """按交易日聚合每日盈亏: 净值日变化 + 当日成交笔数/已实现盈亏。
+
+    账户无出入金时, 每日盈亏 = 当日净值 - 前一交易日净值。期初一日用区间
+    开始前最后一个快照作为基准。"""
+    by_day = {}
+    for s in snaps:
+        d = s.snapshot_time.date()
+        if d <= end:
+            by_day[d] = float(s.total_asset or 0)
+    if current_asset > 0:
+        by_day[end] = current_asset
+    days = sorted(by_day)
+    out = []
+    for i, d in enumerate(days):
+        if d < start:
+            continue
+        prev = by_day[days[i - 1]] if i > 0 else None
+        asset = by_day[d]
+        pnl = round(asset - prev, 2) if prev else None
+        out.append({
+            "date": str(d),
+            "total_asset": round(asset, 2),
+            "day_pnl": pnl,
+            "day_pnl_pct": round(pnl / prev, 6) if (prev and pnl is not None) else None,
+        })
+    # 当日成交统计(按成交时间归日)
+    try:
+        trades = repo.get_trades(
+            start=datetime.combine(start, datetime.min.time()),
+            end=datetime.combine(end, datetime.max.time()),
+            account_id=account_id)
+        trade_by_day = {}
+        for t in trades:
+            d = str(t.trade_time)[:10]
+            item = trade_by_day.setdefault(d, {"trade_count": 0, "realized_pnl": 0.0,
+                                               "fee": 0.0})
+            item["trade_count"] += 1
+            item["fee"] += float(t.fee or 0)
+            if t.pnl is not None:
+                item["realized_pnl"] += float(t.pnl)
+        for row in out:
+            item = trade_by_day.get(row["date"], {})
+            row["trade_count"] = int(item.get("trade_count", 0))
+            row["realized_pnl"] = round(float(item.get("realized_pnl", 0.0)), 2)
+            row["fee"] = round(float(item.get("fee", 0.0)), 2)
+    except Exception:
+        pass
+    return out[-120:]
+
+
+def _build_history_symbols(account_id: str, positions: list):
+    """全部历史标的盈亏(含已清仓): 买卖次数/已实现盈亏/手续费/胜率 + 当前持仓。"""
+    from core.symbol_names import resolve_symbol_name
+    try:
+        trades = repo.get_trades(account_id=account_id, limit=100000)
+    except Exception:
+        trades = []
+    pos_map = {p["symbol"]: p for p in (positions or [])}
+    by = {}
+    for t in trades:
+        st = by.setdefault(t.symbol, {
+            "symbol": t.symbol, "name": t.name or resolve_symbol_name(t.symbol),
+            "buy_count": 0, "sell_count": 0, "realized_pnl": 0.0,
+            "fee": 0.0, "wins": 0, "losses": 0, "first_trade": "", "last_trade": "",
+        })
+        when = str(t.trade_time)[:19]
+        if not st["first_trade"] or when < st["first_trade"]:
+            st["first_trade"] = when
+        if not st["last_trade"] or when > st["last_trade"]:
+            st["last_trade"] = when
+        st["fee"] += float(t.fee or 0)
+        if t.side == "BUY":
+            st["buy_count"] += 1
+        else:
+            st["sell_count"] += 1
+            if t.pnl is not None:
+                st["realized_pnl"] += float(t.pnl)
+                if t.pnl > 0:
+                    st["wins"] += 1
+                elif t.pnl < 0:
+                    st["losses"] += 1
+    out = []
+    for sym, st in by.items():
+        st["realized_pnl"] = round(st["realized_pnl"], 2)
+        st["fee"] = round(st["fee"], 2)
+        st["win_rate"] = round(st["wins"] / (st["wins"] + st["losses"]), 4) \
+            if (st["wins"] + st["losses"]) else None
+        p = pos_map.get(sym)
+        st["position"] = ({
+            "total_qty": p.get("total_qty", 0),
+            "cost_price": p.get("cost_price", 0),
+            "latest_price": p.get("latest_price", 0),
+            "pnl": p.get("pnl", 0),
+            "pnl_pct": p.get("pnl_pct", 0),
+        } if p else None)
+        st["closed"] = p is None and st["sell_count"] > 0
+        out.append(st)
+    out.sort(key=lambda x: x["realized_pnl"], reverse=True)
+    return out
 
 
 @router.get("/reports/list", dependencies=[Depends(require_auth)])
@@ -2270,3 +2423,230 @@ def get_risk_limits():
         "confirmation_policy": cfg.get("confirmation_policy", {}),
         "position_monitor": cfg.get("position_monitor", {}),
     }
+
+
+# ================================================================
+# 14.5 市场状态与自适应策略
+# ================================================================
+@router.get("/strategy/regime", dependencies=[Depends(require_auth)])
+def strategy_regime():
+    """市场状态识别 + regime switch 当前配置/映射/切换历史(供页面展示与编辑)。"""
+    from strategies.market_regime import (
+        get_history, resolve_preset_for_regime, runtime_config,
+    )
+    from strategies.rotation_executor import active_rotation_preset_name
+    active = active_rotation_preset_name()
+    resolved = resolve_preset_for_regime(active)
+    stored = {}
+    try:
+        stored = repo.get_system_state("rotation_regime") or {}
+    except Exception:
+        pass
+    # 可选映射的预设(动态池策略)
+    preset_names = []
+    try:
+        store = _preset_store()
+        preset_names = [n for n, p in (store.get("presets") or {}).items()
+                        if (p or {}).get("universe_mode") == "dynamic_etf"]
+    except Exception:
+        pass
+    return {
+        "active_preset": active,
+        "selected_preset": resolved.get("preset"),
+        "mapped": bool(resolved.get("mapped")),
+        "manual": bool(resolved.get("manual")),
+        "reason": resolved.get("reason", ""),
+        "regime": resolved.get("regime") or {},
+        "config": runtime_config(),
+        "presets": sorted(preset_names),
+        "history": get_history(50),
+        "last_rotation": stored,
+    }
+
+
+@router.put("/strategy/regime/config", dependencies=[Depends(require_auth)])
+def update_strategy_regime(body: dict):
+    """修改自适应切换配置(写入运行时覆盖, 立即生效, 无需重启)。"""
+    from strategies.market_regime import runtime_config, save_runtime_config
+    try:
+        cfg = save_runtime_config(body or {})
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"配置非法: {exc}")
+    AuditLogger.instance().log("regime_switch_config_changed", "web", {
+        k: v for k, v in (body or {}).items()})
+    return {"ok": True, "config": cfg}
+
+
+@router.post("/strategy/regime/config/reset", dependencies=[Depends(require_auth)])
+def reset_strategy_regime():
+    """清除运行时覆盖, 回到 config.yaml 默认。"""
+    from strategies.market_regime import clear_runtime_config
+    return {"ok": True, "config": clear_runtime_config()}
+
+
+@router.get("/strategy/universe", dependencies=[Depends(require_auth)])
+def strategy_universe():
+    """当前动态候选池透明化: 母池规模/本期成员/入选理由/与持仓的关系。"""
+    from strategies.dynamic_etf_universe import (
+        dynamic_pool_config, latest_paper_universe,
+    )
+    from core.timeutil import today as biz_today
+    today = biz_today()
+    cfg = dynamic_pool_config()
+    mother_count = 0
+    try:
+        mother_count = len(repo.get_etf_history_symbols(
+            today, min_bars=20, recent_days=15))
+    except Exception:
+        pass
+    snap = None
+    try:
+        snap = latest_paper_universe(today)
+    except Exception:
+        snap = None
+    holdings = set()
+    try:
+        holdings = {p.symbol for p in repo.get_positions()}
+    except Exception:
+        pass
+    members = []
+    if snap:
+        for m in (snap.get("members") or []):
+            sym = str(m.get("symbol"))
+            members.append({**m, "holding": sym in holdings})
+    return {
+        "date": str(today),
+        "mother_count": mother_count,
+        "config": cfg,
+        "snapshot": {
+            "snapshot_id": (snap or {}).get("snapshot_id", ""),
+            "effective_date": str((snap or {}).get("effective_date", "")),
+            "asof_date": str((snap or {}).get("asof_date", "")),
+            "candidate_count": len(members),
+            "members": members,
+        },
+        "holdings_count": len(holdings),
+        "note": ("动态池每月生成一次(两阶段: 可交易性/完整度/波动率 → 流动性Top"
+                 f"{cfg.get('max_candidates', 40)}); 策略在池内再按动量排名持有 top_n 只"),
+    }
+
+
+# ================================================================
+# 15. 模拟盘重置 + 运行记录归档
+# ================================================================@router.get("/paper/archives", dependencies=[Depends(require_auth)])
+def list_paper_archives(limit: int = 50, account_id: str = ""):
+    """历史运行记录列表(重置前的完整快照归档)。account_id 留空=全部账户。"""
+    from paper_trading.paper_reset import _archive_view
+    rows = repo.list_paper_run_archives(
+        account_id=account_id or None, limit=min(max(int(limit), 1), 200))
+    return {"items": [_archive_view(r) for r in rows], "total": len(rows)}
+
+
+@router.get("/paper/archives/{archive_id}", dependencies=[Depends(require_auth)])
+def get_paper_archive(archive_id: str):
+    """单次运行记录详情(含持仓/订单/成交/净值明细)。"""
+    from paper_trading.paper_reset import _archive_view
+    row = repo.get_paper_run_archive(archive_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    view = _archive_view(row)
+    view["summary"] = row.summary_json or {}
+    return view
+
+
+@router.get("/paper/archives/{archive_id}/export",
+            dependencies=[Depends(require_auth)])
+def export_paper_archive(archive_id: str):
+    """下载运行记录 JSON 备份。"""
+    from fastapi.responses import FileResponse
+    row = repo.get_paper_run_archive(archive_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    from pathlib import Path as _Path
+    path = _Path(row.export_path or "")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="备份文件不存在(可能已被清理)")
+    return FileResponse(path, filename=f"{archive_id}.json",
+                        media_type="application/json")
+
+
+@router.delete("/paper/archives/{archive_id}", dependencies=[Depends(require_auth)])
+def delete_paper_archive(archive_id: str):
+    """删除一条历史运行记录(仅删除归档, 不影响当前账户)。"""
+    row = repo.get_paper_run_archive(archive_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    repo.delete_paper_run_archive(archive_id)
+    # 同步删除 JSON 备份文件(失败不影响删除结果)
+    try:
+        from pathlib import Path as _Path
+        p = _Path(row.export_path or "")
+        if p.is_file() and p.parent.name == "paper_archive":
+            p.unlink()
+    except Exception as exc:
+        logger.warning("归档备份文件删除失败 %s: %s", archive_id, exc)
+    return {"ok": True}
+
+
+@router.post("/paper/reset", dependencies=[Depends(require_auth)])
+def reset_paper(body: dict):
+    """重置模拟盘: 自动归档上一轮运行记录后清空交易数据。
+
+    安全要求: body 必须包含 {"confirm": "RESET"} 才会执行(防误触)。
+    可选: initial_cash(默认读 config.yaml), note, run_name。
+    """
+    if str((body or {}).get("confirm", "")) != "RESET":
+        raise HTTPException(status_code=400,
+                            detail='重置需显式确认: {"confirm": "RESET"}')
+    initial_cash = body.get("initial_cash")
+    if initial_cash is not None:
+        try:
+            initial_cash = float(initial_cash)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="initial_cash 必须为数字")
+    from paper_trading.paper_reset import reset_paper_account
+    from workflows.intraday_monitor_workflow import get_broker
+    try:
+        result = reset_paper_account(
+            broker=get_broker(), initial_cash=initial_cash,
+            note=str(body.get("note") or "Web重置"),
+            run_name=str(body.get("run_name") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.warning("模拟盘重置完成: %s", result.get("archive_id"))
+    return result
+
+
+# ================================================================
+# 16. 系统日志查看(日志文件列表/尾部读取/清理)
+# ================================================================
+@router.get("/logs", dependencies=[Depends(require_auth)])
+def list_logs():
+    """日志文件列表(logs/ 目录, 含各模块子目录)。"""
+    from core.logging import list_log_files
+    files = list_log_files()
+    return {"items": files, "total": len(files),
+            "total_bytes": sum(int(f.get("size") or 0) for f in files)}
+
+
+@router.get("/logs/{name:path}", dependencies=[Depends(require_auth)])
+def tail_log(name: str, lines: int = 200):
+    """读取日志文件末尾 N 行(仅允许 logs/ 内文件)。"""
+    from core.logging import read_log_tail
+    try:
+        content = read_log_tail(name, lines=min(max(int(lines), 10), 2000))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="日志文件不存在")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"日志读取失败: {exc}")
+    return {"name": name, "lines": content, "count": len(content)}
+
+
+@router.post("/logs/cleanup", dependencies=[Depends(require_auth)])
+def cleanup_logs(retention_days: int = 0):
+    """清理超期滚动日志(默认按 system 30天 / error 90天)。"""
+    from core.logging import purge_all_logs
+    result = purge_all_logs(retention_days if retention_days > 0 else None)
+    logger.info("日志清理: %s", result)
+    return {"ok": True, **result}
+

@@ -750,6 +750,8 @@ class TestBacktestReliability(unittest.TestCase):
             "min_listing_days": 60, "max_candidates": 10,
             "min_candidates": 2, "max_per_theme": 2,
             "min_avg_amount": 1, "coverage_window": 30,
+            # 合成K线的年化波动率仅~2.5%, 关闭下限避免误伤
+            "min_annualized_volatility": 0,
         })
         symbols = {s: {"name": s, "asset_type": "etf", "status": "active"}
                    for s in bars}
@@ -968,7 +970,8 @@ class TestWorkflow(unittest.TestCase):
 
         with patch("workflows.intraday_monitor_workflow.build_research_graph",
                    return_value=FakeGraph()), \
-             patch("memory.audit_log.AuditLogger.log"):
+             patch("memory.audit_log.AuditLogger.log"), \
+             patch("core.agent_switch.agent_system_enabled", return_value=True):
             result = asyncio.run(run_intraday_scan("510300", "沪深300ETF"))
         self.assertEqual(result["mode"], "SHADOW_ONLY")
         self.assertEqual(result["execution"]["status"], "OBSERVED_ONLY")
@@ -998,7 +1001,9 @@ class TestWorkflow(unittest.TestCase):
                 bars = self._offline_research_bars()
                 from unittest.mock import patch
                 with patch("workflows.research_workflow._market_env_bars",
-                           return_value=bars):
+                           return_value=bars), \
+                     patch("core.agent_switch.agent_system_enabled",
+                           return_value=True):
                     st = await run_research("510300", asof_override={
                         "bars": bars,
                         "quote": {

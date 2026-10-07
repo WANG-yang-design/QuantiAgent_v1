@@ -22,6 +22,26 @@ from database import repository as repo
 
 SELECTOR_VERSION = "etf_pool_v1"
 
+# 债券/货币类ETF(现金管理工具): 成交额巨大但没有方向性动量,
+# 若不排除会大量占用候选池名额(同主题上限对其不生效),
+# 挤压真正的方向性ETF候选 —— 实测2026年在"数据补全后"因此池子失真。
+_CASHLIKE_KEYWORDS = (
+    "货币", "日利", "添益", "短融", "国债", "政金", "金融债", "信用债",
+    "公司债", "城投债", "转债", "短债", "中债", "国开", "利率债", "债券",
+    "理财", "活钱", "现金", "融债", "科创债", "地方债", "地债", "存单",
+)
+
+
+def is_cash_like_etf(symbol: str, name: str = "") -> bool:
+    """判断是否债券/货币 ETF(现金管理类)。"""
+    text = str(name or "")
+    if any(k in text for k in _CASHLIKE_KEYWORDS):
+        return True
+    # 沪市 511xxx 以货币/债券ETF为主(名称缺失时的兜底)
+    if str(symbol).startswith("511"):
+        return True
+    return False
+
 
 def dynamic_pool_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     base = dict(get_settings().get("universe.dynamic_etf_pool", {}) or {})
@@ -37,8 +57,11 @@ def dynamic_pool_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str,
         "max_annualized_volatility": float(
             base.get("max_annualized_volatility", 0.80)),
         "min_price": float(base.get("min_price", 0.20)),
+        "min_annualized_volatility": float(
+            base.get("min_annualized_volatility", 0.05)),
         "max_per_theme": int(base.get("max_per_theme", 2)),
         "exclude_qdii": bool(base.get("exclude_qdii", False)),
+        "exclude_cash_like": bool(base.get("exclude_cash_like", True)),
         "coverage_window": int(base.get("coverage_window", 60)),
         "min_recent_coverage": float(base.get("min_recent_coverage", 0.95)),
     }
@@ -133,13 +156,25 @@ class DynamicEtfUniverseSelector:
             if coverage < cfg["min_recent_coverage"] and not is_pinned:
                 rejected[symbol] = f"近期行情覆盖率{coverage:.1%}"
                 continue
+            meta = metadata.get(symbol, {})
+            name = str(meta.get("name") or row.get("name") or "")
+            if (cfg.get("exclude_cash_like", True) and not is_pinned
+                    and is_cash_like_etf(symbol, name)):
+                rejected[symbol] = "债券/货币ETF(现金管理类, 非方向性标的)"
+                continue
             liq_bars = bars[-cfg["liquidity_window"]:]
             amounts = [float(b.get("amount") or 0) for b in liq_bars]
             avg_amount = mean(amounts) if amounts else 0.0
             closes = [float(b.get("close") or 0) for b in bars[-max(21, coverage_window):]]
             latest_price = closes[-1] if closes else 0.0
             volatility = _annualized_vol(closes)
-            meta = metadata.get(symbol, {})
+            # 波动率过低 → 债券/货币类现金管理工具(名称未命中关键词时的兜底,
+            # 正常股票/商品/宽基ETF年化波动率远高于5%)
+            if (cfg.get("min_annualized_volatility", 0.05) > 0 and not is_pinned
+                    and volatility < cfg["min_annualized_volatility"]):
+                rejected[symbol] = (f"年化波动率{volatility:.1%}过低(债券/货币类, "
+                                    "非方向性标的)")
+                continue
             if cfg["exclude_qdii"] and meta.get("is_qdii") and not is_pinned:
                 rejected[symbol] = "QDII已排除"
                 continue
@@ -152,7 +187,6 @@ class DynamicEtfUniverseSelector:
             if volatility > cfg["max_annualized_volatility"] and not is_pinned:
                 rejected[symbol] = "年化波动率过高"
                 continue
-            name = str(meta.get("name") or row.get("name") or "")
             theme = _theme_key(symbol, name, str(meta.get("tracking_index") or ""))
             ranked.append({
                 "symbol": symbol, "name": name, "theme": theme,
@@ -264,9 +298,21 @@ def paper_snapshot_is_current(snapshot: Optional[Dict[str, Any]], on_date: date,
         return False
     cfg = dynamic_pool_config(config)
     effective = date.fromisoformat(str(snapshot["effective_date"])[:10])
-    if cfg["refresh"] == "weekly":
-        return effective.isocalendar()[:2] == on_date.isocalendar()[:2]
-    return (effective.year, effective.month) == (on_date.year, on_date.month)
+    in_period = (effective.isocalendar()[:2] == on_date.isocalendar()[:2]
+                 if cfg["refresh"] == "weekly"
+                 else (effective.year, effective.month) == (on_date.year, on_date.month))
+    if not in_period:
+        return False
+    # 选池配置变更(如排除债券/货币ETF)时, 旧快照必须重建, 否则残留错误成员
+    stored = dict(snapshot.get("config") or {})
+    for key in ("max_candidates", "min_listing_days", "min_avg_amount",
+                "max_annualized_volatility", "min_annualized_volatility",
+                "min_price", "max_per_theme",
+                "exclude_qdii", "exclude_cash_like", "coverage_window",
+                "min_recent_coverage"):
+        if key in stored and stored.get(key) != cfg.get(key):
+            return False
+    return True
 
 
 def sync_snapshot_to_watchlist(snapshot: Dict[str, Any]) -> None:

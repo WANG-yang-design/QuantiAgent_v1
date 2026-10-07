@@ -6,6 +6,7 @@
   python main.py init-db                    初始化数据库
   python main.py fetch-symbols              更新ETF池
   python main.py fetch-daily --symbols ...   拉取日K
+  python main.py backfill --days 700         回填历史日K(腾讯直连, 修复回测缺失)
   python main.py scan 510300                单标的盘中分析(完整Agent链路)
   python main.py scan-pool --top 20         扫描池内标的
   python main.py backtest --start 2024-01-01 --end 2025-12-31 --symbols ...
@@ -16,6 +17,7 @@
   python main.py pause / resume             紧急按钮
   python main.py status                     系统状态
   python main.py confirm <id> [approve|reject]
+  python main.py reset-paper --yes          重置模拟盘(自动归档上一轮运行记录)
   python main.py rag <query>                RAG 检索测试
 """
 import argparse
@@ -75,6 +77,20 @@ def cmd_fetch_daily(args):
         bars, rep = svc.get_daily_bars(sym, start, end, "etf")
         print(f"  {sym}: {len(bars)} 条 ({rep.status})")
     print(f"[OK] 日K更新完成, {len(symbols)} 只")
+
+
+def cmd_backfill(args):
+    """一次性回填历史日K(腾讯直连, 前复权), 修复回测行情缺失。"""
+    from scripts.backfill_history import backfill_history
+    result = backfill_history(days=args.days, top=args.top,
+                              all_universe=args.all, symbols=args.symbols,
+                              workers=args.workers)
+    print(f"[OK] 回填完成: 目标 {result['total']} 只, 成功 {result['ok']}, "
+          f"失败 {result['failed']}, 共写入 {result['bars']} 根K线, "
+          f"耗时 {result['elapsed_seconds']}s")
+    for err in result.get("errors", [])[:10]:
+        print(f"  (失败) {err}")
+
 
 
 def cmd_scan(args):
@@ -209,6 +225,14 @@ def cmd_status(args):
     print(f"账户 {acc['account_id']}: 总资产 ¥{acc['total_asset']:,.2f}  "
           f"现金 ¥{acc['cash']:,.2f} 持仓 {len(acc['positions'])} 只")
     print(f"今日订单: {len(repo.get_orders_today(date.today()))} 笔")
+    archives = repo.list_paper_run_archives(limit=1)
+    if archives:
+        a = archives[0]
+        print(f"历史运行记录: {len(repo.list_paper_run_archives(limit=200))} 条 · "
+              f"最近 {a.archive_id} (至 {str(a.ended_at)[:16]}, "
+              f"盈亏 {a.total_pnl:+,.2f})")
+    else:
+        print("历史运行记录: 无(重置模拟盘时自动归档)")
 
 
 def cmd_pause(args):
@@ -241,43 +265,36 @@ def cmd_test_email(args):
 
 
 def cmd_init_portfolio(args):
-    """导入初始模拟盘持仓(重置账户后写入真实持仓)。"""
+    """导入初始模拟盘持仓(先归档上一轮运行记录, 再写入真实持仓)。"""
     import json as _json
     from database import repository as repo
-    from database.models import Account, Position, Order, Trade, AccountSnapshot
-    from paper_trading.paper_account import PaperAccount
+    from database.models import Position
+    from paper_trading.paper_reset import reset_paper_account
 
     path = args.file
     with open(path, "r", encoding="utf-8") as f:
         data = _json.load(f)
     acc_id = data.get("account_id", "PA-001")
 
-    # 1. 重置: 清空该账户的订单/成交/快照/持仓
-    with repo.get_session() as s:
-        s.query(Trade).filter(Trade.order_id.in_(
-            s.query(Order.order_id).filter(Order.account_id == acc_id))).delete(synchronize_session=False)
-        s.query(Order).filter_by(account_id=acc_id).delete()
-        s.query(Position).filter_by(account_id=acc_id).delete()
-        s.query(AccountSnapshot).filter_by(account_id=acc_id).delete()
+    # 1. 归档上一轮 + 清空订单/成交/快照/持仓(不再直接删除, 历史可回溯)
+    init_cash = float(data.get("initial_cash", 0) or 0)
+    if init_cash <= 0:
+        total_mv = sum(int(p["total_qty"]) * float(p["latest_price"])
+                       for p in data.get("positions", []))
+        init_cash = round(float(data["cash"]) + total_mv, 2)
+    result = reset_paper_account(initial_cash=init_cash,
+                                 note=f"导入持仓 {path}",
+                                 run_name="导入真实持仓前",
+                                 account_id=acc_id)
+    print(f"[OK] 上一轮已归档: {result['archive_id']}")
 
-    # 2. 账户资金
-    acc = repo.get_account(acc_id)
-    if acc is None:
-        acc = Account(account_id=acc_id, account_type="paper", init_cash=0)
-    acc.cash = float(data["cash"])
-    acc.frozen_cash = 0.0
-    acc.total_fee = 0.0
-    repo.save_account(acc)
-
-    # 3. 写入持仓(T+1: 全部可卖; 峰值价=成本价, 移动止盈以此为起点)
+    # 2. 写入持仓(T+1: 全部可卖; 峰值价=成本价, 移动止盈以此为起点)
     total_mv = 0.0
-    total_cost = 0.0
     for p in data.get("positions", []):
         cost = float(p["cost_price"])
         last = float(p["latest_price"])
         qty = int(p["total_qty"])
         total_mv += qty * last
-        total_cost += qty * cost
         pos = Position(
             position_id=f"POS-{acc_id}-{p['symbol']}",
             account_id=acc_id, symbol=p["symbol"], name=p.get("name", ""),
@@ -291,14 +308,11 @@ def cmd_init_portfolio(args):
         )
         repo.save_position(pos)
 
-    # 4. 刷新账户市值/总资产/盈亏
-    # 修复: 原实现把 init_cash 置为"现金+持仓成本"(20347), 而用户真实投入是
-    # 文件里的 initial_cash(20000, 现金+持仓市值) —— 成本高于市值时累计盈亏
-    # 被系统性虚增(导入当日就少算亏损)。正确口径: 初始资金 = 用户真实投入。
+    # 3. 刷新账户市值/总资产/盈亏(现金按导入文件回填, 不能沿用重置后的初始资金)
     acc = repo.get_account(acc_id)
-    init_cash = float(data.get("initial_cash", 0) or 0)
-    if init_cash <= 0:
-        init_cash = round(float(data["cash"]) + total_mv, 2)
+    acc.cash = round(float(data["cash"]), 2)
+    acc.frozen_cash = 0.0
+    acc.total_fee = 0.0
     acc.init_cash = round(init_cash, 2)
     acc.market_value = round(total_mv, 2)
     acc.total_asset = round(acc.cash + acc.market_value, 2)
@@ -311,6 +325,25 @@ def cmd_init_portfolio(args):
     print(f"     持仓 {len(data.get('positions', []))} 只")
 
 
+def cmd_reset_paper(args):
+    """重置模拟盘(自动归档上一轮运行记录)。"""
+    from paper_trading.paper_reset import reset_paper_account
+    if not args.yes:
+        print("该操作会清空当前模拟盘交易数据(重置前自动归档运行记录)。")
+        print("确认请追加 --yes, 例如: python main.py reset-paper --yes")
+        return
+    result = reset_paper_account(initial_cash=args.initial_cash, note=args.note,
+                                 run_name=args.name)
+    s = result["summary"]
+    print(f"[OK] 模拟盘已重置: 账户 {result['account_id']} 初始资金 ¥{result['initial_cash']:,.2f}")
+    print(f"     上轮运行记录已归档: {result['archive_id']}")
+    print(f"     上轮总资产 ¥{s['final_asset']:,.2f}  盈亏 {s['total_pnl']:+,.2f} "
+          f"({s['total_return']:+.2%})  最大回撤 {s['max_drawdown']:.2%}")
+    print(f"     清理: {result['purged']}")
+    print(f"     备份文件: {result['export_path']}")
+
+
+
 def cmd_rotate(args):
     """手动执行一轮 ETF 动量轮动(与回测共用信号函数, 落单到模拟盘)。"""
     from strategies.live_rotation import run_live_rotation
@@ -321,6 +354,45 @@ def cmd_rotate(args):
         print(f"  {o['side']} {o['symbol']} {o['qty']}份 @ {o['price']:.3f} — {o['reason']}")
     for s in result.get("skipped", []):
         print(f"  (跳过) {s}")
+
+
+def cmd_universe(args):
+    """查看当前动态ETF候选池(母池规模/本期成员/入选理由/持仓重叠)。"""
+    from core.timeutil import today as biz_today
+    from strategies.dynamic_etf_universe import (
+        build_current_paper_snapshot, dynamic_pool_config, latest_paper_universe,
+    )
+    from database import repository as repo
+    today = biz_today()
+    cfg = dynamic_pool_config()
+    mother = repo.get_etf_history_symbols(today, min_bars=20, recent_days=15)
+    print(f"母池(全市场有近15日行情的ETF): {len(mother)} 只")
+    print(f"池配置: 每期最多 {cfg['max_candidates']} 只(两阶段筛选), "
+          f"流动性下限 {cfg['min_avg_amount']/1e4:.0f}万, 波动率上限 {cfg['max_annualized_volatility']:.0%}, "
+          f"排除债券/货币ETF={cfg.get('exclude_cash_like')}")
+    snap = latest_paper_universe(today)
+    if args.refresh:
+        snap = build_current_paper_snapshot(today, cfg, force=True)
+    elif not snap:
+        print("(库中暂无本期候选池快照, 使用 --refresh 生成)")
+    if snap:
+        members = snap.get("members") or []
+        holdings = {p.symbol for p in repo.get_positions()}
+        print(f"\n本期候选池 {snap.get('snapshot_id')} "
+              f"asof={snap.get('asof_date')} effective={snap.get('effective_date')} "
+              f"共 {len(members)} 只 (★=当前持仓)")
+        print(f"{'#':>3} {'代码':<8} {'名称':<16} {'20日均额(万)':>12} {'年化波动':>8} {'覆盖率':>7} {'主题':<12}")
+        for m in members:
+            star = "★" if str(m.get("symbol")) in holdings else " "
+            print(f"{m.get('rank', 0):>3} {star}{str(m.get('symbol')):<7} "
+                  f"{str(m.get('name') or '')[:14]:<16} "
+                  f"{(m.get('avg_amount') or 0)/1e4:>12,.0f} "
+                  f"{(m.get('annualized_volatility') or 0)*100:>7.1f}% "
+                  f"{(m.get('recent_coverage') or 0)*100:>6.1f}% "
+                  f"{str(m.get('theme') or '')[:12]:<12}")
+        inside = [m for m in members if str(m.get("symbol")) in holdings]
+        print(f"\n策略实际持仓 {len(holdings)} 只, 其中 {len(inside)} 只在候选池内")
+
 
 
 def cmd_rag(args):
@@ -346,6 +418,14 @@ def main():
     p.add_argument("--days", type=int, default=120)
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_fetch_daily)
+
+    p = sub.add_parser("backfill", help="回填历史日K(腾讯直连, 修复回测数据缺失)")
+    p.add_argument("--days", type=int, default=700, help="回填天数(默认700)")
+    p.add_argument("--top", type=int, default=150, help="按成交额回填Top N ETF")
+    p.add_argument("--all", action="store_true", help="回填全部已登记标的(较慢)")
+    p.add_argument("--symbols", nargs="*", default=[], help="额外指定标的")
+    p.add_argument("--workers", type=int, default=4, help="并发数(默认4)")
+    p.set_defaults(fn=cmd_backfill)
 
     p = sub.add_parser("scan")
     p.add_argument("symbol")
@@ -393,8 +473,20 @@ def main():
     p.add_argument("--file", default="data/portfolio_init.json")
     p.set_defaults(fn=cmd_init_portfolio)
 
+    p = sub.add_parser("reset-paper", help="重置模拟盘(自动归档上一轮运行记录)")
+    p.add_argument("--initial-cash", type=float, default=None,
+                   help="新初始资金(默认读 config.yaml paper_account.initial_cash)")
+    p.add_argument("--note", default="", help="重置备注")
+    p.add_argument("--name", default="", help="本轮运行名称")
+    p.add_argument("--yes", action="store_true", help="确认执行")
+    p.set_defaults(fn=cmd_reset_paper)
+
     p = sub.add_parser("rotate", help="手动执行一轮ETF动量轮动(回测策略实盘落地)")
     p.set_defaults(fn=cmd_rotate)
+
+    p = sub.add_parser("universe", help="查看当前动态ETF候选池/母池/持仓重叠")
+    p.add_argument("--refresh", action="store_true", help="强制重新生成候选池快照")
+    p.set_defaults(fn=cmd_universe)
 
     p = sub.add_parser("rag")
     p.add_argument("query")

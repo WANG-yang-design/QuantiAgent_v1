@@ -22,6 +22,11 @@ _spot_lock = threading.RLock()
 _SPOT_TTL = 60.0
 _SPOT_FILE = ROOT_DIR / "data" / "etf_spot_cache.json"
 _SPOT_FILE_TTL = 120.0
+# 修复: 原实现磁盘缓存超过120秒即视为不可用 —— 东财限流/重启后磁盘里明明有
+# 全市场ETF列表(525KB), 却因"过期"直接回源同步拉取, 拉取失败返回空列表,
+# 表现为"行情预热完成: 0 只ETF"、动态池/监控池无法生成。ETF代码表变化很慢,
+# 允许使用陈旧磁盘缓存(1年安全上限), 命中陈旧缓存时后台刷新, 有数据永远好过空。
+_SPOT_FILE_MAX_AGE = 365 * 86400
 _spot_refreshing = False
 _spot_last_attempt_ts = 0.0          # 后台刷新最小重试间隔(修复: 限流时不锤东财)
 _SPOT_REFRESH_MIN_INTERVAL = 30.0
@@ -40,10 +45,15 @@ def _disk_save(df):
 def _disk_load():
     try:
         import pandas as pd
-        if _SPOT_FILE.exists() and time.time() - _SPOT_FILE.stat().st_mtime < _SPOT_FILE_TTL:
-            df = pd.read_json(_SPOT_FILE, orient="split")
-            if not df.empty:
-                return df, _SPOT_FILE.stat().st_mtime
+        if _SPOT_FILE.exists():
+            age = time.time() - _SPOT_FILE.stat().st_mtime
+            if age <= _SPOT_FILE_MAX_AGE:
+                df = pd.read_json(_SPOT_FILE, orient="split")
+                if not df.empty:
+                    if age > _SPOT_FILE_TTL:
+                        logger.warning("使用陈旧ETF列表磁盘缓存(%.1f天前), 后台刷新中",
+                                       age / 86400)
+                    return df, _SPOT_FILE.stat().st_mtime
     except Exception as exc:
         logger.debug("ETF spot 磁盘缓存读取失败: %s", exc)
     return None

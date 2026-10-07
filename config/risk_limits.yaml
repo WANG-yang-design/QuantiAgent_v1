@@ -10,7 +10,10 @@ account_level:
   max_total_drawdown: 0.15        # 最大总回撤(从历史峰值)
   min_cash_ratio: 0.10            # 最小现金比例
   max_daily_trade_count: 20       # 每日最大交易次数
-  max_daily_trade_amount: 50000   # 每日最大交易金额(元)
+  # 每日最大交易金额(元)。修复: 原50000与策略参数冲突 —— 10万本金时
+  # 单标的目标仓位21%≈2.1万, 一次4仓轮动需要约8.4万, 原值会让轮动单
+  # 在第三笔被合规拦截(策略永远调不完仓)。100000可覆盖10万本金的完整轮动。
+  max_daily_trade_amount: 100000
 
 position_level:
   max_single_position: 0.30       # 单标的最大仓位
@@ -33,7 +36,10 @@ strategy_level:
   rebalance_frequency_min: 60     # 策略调仓频率限制(分钟)
 
 order_level:
-  max_order_amount: 20000         # 单笔最大金额(元)
+  # 单笔最大金额(元)。修复: 原20000与10万本金的策略单冲突 —— 单标的目标
+  # 仓位21%≈2.1万, 每笔首仓都会被硬风控拒绝。30000 与单标的仓位上限
+  # (30%×10万)对齐; 20万以上账户请在 config.yaml 调整目标仓位或提高此值。
+  max_order_amount: 30000
   max_order_quantity: 1000000
   max_price_deviation: 0.02       # 委托价偏离最新价 2% 拒绝
   forbid_repeat_order: true

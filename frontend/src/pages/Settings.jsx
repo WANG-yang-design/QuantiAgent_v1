@@ -1,11 +1,14 @@
-﻿import { useState } from "react";
-import { useEffect } from "react";
+﻿import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Mail, Database, Cpu, ShieldAlert, CheckCircle2, XCircle, Clock, PlayCircle } from "lucide-react";
+import {
+  Mail, Database, Cpu, ShieldAlert, CheckCircle2, XCircle, Clock,
+  PlayCircle, FileText, RefreshCw, Trash2,
+} from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar } from "../components/Common";
+import { Empty, Spin, errMsg } from "../components/Common";
+import { toastOk, toastErr } from "../components/Toast";
 
-/** 设置: 邮件测试 / 配置状态(动态读取) / 调度器状态 / 风控限额 / 常用操作 */
+/** 设置: 邮件测试 / 配置状态(动态读取) / 调度器状态 / 风控限额 / 系统日志 / 常用操作 */
 export default function SettingsPage() {
   const qc = useQueryClient();
   const [mailResult, setMailResult] = useState(null);
@@ -21,23 +24,25 @@ export default function SettingsPage() {
   });
   const { data: confirmPolicy } = useQuery({
     queryKey: ["confirmation-settings"], queryFn: () => api.get("/api/confirmations/settings"),
-    onSuccess: (r) => setConfirmForm(r),
   });
   useEffect(() => { if (confirmPolicy) setConfirmForm(confirmPolicy); }, [confirmPolicy]);
   const saveConfirmPolicy = useMutation({
     mutationFn: () => api.put("/api/confirmations/settings", confirmForm),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["confirmation-settings"] }); window.alert("确认超时设置已保存，新建确认单立即生效"); },
-    onError: (e) => window.alert("保存失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["confirmation-settings"] });
+      toastOk("确认超时设置已保存, 新建确认单立即生效");
+    },
+    onError: (e) => toastErr("保存失败: " + errMsg(e)),
   });
 
   // 手动拉起调度器(独立进程, 单例锁保证不重复)
   const startSched = useMutation({
     mutationFn: () => api.post("/api/scheduler/start"),
     onSuccess: () => {
-      window.alert("调度器启动命令已发送, 约10秒后刷新本页查看状态。");
+      toastOk("调度器启动命令已发送, 约10秒后就位");
       qc.invalidateQueries({ queryKey: ["scheduler-status"] });
     },
-    onError: (e) => window.alert("启动失败: " + (e.response?.data?.detail || e.message)),
+    onError: (e) => toastErr("启动失败: " + errMsg(e)),
   });
 
   const testMail = useMutation({
@@ -75,13 +80,16 @@ export default function SettingsPage() {
   const agentMasterEnabled = agentCfg?.master_enabled !== false;
   const toggleAgentMaster = useMutation({
     mutationFn: (enabled) => api.post("/api/agents/config/master", { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["agents-config"] }),
-    onError: (e) => window.alert("切换失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["agents-config"] });
+      toastOk("Agent 总开关已更新");
+    },
+    onError: (e) => toastErr("切换失败: " + errMsg(e)),
   });
   const toggleAgent = useMutation({
     mutationFn: ({ agent, enabled }) => api.post("/api/agents/config", { agent, enabled }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["agents-config"] }),
-    onError: (e) => window.alert("切换失败: " + (e.response?.data?.detail || e.message)),
+    onError: (e) => toastErr("切换失败: " + errMsg(e)),
   });
   // 真实 token 用量(修复: 输出token是成本大头, 逐Agent统计)
   const { data: usage } = useQuery({
@@ -90,11 +98,34 @@ export default function SettingsPage() {
     refetchInterval: 120000,
   });
 
+  // ---- 系统日志查看 ----
+  const [logFile, setLogFile] = useState("system.log");
+  const [logLines, setLogLines] = useState(300);
+  const [logAuto, setLogAuto] = useState(false);
+  const { data: logList, refetch: refetchLogs } = useQuery({
+    queryKey: ["log-files"],
+    queryFn: () => api.get("/api/logs"),
+    refetchInterval: 60000,
+  });
+  const { data: logTail, isFetching: logLoading, refetch: refetchTail } = useQuery({
+    queryKey: ["log-tail", logFile, logLines],
+    queryFn: () => api.get(`/api/logs/${encodeURIComponent(logFile)}?lines=${logLines}`),
+    enabled: !!logFile,
+    refetchInterval: logAuto ? 8000 : false,
+  });
+  const cleanupLogs = useMutation({
+    mutationFn: () => api.post("/api/logs/cleanup"),
+    onSuccess: (r) => {
+      toastOk(`日志清理完成: 删除 ${r?.deleted_files ?? 0} 个文件, 释放 ${((r?.deleted_bytes || 0) / 1048576).toFixed(1)}MB`);
+      refetchLogs();
+    },
+    onError: (e) => toastErr("清理失败: " + errMsg(e)),
+  });
+
   return (
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">设置</h1>
-        <SystemBar />
       </div>
 
       {/* 安全提示 */}
@@ -323,7 +354,7 @@ export default function SettingsPage() {
           </label>
           <label className="text-xs text-gray-500">等待分钟数
             <input className="input block mt-1 w-32" type="number" min="1" max="1440"
-              value={Math.round(confirmForm.timeout_seconds / 60)}
+              value={Math.max(1, Math.round((confirmForm.timeout_seconds || 600) / 60))}
               onChange={(e) => setConfirmForm({ ...confirmForm, timeout_seconds: Math.max(60, Number(e.target.value || 1) * 60) })} />
           </label>
           <button className="btn-primary" disabled={saveConfirmPolicy.isPending}
@@ -354,6 +385,55 @@ export default function SettingsPage() {
         </div>
       </div>
 
+      {/* 系统日志查看(排障入口: 不再需要远程登录服务器翻文件) */}
+      <div className="card">
+        <div className="card-title flex items-center justify-between flex-wrap gap-2">
+          <span><FileText size={14} className="inline mr-1" />系统日志</span>
+          <span className="text-[11px] text-gray-400 font-normal">
+            {logList?.total ?? 0} 个文件 · 共 {((logList?.total_bytes || 0) / 1048576).toFixed(1)}MB
+            · 按天+20MB滚动, 自动压缩, 超期自动清理
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 mb-3">
+          <select className="input max-w-[260px]" value={logFile}
+            onChange={(e) => setLogFile(e.target.value)}>
+            {(logList?.items || []).map((f) => (
+              <option key={f.name} value={f.name}>
+                {f.name} ({(f.size / 1024).toFixed(0)}KB · {f.modified})
+              </option>
+            ))}
+          </select>
+          <select className="input w-24" value={logLines}
+            onChange={(e) => setLogLines(Number(e.target.value))}>
+            {[100, 300, 500, 1000].map((n) => <option key={n} value={n}>尾{n}行</option>)}
+          </select>
+          <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+            <input type="checkbox" checked={logAuto} onChange={(e) => setLogAuto(e.target.checked)} />
+            自动刷新(8s)
+          </label>
+          <button className="btn-ghost text-xs" disabled={logLoading} onClick={() => refetchTail()}>
+            <RefreshCw size={12} className={`inline mr-1 ${logLoading ? "animate-spin" : ""}`} />刷新
+          </button>
+          <button className="btn-ghost text-xs text-red-500 ml-auto"
+            disabled={cleanupLogs.isPending}
+            onClick={() => {
+              if (window.confirm("清理超期滚动日志(system 30天 / error 90天)? 当前活动日志不会删除。"))
+                cleanupLogs.mutate();
+            }}>
+            <Trash2 size={12} className="inline mr-1" />清理旧日志
+          </button>
+        </div>
+        {logLoading && !logTail ? <Spin text="日志读取中..." /> : (
+          <pre className="text-[11px] leading-relaxed bg-slate-900 text-gray-200 rounded-lg p-3 max-h-80 overflow-auto whitespace-pre-wrap break-all">
+            {(logTail?.lines || []).length ? logTail.lines.join("\n") : "（暂无内容）"}
+          </pre>
+        )}
+        <div className="text-xs text-gray-400 mt-2">
+          提示: 排查"调度器没跑/数据源失败/Agent调用失败"优先看 system.log 与 error.log;
+          各模块日志在子目录(data/agent/risk/order/audit)。
+        </div>
+      </div>
+
       {/* 操作说明 */}
       <div className="card">
         <div className="card-title">常用操作</div>
@@ -364,7 +444,8 @@ export default function SettingsPage() {
             <tr><td className="td font-medium">启动管理台</td><td className="td text-brand-600">python main.py serve</td><td className="td text-gray-500">http://localhost:8080</td></tr>
             <tr><td className="td font-medium">启动调度器</td><td className="td text-brand-600">python main.py scheduler</td><td className="td text-gray-500">行情采集/盘中分析/日报/持仓巡检</td></tr>
             <tr><td className="td font-medium">单标的分析</td><td className="td text-brand-600">python main.py scan 510300</td><td className="td text-gray-500">Agent影子研究链路（不下单）</td></tr>
-            <tr><td className="td font-medium">导入真实持仓</td><td className="td text-brand-600">python main.py init-portfolio --file data/portfolio_init.json</td><td className="td text-gray-500">重置账户并写入真实持仓(盈亏自动按持仓成本计算)</td></tr>
+            <tr><td className="td font-medium">重置模拟盘</td><td className="td text-brand-600">python main.py reset-paper --yes</td><td className="td text-gray-500">自动归档上一轮运行记录后清空(也可在"模拟盘/实盘"页操作)</td></tr>
+            <tr><td className="td font-medium">导入真实持仓</td><td className="td text-brand-600">python main.py init-portfolio --file data/portfolio_init.json</td><td className="td text-gray-500">先归档当前运行, 再写入真实持仓(盈亏自动按持仓成本计算)</td></tr>
             <tr><td className="td font-medium">日线回测</td><td className="td text-brand-600">python main.py backtest --start ... --end ...</td><td className="td text-gray-500">或直接在回测中心操作</td></tr>
             <tr><td className="td font-medium">拉取日K</td><td className="td text-brand-600">python main.py fetch-daily --days 400</td><td className="td text-gray-500">新标的先执行此命令</td></tr>
             <tr><td className="td font-medium">日终复盘</td><td className="td text-brand-600">python main.py review</td><td className="td text-gray-500">生成日报+邮件+账户快照</td></tr>

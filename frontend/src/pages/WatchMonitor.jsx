@@ -3,7 +3,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Plus, Trash2, Star, Power, Search } from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar, fmtWan, fmt } from "../components/Common";
+import { fmtWan, fmt, errMsg } from "../components/Common";
+import { toastOk, toastErr } from "../components/Toast";
 import { decisionMeta } from "./AgentCenter";
 import { useLiveQuotes, toQuoteMap } from "../hooks/useLiveQuotes";
 
@@ -57,32 +58,37 @@ export default function WatchMonitor() {
       if (!/^\d{6}$/.test(code)) throw new Error("请输入6位代码");
       return api.post("/api/watchlist", { symbol: code, categories: ["watched"] }).then(() => setAddCode(""));
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
-    onError: (e) => window.alert("添加失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk("已加入监控"); },
+    onError: (e) => toastErr("添加失败: " + errMsg(e)),
   });
   const remove = useMutation({
     mutationFn: (symbol) => api.delete(`/api/watchlist/${symbol}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
-    onError: (e) => window.alert("移除失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk("已移除"); },
+    onError: (e) => toastErr("移除失败: " + errMsg(e)),
   });
   const toggle = useMutation({
     mutationFn: ({ symbol, enabled }) => api.post(`/api/watchlist/${symbol}/enable`, { enabled }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onError: (e) => toastErr("操作失败: " + errMsg(e)),
   });
   const setCats = useMutation({
     mutationFn: ({ symbol, cats }) => api.post(`/api/watchlist/${symbol}/categories`, { categories: cats }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onError: (e) => toastErr("分类更新失败: " + errMsg(e)),
   });
   const overridePool = useMutation({
     mutationFn: ({ symbol, mode }) => api.post(`/api/universe/etf/override/${symbol}`, { mode }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk("ETF池覆盖已更新"); },
+    onError: (e) => toastErr("覆盖失败: " + errMsg(e)),
   });
   const refreshPool = useMutation({
     mutationFn: () => api.post("/api/universe/etf/refresh"),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["watchlist"] });
       qc.invalidateQueries({ queryKey: ["etf-pool-snapshots"] });
+      toastOk("候选池已生成");
     },
+    onError: (e) => toastErr("候选池生成失败: " + errMsg(e)),
   });
 
   const items = (data?.items || []).filter((i) => !searchName || (i.name || "").includes(searchName) || (i.symbol || "").includes(searchName));
@@ -101,7 +107,6 @@ export default function WatchMonitor() {
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">监控标的</h1>
-        <SystemBar />
       </div>
 
       <div className="card flex flex-wrap items-center gap-3">

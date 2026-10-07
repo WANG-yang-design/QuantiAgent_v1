@@ -583,6 +583,37 @@ class AccountSnapshot(Base):
     source: Mapped[str] = mapped_column(String(16), default="paper")
 
 
+class PaperRunArchive(Base):
+    """模拟盘运行记录归档表。
+
+    每次"重置模拟盘"前把上一轮完整运行快照归档到此表(账户/持仓/订单/成交/
+    净值快照/人工确认), 同时导出 JSON 文件到 reports/paper_archive/。
+    重置只清空交易数据, 归档永久保留, 可随时回看历史轮次的业绩与明细。
+    """
+    __tablename__ = "paper_run_archives"
+    __table_args__ = (Index("ix_paper_archive_account", "account_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    archive_id: Mapped[str] = mapped_column(String(32), unique=True)
+    account_id: Mapped[str] = mapped_column(String(64), index=True)
+    run_name: Mapped[str] = mapped_column(String(64), default="")     # 本轮名称(可选)
+    note: Mapped[str] = mapped_column(Text, default="")               # 重置备注
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ended_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    initial_cash: Mapped[float] = mapped_column(Float, default=0)
+    final_asset: Mapped[float] = mapped_column(Float, default=0)
+    total_pnl: Mapped[float] = mapped_column(Float, default=0)
+    total_return: Mapped[float] = mapped_column(Float, default=0)
+    max_drawdown: Mapped[float] = mapped_column(Float, default=0)
+    total_fee: Mapped[float] = mapped_column(Float, default=0)
+    order_count: Mapped[int] = mapped_column(Integer, default=0)
+    trade_count: Mapped[int] = mapped_column(Integer, default=0)
+    position_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict)    # 全量明细快照
+    export_path: Mapped[str] = mapped_column(Text, default="")        # JSON 备份文件路径
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 # ================================================================
 # 七、回测
 # ================================================================

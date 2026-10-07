@@ -4,11 +4,11 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
   AreaChart, Area, BarChart, Bar, Legend,
 } from "recharts";
-import { Play, History, Download, ListPlus } from "lucide-react";
+import { Play, History, Download, ListPlus, ChevronDown } from "lucide-react";
 import { api, poll, downloadReport } from "../api/client";
 import BacktestKline from "../components/BacktestKline";
 import ErrorBoundary from "../components/ErrorBoundary";
-import { SystemBar, fmt, Empty } from "../components/Common";
+import { fmt, Empty } from "../components/Common";
 
 function downloadJson(filename, data) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -144,20 +144,27 @@ function TradeKlineCard({ runId, trades, nameMap = {} }) {
 
 /** 回测中心: 表单 → 异步任务轮询 → 指标/图表/明细/历史 */
 export default function BacktestCenter() {
-  const [form, setForm] = useState({
-    symbols: [], start: "2026-04-01", end: "2026-07-31",
-    initial_cash: 20000, mode: "daily", use_agents: false, name: "",
-    universe_mode: "dynamic_etf",
-    params: { top_n: 4, mom_window: 20, min_amount: 30000000, max_vol: 0.55,
-              target_weight: 0.21, rebalance_threshold: 0.15, max_total_position: 0.85,
-              hard_stop_pct: 0.08, trailing_stop_pct: 0.06,
-              trailing_stop_activation: 0.04, min_hold_days: 3, hold_buffer: 2,
-              rebalance_interval_days: 3, min_momentum: 0.01, trend_ma_window: 20,
-              max_buy_momentum: 0.25, fresh_stop_mult: 1.5,
-              initial_ratio: 0.5, bottom_ratio: 0.0,
-              require_above_ma20: true, max_distance_from_ma20: 0.15,
-              max_position_in_recent_range: 1.0,
-              low_rebound_bonus: 0.015, low_rebound_from_low_pct: 0.10 },
+  const [form, setForm] = useState(() => {
+    // 默认区间: 最近 4 个月(修复: 原硬编码 2026-04-01~2026-07-31, 时间一过就过期)
+    const end = new Date();
+    const start = new Date(end);
+    start.setMonth(start.getMonth() - 4);
+    const iso = (d) => d.toISOString().slice(0, 10);
+    return {
+      symbols: [], start: iso(start), end: iso(end),
+      initial_cash: 20000, mode: "daily", use_agents: false, name: "",
+      universe_mode: "dynamic_etf",
+      params: { top_n: 4, mom_window: 20, min_amount: 30000000, max_vol: 0.55,
+                target_weight: 0.21, rebalance_threshold: 0.15, max_total_position: 0.85,
+                hard_stop_pct: 0.08, trailing_stop_pct: 0.06,
+                trailing_stop_activation: 0.04, min_hold_days: 3, hold_buffer: 2,
+                rebalance_interval_days: 3, min_momentum: 0.01, trend_ma_window: 20,
+                max_buy_momentum: 0.25, fresh_stop_mult: 1.5,
+                initial_ratio: 0.5, bottom_ratio: 0.0,
+                require_above_ma20: true, max_distance_from_ma20: 0.15,
+                max_position_in_recent_range: 1.0,
+                low_rebound_bonus: 0.015, low_rebound_from_low_pct: 0.10 },
+    };
   });
   const [customCode, setCustomCode] = useState("");
   const [running, setRunning] = useState(null);
@@ -165,6 +172,7 @@ export default function BacktestCenter() {
   const [selectedRunId, setSelectedRunId] = useState("");
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const notify = (message, type = "success") => {
     setNotice({ message, type, id: Date.now() });
   };
@@ -367,7 +375,6 @@ export default function BacktestCenter() {
       )}
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">回测中心</h1>
-        <SystemBar />
       </div>
 
       {/* 历史记录放在操作区上方，便于随时切换结果 */}
@@ -447,9 +454,14 @@ export default function BacktestCenter() {
           </label>
         </div>
         <div className="xl:col-span-3 flex flex-col gap-2 border-t border-gray-100 pt-3">
-          {/* 策略参数 */}
+          {/* 策略参数(默认折叠: 页面更短, 需要时展开微调) */}
           <div>
-            <div className="text-xs text-gray-500 mb-1.5">轮动策略参数(修改后立即生效)</div>
+            <button className="text-xs text-gray-500 mb-1.5 flex items-center gap-1 hover:text-brand-600"
+              onClick={() => setShowAdvanced((v) => !v)}>
+              <ChevronDown size={13} className={`transition-transform ${showAdvanced ? "" : "-rotate-90"}`} />
+              轮动策略参数(修改后立即生效){showAdvanced ? "" : " · 点击展开"}
+            </button>
+            {showAdvanced && (
             <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-2">
               {[
                 ["top_n", "持有数量", "number"],
@@ -497,6 +509,7 @@ export default function BacktestCenter() {
                 买入需站上趋势均线
               </label>
             </div>
+            )}
           </div>
           <label className="flex items-center gap-2 text-sm text-gray-600">
             <input type="checkbox" checked={form.use_agents}
@@ -610,34 +623,60 @@ export default function BacktestCenter() {
                 {metrics.note}
               </div>
             )}
-            {Object.keys(metrics.data_coverage || {}).length > 0 && (
-              <div className={`mt-2 text-xs border rounded-lg px-3 py-2 ${
-                Object.values(metrics.data_coverage).some((r) => r.status !== "complete")
-                  ? "text-amber-700 bg-amber-50 border-amber-200"
-                  : "text-emerald-700 bg-emerald-50 border-emerald-200"
-              }`}>
-                行情完整性已校验：{Object.values(metrics.data_coverage).map((r) =>
-                  `${r.symbol} ${(Number(r.coverage || 0) * 100).toFixed(1)}%（${r.actual_start || "无数据"}～${r.actual_end || "无数据"}` +
-                  `${r.pre_listing_days ? `，上市前 ${r.pre_listing_days} 日已排除` : ""}` +
-                  `${r.missing_days?.length ? `，上市后缺口 ${r.missing_days.length} 日` : ""}` +
-                  `${r.price_adjustments?.length ? `，复权口径修正 ${r.price_adjustments.length} 处` : ""}）`
-                ).join("；")} · 快照 {metrics.data_snapshot_hash?.slice?.(0, 12)}
-              </div>
-            )}
+            {Object.keys(metrics.data_coverage || {}).length > 0 && (() => {
+              const covs = Object.values(metrics.data_coverage);
+              const abnormal = covs.filter((r) =>
+                Number(r.coverage || 0) < 0.98 || (r.missing_days || []).length > 0);
+              const minCov = Math.min(...covs.map((r) => Number(r.coverage || 0)));
+              const hasIssue = abnormal.length > 0;
+              return (
+                <details className={`mt-2 text-xs border rounded-lg px-3 py-2 ${
+                  hasIssue ? "text-amber-700 bg-amber-50 border-amber-200"
+                           : "text-emerald-700 bg-emerald-50 border-emerald-200"}`}>
+                  <summary className="cursor-pointer font-medium">
+                    行情完整性: {covs.length} 只 · 最低覆盖 {(minCov * 100).toFixed(1)}%
+                    · 缺口/异常 {abnormal.length} 只 · 快照 {metrics.data_snapshot_hash?.slice?.(0, 12)}
+                    <span className="font-normal opacity-70">（点击展开明细）</span>
+                  </summary>
+                  <div className="mt-1.5 space-y-0.5 max-h-56 overflow-y-auto">
+                    {covs.map((r) => (
+                      <div key={r.symbol}>
+                        {r.symbol} {(Number(r.coverage || 0) * 100).toFixed(1)}%
+                        （{r.actual_start || "无数据"}～{r.actual_end || "无数据"}
+                        {r.pre_listing_days ? `，上市前 ${r.pre_listing_days} 日已排除` : ""}
+                        {r.missing_days?.length ? `，上市后缺口 ${r.missing_days.length} 日` : ""}
+                        {r.price_adjustments?.length ? `，复权口径修正 ${r.price_adjustments.length} 处` : ""}）
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              );
+            })()}
             {(metrics.universe_snapshots || []).length > 0 && (
-              <div className="mt-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
-                <div className="font-semibold mb-1">
-                  一级候选池快照 {(metrics.universe_snapshots || []).length} 期（可审计、无未来数据）
-                </div>
-                <div className="flex flex-wrap gap-1.5">
+              <details className="mt-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                <summary className="cursor-pointer font-semibold">
+                  一级候选池快照 {(metrics.universe_snapshots || []).length} 期
+                  （动态池每月成员，可审计、无未来数据，点击展开）
+                </summary>
+                <div className="mt-2 space-y-2 max-h-64 overflow-y-auto">
                   {(metrics.universe_snapshots || []).map((s) => (
-                    <span key={s.snapshot_id} className="badge bg-white text-blue-700"
-                      title={`${s.snapshot_id} · ${s.snapshot_hash || ""}`}>
-                      {String(s.effective_date).slice(0, 10)} · {s.candidate_count ?? s.members?.length ?? 0}只 · {String(s.snapshot_hash || "").slice(0, 8)}
-                    </span>
+                    <div key={s.snapshot_id}>
+                      <div className="font-medium">
+                        {String(s.effective_date).slice(0, 10)} · {s.candidate_count ?? s.members?.length ?? 0} 只
+                        <span className="font-normal opacity-60 ml-2">asof {String(s.asof_date || "").slice(0, 10)}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {(s.members || []).map((m) => (
+                          <span key={m.symbol} className="badge bg-white text-blue-700"
+                            title={`${m.symbol} ${m.name || ""} · 20日均额 ${((m.avg_amount || 0) / 1e4).toFixed(0)}万 · 波动 ${((m.annualized_volatility || 0) * 100).toFixed(0)}%`}>
+                            {m.symbol} {m.name || ""}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
                   ))}
                 </div>
-              </div>
+              </details>
             )}
             {metrics.skipped_buys > 0 && (
               <div className="mt-1 text-xs text-gray-400">

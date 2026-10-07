@@ -113,55 +113,69 @@ class SinaClient(BaseDataSource):
             self._ak = ak
         return self._ak
 
-    # ---------------- ETF 日K (备源, 免费完整历史) ----------------
+    # ---------------- 日K (直连新浪 K线接口, ETF/股票/指数通用) ----------------
+    def _hist_daily(self, sina_code: str, datalen: int = 1023) -> List[Dict[str, Any]]:
+        """新浪日K(近 datalen 根, 未复权, 成交量单位:股)。"""
+        import json
+        url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+               "CN_MarketData.getKLineData"
+               f"?symbol={sina_code}&scale=240&ma=no&datalen={int(datalen)}")
+        resp = self.client.get(url)
+        resp.raise_for_status()
+        try:
+            data = json.loads(resp.text)
+        except ValueError as exc:
+            raise RuntimeError(f"新浪日K解析失败 {sina_code}") from exc
+        if not isinstance(data, list) or not data:
+            raise RuntimeError(f"新浪无 {sina_code} 日K")
+        return data
+
     def get_daily_bars(self, symbol: str, start: date, end: date,
                        asset_type: str = "etf") -> List[Dict[str, Any]]:
-        if asset_type != "etf":
-            raise NotImplementedError("新浪日K仅支持ETF")
-        df = self._ak_module().fund_etf_hist_sina(symbol=_sina_symbol(symbol))
-        if df is None or df.empty:
-            raise RuntimeError(f"新浪无 {symbol} 日K")
+        """ETF/股票历史日K(新浪免费接口, 最多约1023个交易日)。"""
+        data = self._hist_daily(_sina_symbol(symbol))
         rows = []
-        for _, r in df.iterrows():
-            d = r.get("date")
-            if isinstance(d, str):
-                d = datetime.strptime(d[:10], "%Y-%m-%d").date()
-            elif hasattr(d, "date"):
-                # 修复: pandas Timestamp 与 date 直接比较抛 TypeError, 导致整源被 Hub 判失败
-                d = d.date()
+        for r in data:
+            try:
+                d = datetime.strptime(str(r.get("day", ""))[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
             if not (start <= d <= end):
                 continue
+            o = _safe_float(r.get("open"))
+            c = _safe_float(r.get("close"))
+            h = _safe_float(r.get("high"))
+            l = _safe_float(r.get("low"))
+            vol = _safe_float(r.get("volume"))       # 新浪已是股单位
+            if min(o, c, h, l) <= 0:
+                continue
+            vwap = (h + l + c) / 3 if h and l else c
             rows.append({
                 "symbol": symbol,
                 "trade_date": d,
-                "open": _safe_float(r.get("open")),
-                "high": _safe_float(r.get("high")),
-                "low": _safe_float(r.get("low")),
-                "close": _safe_float(r.get("close")),
-                "volume": _safe_float(r.get("volume")),   # 新浪已是股单位
-                "amount": _safe_float(r.get("amount")),
+                "open": o, "high": h, "low": l, "close": c,
+                "volume": vol,
+                # 新浪日K不含成交额: 用典型价×成交量近似(流动性过滤用)
+                "amount": round(vol * vwap, 2),
                 "source": self.name,
             })
+        if not rows:
+            raise RuntimeError(f"新浪 {symbol} 区间内无日K")
         return rows
 
     # ---------------- 指数日K (基准对比用) ----------------
     def get_index_bars(self, index_code: str, start: date, end: date) -> List[Dict[str, Any]]:
         code_map = {"000300": "sh000300", "000001": "sh000001", "000905": "sh000905",
-                    "399006": "sz399006"}
+                    "399006": "sz399006", "000016": "sh000016", "000852": "sh000852",
+                    "399001": "sz399001"}
         sina_code = code_map.get(index_code, "sh" + index_code)
-        try:
-            df = self._ak_module().stock_zh_index_daily(symbol=sina_code)
-        except Exception as exc:
-            raise RuntimeError(f"新浪指数失败 {index_code}: {exc}") from exc
-        if df is None or df.empty:
-            raise RuntimeError(f"新浪无指数 {index_code} 数据")
+        data = self._hist_daily(sina_code)
         rows = []
-        for _, r in df.iterrows():
-            d = r.get("date")
-            if isinstance(d, str):
-                d = datetime.strptime(d[:10], "%Y-%m-%d").date()
-            elif hasattr(d, "date"):
-                d = d.date()
+        for r in data:
+            try:
+                d = datetime.strptime(str(r.get("day", ""))[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
             if not (start <= d <= end):
                 continue
             rows.append({
@@ -170,8 +184,8 @@ class SinaClient(BaseDataSource):
                 "high": _safe_float(r.get("high")),
                 "low": _safe_float(r.get("low")),
                 "close": _safe_float(r.get("close")),
-                "volume": _safe_float(r.get("volume")) * 100,
-                "amount": _safe_float(r.get("amount") or r.get("value")),
+                "volume": _safe_float(r.get("volume")),
+                "amount": 0.0,
                 "source": self.name,
             })
         return rows
@@ -208,4 +222,82 @@ class SinaClient(BaseDataSource):
         if symbol not in quotes:
             raise RuntimeError(f"新浪无 {symbol} 行情")
         return quotes[symbol]
+
+    # ------------------------------------------------------------------
+    def get_etf_spot(self) -> List[Dict[str, Any]]:
+        """全市场ETF实时列表(新浪 etf_hq_fund 节点, 成交额排序分页)。
+
+        东财 clist 限流时的备源: 同一份场内基金清单, 字段口径与 akshare 对齐。
+        """
+        import json as _json
+        out: List[Dict[str, Any]] = []
+        for page in range(1, 26):
+            url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+                   "json_v2.php/Market_Center.getHQNodeData"
+                   f"?page={page}&num=100&sort=amount&asc=0&node=etf_hq_fund&symbol=")
+            resp = self.client.get(url)
+            resp.raise_for_status()
+            try:
+                rows = _json.loads(resp.text)
+            except ValueError:
+                break
+            if not isinstance(rows, list) or not rows:
+                break
+            for r in rows:
+                code = _safe_str(r.get("code")) or str(r.get("symbol") or "")[-6:]
+                if not code:
+                    continue
+                price = _safe_float(r.get("trade"))
+                prev = _safe_float(r.get("settlement"))
+                out.append({
+                    "symbol": code,
+                    "name": _safe_str(r.get("name")),
+                    "latest_price": price,
+                    "change_pct": _safe_float(r.get("changepercent")),
+                    "amount": _safe_float(r.get("amount")),
+                    "volume": _safe_float(r.get("volume")),
+                    "high": _safe_float(r.get("high")),
+                    "low": _safe_float(r.get("low")),
+                    "open": _safe_float(r.get("open")),
+                    "prev_close": prev,
+                    "turnover_rate": _safe_float(r.get("turnoverratio")),
+                    "iopv": 0.0,
+                    "premium_rate": 0.0,
+                    "source": self.name,
+                })
+        if not out:
+            raise RuntimeError("新浪ETF列表为空")
+        return out
+
+    # ------------------------------------------------------------------
+    def get_stock_rank(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """沪深A股成交额榜(新浪免费榜单接口), 供热门股票/搜索页兜底。"""
+        import json as _json
+        url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+               "json_v2.php/Market_Center.getHQNodeData"
+               f"?page=1&num={max(20, min(int(limit), 100))}&sort=amount"
+               "&asc=0&node=hs_a&symbol=")
+        resp = self.client.get(url, headers={
+            "Referer": "https://finance.sina.com.cn/"})
+        resp.raise_for_status()
+        rows = _json.loads(resp.text)
+        if not isinstance(rows, list):
+            raise RuntimeError("新浪榜单返回格式异常")
+        out = []
+        for r in rows:
+            symbol = str(r.get("symbol") or "")[-6:]
+            if not symbol:
+                continue
+            out.append({
+                "symbol": symbol,
+                "name": str(r.get("name") or ""),
+                "asset_type": "stock",
+                "latest_price": float(r.get("trade") or 0),
+                "change_pct": float(r.get("changepercent") or 0),
+                "amount": float(r.get("amount") or 0),
+            })
+        if not out:
+            raise RuntimeError("新浪榜单为空")
+        return out[:limit]
+
 

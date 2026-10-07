@@ -39,16 +39,19 @@ export const api = {
 };
 
 export async function downloadReport(filename) {
-  const response = await client.get(`/api/reports/${encodeURIComponent(filename)}`, {
-    responseType: "blob",
-  });
-  const blob = response instanceof Blob ? response : new Blob([response]);
-  const url = URL.createObjectURL(blob);
+  return downloadFile(`/api/reports/${encodeURIComponent(filename)}`, filename);
+}
+
+/** 通用带鉴权文件下载(拦截器已返回 blob 数据)。 */
+export async function downloadFile(url, filename) {
+  const data = await client.get(url, { responseType: "blob" });
+  const blob = data instanceof Blob ? data : new Blob([data]);
+  const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url;
+  a.href = objectUrl;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(url);
+  URL.revokeObjectURL(objectUrl);
 }
 
 /** 轮询工具: 每 interval ms 轮询直到 status 非 RUNNING/PENDING。

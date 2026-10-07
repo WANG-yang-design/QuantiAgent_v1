@@ -1,16 +1,17 @@
 ﻿import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area,
+  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, AreaChart, Area,
 } from "recharts";
 import { Pause, Play, XCircle, Wallet, TrendingUp, TrendingDown, PiggyBank, Radar } from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar, fmt, fmtWan, Empty, Spin } from "../components/Common";
+import { fmt, fmtWan, fmtPct, Empty, errMsg, pnlColor } from "../components/Common";
+import { toastOk, toastErr } from "../components/Toast";
 
 export default function Dashboard() {
   const nav = useNavigate();
   const qc = useQueryClient();
-  const { data: acc } = useQuery({ queryKey: ["account"], queryFn: () => api.get("/api/account"), refetchInterval: 3000 });
+  const { data: acc, isLoading } = useQuery({ queryKey: ["account"], queryFn: () => api.get("/api/account"), refetchInterval: 3000 });
   const { data: equity } = useQuery({ queryKey: ["equity"], queryFn: () => api.get("/api/equity?limit=200") });
   const { data: orders } = useQuery({ queryKey: ["orders"], queryFn: () => api.get("/api/orders?limit=10"), refetchInterval: 15000 });
   const { data: mode } = useQuery({ queryKey: ["sysmode"], queryFn: () => api.get("/api/system/mode"), refetchInterval: 15000 });
@@ -19,23 +20,27 @@ export default function Dashboard() {
     // 修复: 原实现把 window.confirm 放进 mutationFn, 取消时返回 resolved
     // Promise 仍触发 onSuccess 刷新 —— 取消确认移到调用点
     mutationFn: () => api.post("/api/emergency/pause?reason=dashboard"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["sysmode"] }),
-    onError: (e) => window.alert("暂停失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["sysmode"] }); toastOk("已暂停全部交易"); },
+    onError: (e) => toastErr("暂停失败: " + errMsg(e)),
   });
   const resume = useMutation({
     mutationFn: () => api.post("/api/emergency/resume"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["sysmode"] }),
-    onError: (e) => window.alert("恢复失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["sysmode"] }); toastOk("已恢复交易"); },
+    onError: (e) => toastErr("恢复失败: " + errMsg(e)),
   });
   const cancelAll = useMutation({
     mutationFn: () => api.post("/api/emergency/cancel_all"),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ["orders"] }); qc.invalidateQueries({ queryKey: ["sysmode"] }); },
-    onError: (e) => window.alert("撤单失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["orders"] });
+      qc.invalidateQueries({ queryKey: ["sysmode"] });
+      toastOk(`已撤销 ${(r?.cancelled || []).length} 笔未成交委托`);
+    },
+    onError: (e) => toastErr("撤单失败: " + errMsg(e)),
   });
   const doSnapshot = useMutation({
     mutationFn: () => api.post("/api/account/snapshot"),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["equity"] }),
-    onError: (e) => window.alert("快照失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["equity"] }); toastOk("已记录当前净值快照"); },
+    onError: (e) => toastErr("快照失败: " + errMsg(e)),
   });
 
   // 净值曲线: 快照不足时用 [初始资金, 当前资产] 兜底, 保证始终有曲线
@@ -59,7 +64,7 @@ export default function Dashboard() {
     { label: "总资产", value: fmt(acc?.total_asset, 2), icon: Wallet, color: "text-brand-600" },
     { label: "可用资金", value: fmt(acc?.cash, 2), icon: PiggyBank, color: "text-cyan-600" },
     { label: "持仓市值", value: fmt(acc?.market_value, 2), icon: TrendingUp, color: "text-green-600" },
-    { label: "总盈亏", value: fmt(acc?.total_pnl, 2), icon: TrendingDown, color: (acc?.total_pnl || 0) >= 0 ? "text-up" : "text-down" },
+    { label: "总盈亏", value: fmt(acc?.total_pnl, 2), icon: TrendingDown, color: pnlColor(acc?.total_pnl) },
   ];
 
   // 大盘指数 + 牛熊诊断
@@ -75,7 +80,6 @@ export default function Dashboard() {
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold text-brand-600">仪表盘</h1>
-        <SystemBar />
       </div>
 
       {/* 大盘指数 + 牛熊诊断(点击指数卡片查看K线) */}
@@ -104,7 +108,9 @@ export default function Dashboard() {
             </span>
           </div>
           <div className={`text-sm font-semibold mt-1 ${diagColor}`}>{diag?.advice || "计算中..."}</div>
-          <div className="text-[10px] text-gray-400 mt-1">依据上证/沪深300/中证500的20日动量与均线 · {diag?.time}</div>
+          <div className="text-[10px] text-gray-400 mt-1">
+            依据上证/沪深300/中证500的20日动量与均线 · 数据截止 {diag?.data_asof || "-"}（收盘口径，盘中不变） · 更新 {diag?.time}
+          </div>
         </div>
       </div>
 
@@ -117,9 +123,13 @@ export default function Dashboard() {
               <span className="text-xs text-gray-500">{label}</span>
               <Icon size={16} className={color} />
             </div>
-            <div className="text-xl font-bold mt-1">¥{value}</div>
+            {isLoading ? (
+              <div className="skeleton h-7 w-28 mt-1.5" />
+            ) : (
+              <div className="text-xl font-bold mt-1">¥{value}</div>
+            )}
             {label === "总盈亏" && (
-              <div className={`text-xs ${(acc?.total_pnl || 0) >= 0 ? "text-up" : "text-down"}`}>
+              <div className={`text-xs ${pnlColor(acc?.total_pnl)}`}>
                 {acc?.total_return != null ? `${(acc.total_return || 0) >= 0 ? "+" : ""}${(acc.total_return * 100).toFixed(2)}%` : "-"}
               </div>
             )}
@@ -188,8 +198,8 @@ export default function Dashboard() {
                 <button key={p.symbol} className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-gray-50 text-left"
                   onClick={() => nav(`/symbol/${p.symbol}`)}>
                   <span className="text-sm font-medium">{p.symbol} <span className="text-gray-400">{p.name}</span></span>
-                  <span className={`text-sm font-semibold ${(p.pnl_pct || 0) >= 0 ? "text-up" : "text-down"}`}>
-                    {fmt(p.total_qty, 0)}份 {(p.pnl_pct * 100)?.toFixed(2)}%
+                  <span className={`text-sm font-semibold ${pnlColor(p.pnl_pct)}`}>
+                    {fmt(p.total_qty, 0)}份 {fmtPct((p.pnl_pct || 0) * 100)}
                   </span>
                 </button>
               ))}

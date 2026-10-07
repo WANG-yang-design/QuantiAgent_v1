@@ -395,15 +395,27 @@ class DataReplayer:
 
     # ------------------------------------------------------------------
     def load_benchmark(self, symbol: str, start: date, end: date) -> List[dict]:
-        """基准指数日K(沪深300), 无未来函数(纯行情序列)。"""
+        """基准指数日K(沪深300), 无未来函数(纯行情序列)。
+
+        修复: 原实现在 dynamic_etf 回测(online_fill=False)时直接返回空 ——
+        基准曲线整条缺失。基准是只读行情, 不影响交易决策, 改为先读本地
+        日K库(已由 backfill/采集落库), 缺失且允许联网时才回源。
+        """
         key = f"bench:{symbol}:{start}:{end}"
         if key in self._daily_cache:
             return self._daily_cache[key]
-        if not self.online_fill:
-            # Reproducible batch/dynamic runs must not change inputs halfway
-            # through because an optional benchmark network call succeeded.
-            bars = []
-        else:
+        bars: List[dict] = []
+        try:
+            rows = repo.get_daily_bars(symbol, start, end)
+            if rows:
+                bars = [{
+                    "symbol": r.symbol, "trade_date": r.trade_date,
+                    "open": r.open, "high": r.high, "low": r.low,
+                    "close": r.close, "volume": r.volume, "amount": r.amount,
+                } for r in rows]
+        except Exception as exc:
+            logger.warning("基准指数本地读取失败 %s: %s", symbol, exc)
+        if not bars and self.online_fill:
             try:
                 bars = get_market_service().get_index_bars(symbol, start, end)
             except Exception as exc:

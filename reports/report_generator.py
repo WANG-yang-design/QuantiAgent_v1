@@ -87,15 +87,20 @@ class ReportGenerator:
     # ------------------------------------------------------------------
     def _benchmark_curve(self, start: date, end: date):
         """沪深300买入持有净值(区间首日收盘归一为1)。DB日K优先, 缺失用实时源。
-        进程内缓存: 网络源拉取一次约30秒, 报告/分析页高频调用不能反复拉。"""
+        进程内缓存: 网络源拉取一次约30秒, 报告/分析页高频调用不能反复拉。
+        修复: 指数缺数据时回退 510300 ETF(同一指数代理), 保证基准曲线始终可见。"""
         cache = getattr(self, "_bench_cache", {})
         key = (str(start), str(end))
         if key in cache:
             return cache[key]
-        try:
-            rows = repo.get_daily_bars("000300", start, end)
-        except Exception:
-            rows = []
+        rows = []
+        for code in ("000300", "510300"):
+            try:
+                rows = repo.get_daily_bars(code, start, end)
+            except Exception:
+                rows = []
+            if rows:
+                break
         if not rows:
             try:
                 from data_service.market_data_service import get_market_service

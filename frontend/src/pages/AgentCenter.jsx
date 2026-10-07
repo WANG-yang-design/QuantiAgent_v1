@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { Zap, ChevronDown, ChevronRight, Target, Download } from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar, Empty, Spin } from "../components/Common";
+import { Empty, Spin } from "../components/Common";
 import DecisionTimeline from "../components/DecisionTimeline";
 import { useScanStore } from "../store/scanStore";
 
@@ -221,17 +221,18 @@ export default function AgentCenter() {
   });
 
   // 全局扫描任务状态轮询(跨页面恢复); 终态后停止
-  const { data: taskStatus } = useQuery({
+  const { data: taskStatus, isError: taskStatusError } = useQuery({
     queryKey: ["scantask", taskId],
     queryFn: () => api.get(`/api/scan/status/${taskId}`),
     enabled: !!taskId && scanStatus !== "DONE" && scanStatus !== "FAILED",
     refetchInterval: scanStatus === "RUNNING" ? 3000 : false,
-    // 修复: 轮询接口异常(服务重启/网络)时置为终态, 不再无限卡死
-    onError: () => {
-      update({ status: "FAILED", error: "任务状态查询失败(服务可能已重启), 请重新分析" });
-      setLastTaskState("FAILED");
-    },
   });
+  // 修复: React Query v5 已移除 query 级 onError, 原回调是死代码
+  useEffect(() => {
+    if (!taskStatusError) return;
+    update({ status: "FAILED", error: "任务状态查询失败(服务可能已重启), 请重新分析" });
+    setLastTaskState("FAILED");
+  }, [taskStatusError]);
   // 只在状态迁移时刷新工作流列表(修复: 原实现依赖每3秒变化的对象, DONE后持续刷新)
   const [lastTaskState, setLastTaskState] = useState(null);
   useEffect(() => {
@@ -272,7 +273,6 @@ export default function AgentCenter() {
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">Agent 影子观察中心</h1>
-        <SystemBar />
       </div>
 
       <div className="card border-blue-200 bg-blue-50/40 text-sm text-blue-800">

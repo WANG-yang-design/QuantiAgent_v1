@@ -5,7 +5,8 @@ import { Search, Zap, Star, ArrowLeft, TrendingUp, Wallet } from "lucide-react";
 import { api } from "../api/client";
 import KlineChart from "../components/KlineChart";
 import IntradayChart from "../components/IntradayChart";
-import { fmt, fmtPct, Spin, Empty, chgColor } from "../components/Common";
+import { fmt, fmtPct, Spin, Empty, chgColor, errMsg } from "../components/Common";
+import { toastOk, toastErr } from "../components/Toast";
 import { useScanStore } from "../store/scanStore";
 import { useLiveQuotes } from "../hooks/useLiveQuotes";
 
@@ -68,8 +69,8 @@ export default function SymbolDetail() {
     mutationFn: () => (inWatch
       ? api.delete(`/api/watchlist/${symbol}`)
       : api.post("/api/watchlist", { symbol, categories: ["watched"] })),
-    onSuccess: () => { setInWatch(!inWatch); qc.invalidateQueries({ queryKey: ["watchlist"] }); },
-    onError: (e) => window.alert("操作失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { setInWatch(!inWatch); qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk(inWatch ? "已移出监控" : "已加入监控"); },
+    onError: (e) => toastErr("操作失败: " + errMsg(e)),
   });
   const runScan = useMutation({
     mutationFn: async () => {
@@ -87,18 +88,20 @@ export default function SymbolDetail() {
     },
   });
   // 异步分析任务轮询(全局store, 切页不丢); 终态后停止轮询
-  const { data: scanStatusData } = useQuery({
+  const { data: scanStatusData, isError: scanStatusError } = useQuery({
     queryKey: ["scantask", taskId],
     queryFn: () => api.get(`/api/scan/status/${taskId}`),
     enabled: !!taskId && scanSymbol === symbol && scanStatus !== "DONE" && scanStatus !== "FAILED",
     refetchInterval: scanStatus === "RUNNING" ? 3000 : false,
-    // 修复: 轮询接口异常(服务重启/网络)时不再无限卡在"分析中", 置为终态
-    onError: () => {
-      setAnalyzing(false);
-      setScanErrorMsg("任务状态查询失败(服务可能已重启), 请重新分析");
-      update({ status: "FAILED", error: "任务状态查询失败" });
-    },
   });
+  // 修复: React Query v5 已移除 query 级 onError, 原回调是死代码 ——
+  // 轮询接口异常(服务重启/网络)时不再无限卡在"分析中", 置为终态
+  useEffect(() => {
+    if (!scanStatusError) return;
+    setAnalyzing(false);
+    setScanErrorMsg("任务状态查询失败(服务可能已重启), 请重新分析");
+    update({ status: "FAILED", error: "任务状态查询失败" });
+  }, [scanStatusError]);
   useEffect(() => {
     if (!scanStatusData) return;
     if (scanStatusData.status === "DONE") {

@@ -3,7 +3,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { Plus, Trash2, ArrowUpDown, RefreshCw, Star } from "lucide-react";
 import { api } from "../api/client";
-import { SystemBar, fmt, fmtWan, Empty } from "../components/Common";
+import { fmt, fmtWan, fmtPct, Empty, errMsg } from "../components/Common";
+import { toastOk, toastErr } from "../components/Toast";
 import { useLiveQuotes } from "../hooks/useLiveQuotes";
 
 /** 实时盯盘: 自选池来自"监控标的"(DB持久化), 10s自动刷新 */
@@ -59,19 +60,19 @@ export default function Watchlist() {
       await api.post("/api/watchlist", { symbol: code, categories: ["watched"] });
       setAddCode("");
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
-    onError: (e) => window.alert("添加失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk("已加入自选"); },
+    onError: (e) => toastErr("添加失败: " + errMsg(e)),
   });
   const remove = useMutation({
     mutationFn: (code) => api.delete(`/api/watchlist/${code}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
-    onError: (e) => window.alert("移除失败: " + (e.response?.data?.detail || e.message)),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["watchlist"] }); toastOk("已移除"); },
+    onError: (e) => toastErr("移除失败: " + errMsg(e)),
   });
   // 监控开关(修复: 自选池每行没有"加入监控/停用监控"入口)
   const toggleWatch = useMutation({
     mutationFn: ({ symbol, enabled }) => api.post(`/api/watchlist/${symbol}/enable`, { enabled }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["watchlist"] }),
-    onError: (e) => window.alert("操作失败: " + (e.response?.data?.detail || e.message)),
+    onError: (e) => toastErr("操作失败: " + errMsg(e)),
   });
   const watchState = Object.fromEntries((watch?.items || []).map((i) => [i.symbol, i]));
 
@@ -96,7 +97,6 @@ export default function Watchlist() {
     <div className="p-3 md:p-5 space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
         <h1 className="text-lg font-bold text-brand-600">实时盯盘</h1>
-        <SystemBar />
       </div>
 
       {/* 工具条 */}
@@ -151,7 +151,7 @@ export default function Watchlist() {
                   <td className="td text-gray-500">{q.name}</td>
                   <td className={`td font-semibold ${q.change_pct > 0 ? "text-up" : q.change_pct < 0 ? "text-down" : ""}`}>{fmt(q.latest_price)}</td>
                   <td className={`td font-semibold ${q.change_pct > 0 ? "text-up" : q.change_pct < 0 ? "text-down" : ""}`}>
-                    {q.change_pct > 0 ? "+" : ""}{q.change_pct?.toFixed(2)}%
+                    {q.change_pct == null ? "-" : `${q.change_pct > 0 ? "+" : ""}${fmtPct(q.change_pct)}`}
                   </td>
                   <td className="td text-gray-600">{fmtWan(q.amount)}</td>
                   <td className="td text-gray-600">{q.premium_rate ? (q.premium_rate * 100).toFixed(2) + "%" : "-"}</td>

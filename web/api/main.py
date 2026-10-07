@@ -345,10 +345,11 @@ def pending_confirmations():
 def confirmation_history(limit: int = 100):
     """确认单完整历史及其后续订单/成交，用于回答谁在何时做了什么。"""
     from core.symbol_names import resolve_symbol_name
+    account_id = str(get_settings().get("paper_account.account_id", "PA-001"))
     rows = repo.list_confirmations(limit)
     orders = {o.plan_id: o for o in repo.get_orders_recent(limit=500) if o.plan_id}
     trades = {t.order_id: t for t in repo.get_trades(limit=500,
-                                                      account_id="PA-001")}
+                                                      account_id=account_id)}
     out = []
     for c in rows:
         order = orders.get(c.plan_id)
@@ -552,25 +553,30 @@ def run_backtest(body: dict):
 
 
 # ---------------------------------------------------------------
-# 静态仪表盘
+# 静态前端
 # ---------------------------------------------------------------
 from pathlib import Path
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-_DASHBOARD = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+
+def _serve_frontend():
+    index = _FRONTEND_DIST / "index.html"
+    if index.exists():
+        return FileResponse(index)
+    raise HTTPException(
+        status_code=503,
+        detail="前端未构建: 请在 frontend 目录执行 npm install && npm run build")
 
 
 @app.get("/", include_in_schema=False)
 def dashboard():
-    # 优先托管 React 构建产物, 不存在时退回旧静态页
-    if _FRONTEND_DIST.exists() and (_FRONTEND_DIST / "index.html").exists():
-        return FileResponse(_FRONTEND_DIST / "index.html")
-    return FileResponse(_DASHBOARD)
+    return _serve_frontend()
 
 
-if _FRONTEND_DIST.exists():
+if (_FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"),
               name="assets")
 
@@ -753,9 +759,7 @@ def spa_fallback(full_path: str):
     路由在后端无匹配 → 404。非 /api 路径统一返回前端入口。"""
     if full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="Not Found")
-    if _FRONTEND_DIST.exists() and (_FRONTEND_DIST / "index.html").exists():
-        return FileResponse(_FRONTEND_DIST / "index.html")
-    return FileResponse(_DASHBOARD)
+    return _serve_frontend()
 
 
 def start_web(host: str = "0.0.0.0", port: int = 8080, reload: bool = False):
